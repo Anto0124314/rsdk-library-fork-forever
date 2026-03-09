@@ -40,6 +40,7 @@ export default function V3() {
     return (
         <>
             <Head>
+                <script src="/coi-serviceworker.js" />
                 <meta name='viewport' content='initial-scale=1, viewport-fit=cover' />
             </Head>
             <div className='enginePage'>
