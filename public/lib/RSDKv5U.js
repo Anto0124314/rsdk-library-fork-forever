@@ -1,3 +1,31 @@
+function enforceIntegerScaling() {
+    const canvas = document.getElementById('canvas');
+    if (!canvas) return;
+
+    const baseWidth = 424; 
+    const baseHeight = 240; 
+
+    // Force strict whole-number multipliers to prevent Moiré bands
+    const scaleX = Math.floor(window.innerWidth / baseWidth);
+    const scaleY = Math.floor(window.innerHeight / baseHeight);
+    const scale = Math.max(1, Math.min(scaleX, scaleY)); 
+
+    canvas.style.width = (baseWidth * scale) + 'px';
+    canvas.style.height = (baseHeight * scale) + 'px';
+    canvas.style.imageRendering = 'pixelated'; 
+
+    // Pin it dead center
+    canvas.style.position = 'absolute';
+    canvas.style.top = '50%';
+    canvas.style.left = '50%';
+    canvas.style.transform = 'translate(-50%, -50%)';
+}
+
+document.body.style.backgroundColor = 'black'; 
+document.body.style.margin = '0';
+document.body.style.overflow = 'hidden'; 
+
+window.addEventListener('resize', enforceIntegerScaling);
 var Module = {
     onRuntimeInitialized: function () {
         TS_InitFS('RSDKv5U',
@@ -25,6 +53,7 @@ var Module = {
     canvas: (() => {
         var canvas = document.getElementById('canvas');
         canvas.addEventListener("webglcontextlost", (e) => { alert('WebGL context lost. You will need to reload the page.'); e.preventDefault(); }, false);
+        enforceIntegerScaling();
         return canvas;
     })(),
     setStatus: (text) => {
