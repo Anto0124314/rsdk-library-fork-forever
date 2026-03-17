@@ -27,13 +27,19 @@ import EngineFS from '@/lib/EngineFS'
 export default function V5U() {
     React.useEffect(() => {
         // Expose the init function to the global window
+        // Expose the init function to the global window
         (window as any).TS_InitFS = async (p: string, f: any) => {
             try {
+                // Only catch errors that happen during our custom file system init
                 await EngineFS.Init(p);
-                f();
             } catch (error) {
-                console.error("FS Init Error:", error);
+                console.error("EngineFS Error:", error);
+                return; // Stop execution if the file system fails to load entirely
             }
+            
+            // Call the engine's callback OUTSIDE the try...catch block
+            // This allows Emscripten to throw 'unwind' and pause itself properly
+            f(); 
         };
 
         // Helper function to load scripts in strict sequential order
