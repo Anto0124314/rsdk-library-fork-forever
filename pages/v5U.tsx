@@ -66,9 +66,8 @@ export default function V5U() {
                 
                 // 2. Load the main Emscripten engine/WASM glue code
                 await loadScript(`${basePath}/modules/RSDKv5U.js`);
+
                 
-                // 3. Load the wrapper/helper script last
-                await loadScript(`${basePath}/lib/RSDKv5U.js`);
             } catch (err) {
                 console.error("Failed to load engine scripts:", err);
             }
