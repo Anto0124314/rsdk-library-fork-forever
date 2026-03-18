@@ -27,7 +27,7 @@ The settings page currently provides two options:
 Run the following commands to build the site:
 
 ```bash
-npm install
+npm install --force
 npm run build
 ```
 
