@@ -51,9 +51,14 @@ var Module = {
     }
 };
 Module.setStatus('Downloading...');
-window.onerror = () => {
-    Module.setStatus('Exception thrown, see JavaScript console');
-
+window.onerror = (event, source, lineno, colno, error) => {
+    var msg = "Error: " + event;
+    if (error && error.stack) msg += "\n" + error.stack;
+    
+    // Send to console.error so our React Hook catches it!
+    console.error(msg); 
+    
+    Module.setStatus('Exception thrown: ' + event);
     Module.setStatus = (text) => {
         if (text) console.error('[post-exception status] ' + text);
     };
