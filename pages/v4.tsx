@@ -1,7 +1,7 @@
 'use client'
 
 import * as React from 'react'
-import { useEffect, useRef, useState } from 'react'
+import { useState, useEffect, useRef } from 'react'
 
 import '@/app/globals.css'
 import '@/app/engine.css'
@@ -13,52 +13,35 @@ import { Splash } from '@/app/controls/splash'
 import EngineFS from '@/lib/EngineFS'
 
 export default function V4() {
-    const consoleRef = useRef<HTMLTextAreaElement>(null);
-    const [isVisible, setIsVisible] = useState(true);
     const [isReady, setIsReady] = useState(false);
+    const consoleRef = useRef<HTMLTextAreaElement>(null);
 
-    // 1. Console Hook
+    // 1. Console Capture (Optional, but helps debug the worker)
     useEffect(() => {
         const originalLog = console.log;
-        const originalWarn = console.warn;
         const originalError = console.error;
 
-        const appendToVirtualConsole = (type: string, args: any[]) => {
+        const logToScreen = (msg: string) => {
             if (consoleRef.current) {
-                const message = args.map(arg => {
-                    try {
-                        if (arg instanceof Error) return `${arg.name}: ${arg.message}\n${arg.stack}`;
-                        return (typeof arg === 'object') ? JSON.stringify(arg) : String(arg);
-                    } catch (e) {
-                        return String(arg);
-                    }
-                }).join(' ');
-                const timestamp = new Date().toLocaleTimeString().split(' ')[0];
-                consoleRef.current.value += `[${timestamp}] [${type}] ${message}\n`;
+                consoleRef.current.value += msg + "\n";
                 consoleRef.current.scrollTop = consoleRef.current.scrollHeight;
             }
         };
 
-        console.log = (...args) => { originalLog.apply(console, args); appendToVirtualConsole('LOG', args); };
-        console.warn = (...args) => { originalWarn.apply(console, args); appendToVirtualConsole('WRN', args); };
-        console.error = (...args) => { originalError.apply(console, args); appendToVirtualConsole('ERR', args); };
-        window.addEventListener('error', (e) => appendToVirtualConsole('CRASH', [e.message]));
+        console.log = (...args) => { originalLog.apply(console, args); logToScreen(args.join(' ')); };
+        console.error = (...args) => { originalError.apply(console, args); logToScreen("[ERR] " + args.join(' ')); };
 
-        return () => {
-            console.log = originalLog;
-            console.warn = originalWarn;
-            console.error = originalError;
-        };
+        return () => { console.log = originalLog; console.error = originalError; };
     }, []);
 
     // 2. Security Check (The Gate)
     useEffect(() => {
+        // If the browser says we are "Isolated", Pthreads will work.
         if (window.crossOriginIsolated) {
-            console.log("High Performance Mode Active (Pthreads Enabled).");
+            console.log("Environment Secure (COOP/COEP). Loading Game...");
             setIsReady(true);
         } else {
-            console.log("High Performance Mode Inactive. Waiting for Auto-Reload...");
-            // The coi-serviceworker script loaded below will detect this and trigger a reload.
+            console.log("Environment Insecure. Waiting for Service Worker Reload...");
         }
     }, []);
 
@@ -70,10 +53,9 @@ export default function V4() {
             console.log("Initializing FileSystem...");
             try {
                 await EngineFS.Init(p);
-                console.log("FileSystem Initialized.");
+                console.log("FS Ready. Starting Engine.");
                 f();
             } catch (error) {
-                console.error("FS Init Failed:", error);
             }
         };
     }, [isReady]);
@@ -83,29 +65,36 @@ export default function V4() {
             <Head>
                 <meta name='viewport' content='initial-scale=1, viewport-fit=cover' />
             </Head>
-            
-            <div className='enginePage' style={{ position: 'relative', width: '100vw', height: '100vh', overflow: 'hidden', backgroundColor: 'black' }}>
+            <div className='enginePage' style={{position: 'relative', width: '100vw', height: '100vh', backgroundColor: 'black'}}>
                 <ThemeProvider attribute='class' defaultTheme='dark' enableSystem>
                     
-                    {/* Load the Patched Service Worker Script FIRST */}
+                    {/* 1. Load the Service Worker FIRST. It will reload the page if needed. */}
                     <Script src='coi-serviceworker.js' strategy="beforeInteractive" />
 
+                    {/* 2. Only render Game & Scripts if Secure */}
                     {isReady ? (
                         <>
-                            <canvas id='canvas' className='engineCanvas' style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', zIndex: 1, display: 'block' }} onContextMenu={(e) => e.preventDefault()} />
-                            <div style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', zIndex: 10, pointerEvents: 'none' }}><Splash/></div>
+                            <Splash/>
+                            <canvas className='engineCanvas' id='canvas' style={{display: 'block', width: '100%', height: '100%'}} />
+                            
+                            {/* Load Wrapper First, then Engine */}
                             <Script src='./lib/RSDKv4.js' strategy="lazyOnload" />
                             <Script src='./modules/RSDKv4.js' strategy="lazyOnload" />
                         </>
                     ) : (
-                        <div style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', color: 'white', fontFamily: 'monospace', zIndex: 999 }}>
-                            <h2>Reloading for High Performance Mode...</h2>
+                        // Loading Screen while waiting for reload
+                        <div style={{color: 'white', display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100%'}}>
+                            <h2>Enabling High Performance Mode...</h2>
                         </div>
                     )}
 
-                    <div style={{ position: 'absolute', bottom: 0, left: 0, width: '100%', height: '25vh', backgroundColor: 'rgba(0, 0, 0, 0.9)', borderTop: '2px solid #333', zIndex: 9999, display: isVisible ? 'flex' : 'none', flexDirection: 'column' }}>
-                        <textarea id="output" ref={consoleRef} readOnly spellCheck={false} style={{ flex: 1, backgroundColor: 'transparent', color: '#00ff00', border: 'none', resize: 'none', padding: '10px' }} />
-                    </div>
+                    {/* Mini Console for debugging Pthread errors */}
+                    <textarea 
+                        ref={consoleRef} 
+                        style={{position: 'absolute', bottom: 0, left: 0, width: '100%', height: '100px', background: 'rgba(0,0,0,0.8)', color: 'lime', border: 'none', fontSize: '10px', zIndex: 9999}}
+                        readOnly 
+                    />
+
                 </ThemeProvider>
             </div>
         </>
