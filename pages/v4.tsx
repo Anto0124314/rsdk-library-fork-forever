@@ -16,7 +16,7 @@ export default function V4() {
     const [isReady, setIsReady] = useState(false);
     const consoleRef = useRef<HTMLTextAreaElement>(null);
 
-    // 1. Console Hook (Captures logs to on-screen console)
+    // 1. Console Hook
     useEffect(() => {
         const originalLog = console.log;
         const originalError = console.error;
@@ -40,7 +40,7 @@ export default function V4() {
         };
     }, []);
 
-    // 2. Security Gate (Required for Pthreads on GitHub Pages)
+    // 2. Security Gate
     useEffect(() => {
         if (window.crossOriginIsolated) {
             console.log("Environment Secure (COOP/COEP Active).");
@@ -50,20 +50,39 @@ export default function V4() {
         }
     }, []);
 
-    // 3. FileSystem Hook (Standard Init)
+    // 3. FileSystem Hook (With Pthread Ready Wait)
     useEffect(() => {
         if (!isReady) return;
         
         // @ts-ignore
         window.TS_InitFS = async (p: string, f: any) => {
+            // --- FIX: Wait for Pthread pool to fully initialize ---
+            // Without this delay, FS.syncfs fires before the workers are ready,
+            // causing the callback to get lost (deadlock).
+            // RSDKv5U avoids this by initing FS from C++ (after threads are running).
+            console.log("Waiting for Pthread pool...");
+            await new Promise(resolve => setTimeout(resolve, 500));
+
+            // --- DEBUG: Check if IDBFS is available ---
+            // @ts-ignore
+            if (typeof IDBFS === 'undefined') {
+                console.error("IDBFS is UNDEFINED. Build is missing -lidbfs.js flag!");
+                // Fallback: Start game without persistent storage
+                f();
+                return;
+            } else {
+                console.log("IDBFS is available.");
+            }
+
             console.log("Initializing FileSystem...");
             try {
-                // Standard Init - Relies on correct build (-lidbfs.js) to not hang
                 await EngineFS.Init(p);
                 console.log("FileSystem Ready.");
                 f();
             } catch (error) {
                 console.error("FS Error:", error);
+                // Start game anyway even if FS fails
+                f();
             }
         };
     }, [isReady]);
@@ -76,7 +95,6 @@ export default function V4() {
             <div className='enginePage' style={{position: 'relative', width: '100vw', height: '100vh', backgroundColor: 'black'}}>
                 <ThemeProvider attribute='class' defaultTheme='dark' enableSystem>
                     
-                    {/* Load Service Worker Script (Handles Auto-Reload for Headers) */}
                     <Script src='coi-serviceworker.js' strategy="beforeInteractive" />
 
                     {isReady ? (
@@ -84,19 +102,16 @@ export default function V4() {
                             <canvas id='canvas' className='engineCanvas' style={{position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', display: 'block'}} onContextMenu={(e)=>e.preventDefault()} />
                             <div style={{position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'none'}}><Splash/></div>
                             
-                            {/* Load Wrapper First, then Engine */}
                             <Script src='./lib/RSDKv4.js' strategy="lazyOnload" />
                             <Script src='./modules/RSDKv4.js' strategy="lazyOnload" />
                         </>
                     ) : (
-                        // Loading Screen while waiting for Page Reload
                         <div style={{color: 'white', display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', height: '100%'}}>
                             <h2>Enabling High Performance Mode...</h2>
                             <p style={{color: '#888'}}>Reloading to enable Pthreads</p>
                         </div>
                     )}
 
-                    {/* Debug Console */}
                     <textarea 
                         ref={consoleRef} 
                         style={{position: 'absolute', bottom: 0, left: 0, width: '100%', height: '150px', background: 'rgba(0,0,0,0.85)', color: '#00ff00', borderTop: '1px solid #333', border: 'none', fontSize: '12px', fontFamily: 'monospace', padding: '10px', resize: 'none', outline: 'none', zIndex: 9999}} 
