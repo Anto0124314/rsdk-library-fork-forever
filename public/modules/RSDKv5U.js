@@ -229,20 +229,6 @@ var out = defaultPrint;
 
 var err = defaultPrintErr;
 
-var PROXYFS = "PROXYFS is no longer included by default; build with -lproxyfs.js";
-
-var WORKERFS = "WORKERFS is no longer included by default; build with -lworkerfs.js";
-
-var FETCHFS = "FETCHFS is no longer included by default; build with -lfetchfs.js";
-
-var ICASEFS = "ICASEFS is no longer included by default; build with -licasefs.js";
-
-var JSFILEFS = "JSFILEFS is no longer included by default; build with -ljsfilefs.js";
-
-var OPFS = "OPFS is no longer included by default; build with -lopfs.js";
-
-var NODEFS = "NODEFS is no longer included by default; build with -lnodefs.js";
-
 // perform assertions in shell.js after we set up out() and err(), as otherwise
 // if an assertion fails it cannot print the message
 assert(ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER || ENVIRONMENT_IS_NODE, "Pthreads do not work in this environment yet (need Web Workers, or an alternative to them)");
@@ -259,8 +245,6 @@ assert(!ENVIRONMENT_IS_SHELL, "shell environment detected but not enabled at bui
 // You can also build docs locally as HTML or other formats in site/
 // An online HTML version (which may be of a different version of Emscripten)
 //    is up at http://kripken.github.io/emscripten-site/docs/api_reference/preamble.js.html
-var dynamicLibraries = [];
-
 var wasmBinary;
 
 if (!globalThis.WebAssembly) {
@@ -515,15 +499,11 @@ function checkInt(value, bits, min, max) {
   assert(value >= min, `value (${value}) too small to write as ${bits}-bit value`);
 }
 
-var checkInt1 = value => checkInt(value, 1, 1);
-
 var checkInt8 = value => checkInt(value, 8, MIN_INT8, MAX_UINT8);
 
 var checkInt16 = value => checkInt(value, 16, MIN_INT16, MAX_UINT16);
 
 var checkInt32 = value => checkInt(value, 32, MIN_INT32, MAX_UINT32);
-
-var checkInt53 = value => checkInt(value, 53, MIN_INT53, MAX_UINT53);
 
 var checkInt64 = value => checkInt(value, 64, MIN_INT64, MAX_UINT64);
 
@@ -590,10 +570,6 @@ if (ENVIRONMENT_IS_NODE && (ENVIRONMENT_IS_PTHREAD)) {
 // including the main thread).
 var workerID = 0;
 
-// Map of modules to be shared with new threads.  This gets populated by the
-// main thread and shared with all new workers via the initial `load` message.
-var sharedModules = {};
-
 var startWorker;
 
 if (ENVIRONMENT_IS_PTHREAD) {
@@ -628,8 +604,6 @@ if (ENVIRONMENT_IS_PTHREAD) {
           // Restore the real message handler.
           self.onmessage = handleMessage;
         };
-        dynamicLibraries = msgData.dynamicLibraries;
-        sharedModules = msgData.sharedModules;
         // Use `const` here to ensure that the variable is scoped only to
         // that iteration, allowing safe reference from a closure.
         for (const handler of msgData.handlers) {
@@ -753,8 +727,6 @@ function initMemory() {
 // end include: runtime_common.js
 assert(globalThis.Int32Array && globalThis.Float64Array && Int32Array.prototype.subarray && Int32Array.prototype.set, "JS engine does not provide full typed array support");
 
-var __RELOC_FUNCS__ = [];
-
 function preRun() {
   assert(!ENVIRONMENT_IS_PTHREAD);
   // PThreads reuse the runtime from the main thread.
@@ -775,24 +747,17 @@ function initRuntime() {
   if (ENVIRONMENT_IS_PTHREAD) return startWorker();
   setStackLimits();
   checkStackCookie();
-  callRuntimeCallbacks(__RELOC_FUNCS__);
   // Begin ATINITS hooks
-  callRuntimeCallbacks(onInits);
   if (!Module["noFSInit"] && !FS.initialized) FS.init();
   TTY.init();
-  PIPEFS.root = FS.mount(PIPEFS, {}, null);
-  SOCKFS.root = FS.mount(SOCKFS, {}, null);
   // End ATINITS hooks
   wasmExports["__wasm_call_ctors"]();
   // Begin ATPOSTCTORS hooks
-  callRuntimeCallbacks(onPostCtors);
   FS.ignorePermissions = false;
 }
 
 function preMain() {
   checkStackCookie();
-  // Begin ATMAINS hooks
-  callRuntimeCallbacks(onMains);
 }
 
 function postRun() {
@@ -916,12 +881,9 @@ async function instantiateAsync(binary, binaryFile, imports) {
 function getWasmImports() {
   assignWasmImports();
   // prepare imports
-  var GOTProxyHandler = new Proxy(new Set([]), GOTHandler);
   var imports = {
     "env": wasmImports,
-    "wasi_snapshot_preview1": wasmImports,
-    "GOT.mem": GOTProxyHandler,
-    "GOT.func": GOTProxyHandler
+    "wasi_snapshot_preview1": wasmImports
   };
   return imports;
 }
@@ -934,17 +896,8 @@ async function createWasm() {
   // performing other necessary setup
   /** @param {WebAssembly.Module=} module*/ function receiveInstance(instance, module) {
     wasmExports = instance.exports;
-    var origExports = wasmExports;
-    mergeLibSymbols(wasmExports, "main");
-    var metadata = getDylinkMetadata(module);
-    if (metadata.neededDynlibs) {
-      dynamicLibraries = metadata.neededDynlibs.concat(dynamicLibraries);
-    }
-    registerTLSInit(wasmExports["_emscripten_tls_init"], instance.exports, metadata);
+    registerTLSInit(wasmExports["_emscripten_tls_init"]);
     assignWasmExports(wasmExports);
-    updateGOT(origExports);
-    LDSO.init();
-    loadDylibs();
     // We now have the Wasm module loaded up, keep a reference to the compiled module so we can post it to the workers.
     wasmModule = module;
     removeRunDependency("wasm-instantiate");
@@ -1005,27 +958,6 @@ class ExitStatus {
   }
 }
 
-var GOT = {};
-
-var GOTHandler = {
-  get(weakImports, symName) {
-    var rtn = GOT[symName];
-    if (!rtn) {
-      rtn = GOT[symName] = new WebAssembly.Global({
-        "value": "i32",
-        "mutable": true
-      }, -1);
-    }
-    if (!weakImports.has(symName)) {
-      // Any non-weak reference to a symbol marks it as `required`, which
-      // enabled `reportUndefinedSymbols` to report undefined symbol errors
-      // correctly.
-      rtn.required = true;
-    }
-    return rtn;
-  }
-};
-
 var terminateWorker = worker => {
   worker.terminate();
   // terminate() can be asynchronous, so in theory the worker can continue
@@ -1043,10 +975,6 @@ var cleanupThread = pthread_ptr => {
   assert(!ENVIRONMENT_IS_PTHREAD, "Internal Error! cleanupThread() can only ever be called from main application thread!");
   assert(pthread_ptr, "Internal Error! Null pthread_ptr in cleanupThread!");
   var worker = PThread.pthreads[pthread_ptr];
-  PThread.finishedThreads.delete(pthread_ptr);
-  if (pthread_ptr in PThread.outstandingPromises) {
-    PThread.outstandingPromises[pthread_ptr].resolve();
-  }
   assert(worker);
   PThread.returnWorkerToPool(worker);
 };
@@ -1061,13 +989,6 @@ var callRuntimeCallbacks = callbacks => {
 var onPreRuns = [];
 
 var addOnPreRun = cb => onPreRuns.push(cb);
-
-var markAsFinished = pthread_ptr => {
-  PThread.finishedThreads.add(pthread_ptr);
-  if (pthread_ptr in PThread.outstandingPromises) {
-    PThread.outstandingPromises[pthread_ptr].resolve();
-  }
-};
 
 var runDependencies = 0;
 
@@ -1218,8 +1139,6 @@ function _proc_exit(code) {
   quit_(code, new ExitStatus(code));
 }
 
-_proc_exit.sig = "vi";
-
 function exitOnMainThread(returnCode) {
   if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(1, 0, 0, returnCode);
   _exit(returnCode);
@@ -1247,8 +1166,6 @@ function exitOnMainThread(returnCode) {
 };
 
 var _exit = exitJS;
-
-_exit.sig = "vi";
 
 var ptrToString = ptr => {
   assert(typeof ptr === "number", `ptrToString expects a number, got ${typeof ptr}`);
@@ -1282,10 +1199,6 @@ var PThread = {
       await pthreadPoolReady;
       removeRunDependency("loading-workers");
     });
-    PThread.outstandingPromises = {};
-    // Finished threads are threads that have finished running but we are not yet
-    // joined.
-    PThread.finishedThreads = new Set;
   },
   terminateAllThreads: () => {
     assert(!ENVIRONMENT_IS_PTHREAD, "Internal Error! terminateAllThreads() can only ever be called from main application thread!");
@@ -1355,8 +1268,6 @@ var PThread = {
         // back into user code to free thread data. Without this it's possible
         // the unwind or ExitStatus exception could escape here.
         callUserCallback(() => cleanupThread(d.thread));
-      } else if (cmd === "markAsFinished") {
-        markAsFinished(d.thread);
       } else if (cmd === "loaded") {
         worker.loaded = true;
         // Check that this worker doesn't have an associated pthread.
@@ -1416,10 +1327,6 @@ var PThread = {
       handlers,
       wasmMemory,
       wasmModule,
-      dynamicLibraries,
-      // Share all modules that have been loaded so far.  New workers
-      // won't start running threads until these are all loaded.
-      sharedModules,
       "workerID": worker.workerID
     });
   }),
@@ -1490,184 +1397,6 @@ function establishStackSpace(pthread_ptr) {
   writeStackCookie();
 }
 
-var UTF8Decoder = new TextDecoder;
-
-var findStringEnd = (heapOrArray, idx, maxBytesToRead, ignoreNul) => {
-  var maxIdx = idx + maxBytesToRead;
-  if (ignoreNul) return maxIdx;
-  // TextDecoder needs to know the byte length in advance, it doesn't stop on
-  // null terminator by itself.
-  // As a tiny code save trick, compare idx against maxIdx using a negation,
-  // so that maxBytesToRead=undefined/NaN means Infinity.
-  while (heapOrArray[idx] && !(idx >= maxIdx)) ++idx;
-  return idx;
-};
-
-var warnOnce = text => {
-  warnOnce.shown ||= {};
-  if (!warnOnce.shown[text]) {
-    warnOnce.shown[text] = 1;
-    if (ENVIRONMENT_IS_NODE) text = "warning: " + text;
-    err(text);
-  }
-};
-
-/**
-   * Given a pointer 'idx' to a null-terminated UTF8-encoded string in the given
-   * array that contains uint8 values, returns a copy of that string as a
-   * Javascript String object.
-   * heapOrArray is either a regular array, or a JavaScript typed array view.
-   * @param {number=} idx
-   * @param {number=} maxBytesToRead
-   * @param {boolean=} ignoreNul - If true, the function will not stop on a NUL character.
-   * @return {string}
-   */ var UTF8ArrayToString = (heapOrArray, idx = 0, maxBytesToRead, ignoreNul) => {
-  var endPtr = findStringEnd(heapOrArray, idx, maxBytesToRead, ignoreNul);
-  return UTF8Decoder.decode(heapOrArray.buffer ? heapOrArray.slice(idx, endPtr) : new Uint8Array(heapOrArray.slice(idx, endPtr)));
-};
-
-var getDylinkMetadata = binary => {
-  var offset = 0;
-  var end = 0;
-  function getU8() {
-    return binary[offset++];
-  }
-  function getLEB() {
-    var ret = 0;
-    var mul = 1;
-    while (1) {
-      var byte = binary[offset++];
-      ret += ((byte & 127) * mul);
-      mul *= 128;
-      if (!(byte & 128)) break;
-    }
-    return ret;
-  }
-  function getString() {
-    var len = getLEB();
-    offset += len;
-    return UTF8ArrayToString(binary, offset - len, len);
-  }
-  function getStringList() {
-    var count = getLEB();
-    var rtn = [];
-    while (count--) rtn.push(getString());
-    return rtn;
-  }
-  /** @param {string=} message */ function failIf(condition, message) {
-    if (condition) throw new Error(message);
-  }
-  if (binary instanceof WebAssembly.Module) {
-    var dylinkSection = WebAssembly.Module.customSections(binary, "dylink.0");
-    failIf(dylinkSection.length === 0, "need dylink section");
-    binary = new Uint8Array(dylinkSection[0]);
-    end = binary.length;
-  } else {
-    var int32View = new Uint32Array(new Uint8Array(binary.subarray(0, 24)).buffer);
-    var magicNumberFound = int32View[0] == 1836278016;
-    failIf(!magicNumberFound, "need to see wasm magic number");
-    // \0asm
-    // we should see the dylink custom section right after the magic number and wasm version
-    failIf(binary[8] !== 0, "need the dylink section to be first");
-    offset = 9;
-    var section_size = getLEB();
-    // section size
-    end = offset + section_size;
-    var name = getString();
-    failIf(name !== "dylink.0");
-  }
-  var customSection = {
-    neededDynlibs: [],
-    tlsExports: new Set,
-    weakImports: new Set,
-    runtimePaths: []
-  };
-  var WASM_DYLINK_MEM_INFO = 1;
-  var WASM_DYLINK_NEEDED = 2;
-  var WASM_DYLINK_EXPORT_INFO = 3;
-  var WASM_DYLINK_IMPORT_INFO = 4;
-  var WASM_DYLINK_RUNTIME_PATH = 5;
-  var WASM_SYMBOL_TLS = 256;
-  var WASM_SYMBOL_BINDING_MASK = 3;
-  var WASM_SYMBOL_BINDING_WEAK = 1;
-  while (offset < end) {
-    var subsectionType = getU8();
-    var subsectionSize = getLEB();
-    if (subsectionType === WASM_DYLINK_MEM_INFO) {
-      customSection.memorySize = getLEB();
-      customSection.memoryAlign = getLEB();
-      customSection.tableSize = getLEB();
-      customSection.tableAlign = getLEB();
-    } else if (subsectionType === WASM_DYLINK_NEEDED) {
-      customSection.neededDynlibs = getStringList();
-    } else if (subsectionType === WASM_DYLINK_EXPORT_INFO) {
-      var count = getLEB();
-      while (count--) {
-        var symname = getString();
-        var flags = getLEB();
-        if (flags & WASM_SYMBOL_TLS) {
-          customSection.tlsExports.add(symname);
-        }
-      }
-    } else if (subsectionType === WASM_DYLINK_IMPORT_INFO) {
-      var count = getLEB();
-      while (count--) {
-        var modname = getString();
-        var symname = getString();
-        var flags = getLEB();
-        if ((flags & WASM_SYMBOL_BINDING_MASK) == WASM_SYMBOL_BINDING_WEAK) {
-          customSection.weakImports.add(symname);
-        }
-      }
-    } else if (subsectionType === WASM_DYLINK_RUNTIME_PATH) {
-      customSection.runtimePaths = getStringList();
-    } else {
-      err("unknown dylink.0 subsection:", subsectionType);
-      // unknown subsection
-      offset += subsectionSize;
-    }
-  }
-  var tableAlign = Math.pow(2, customSection.tableAlign);
-  assert(tableAlign === 1, `invalid tableAlign ${tableAlign}`);
-  assert(offset == end);
-  return customSection;
-};
-
-/**
-   * @param {number} ptr
-   * @param {string} type
-   */ function getValue(ptr, type = "i8") {
-  if (type.endsWith("*")) type = "*";
-  switch (type) {
-   case "i1":
-    return HEAP8[SAFE_HEAP_INDEX(HEAP8, ptr, "loading")];
-
-   case "i8":
-    return HEAP8[SAFE_HEAP_INDEX(HEAP8, ptr, "loading")];
-
-   case "i16":
-    return HEAP16[SAFE_HEAP_INDEX(HEAP16, ((ptr) >> 1), "loading")];
-
-   case "i32":
-    return HEAP32[SAFE_HEAP_INDEX(HEAP32, ((ptr) >> 2), "loading")];
-
-   case "i64":
-    return HEAP64[SAFE_HEAP_INDEX(HEAP64, ((ptr) >> 3), "loading")];
-
-   case "float":
-    return HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((ptr) >> 2), "loading")];
-
-   case "double":
-    return HEAPF64[SAFE_HEAP_INDEX(HEAPF64, ((ptr) >> 3), "loading")];
-
-   case "*":
-    return HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((ptr) >> 2), "loading")];
-
-   default:
-    abort(`invalid type for getValue: ${type}`);
-  }
-}
-
 /** @suppress{checkTypes} */ var getWasmTableEntry = funcPtr => wasmTable.get(funcPtr);
 
 var invokeEntryPoint = (ptr, arg) => {
@@ -1682,10 +1411,6 @@ var invokeEntryPoint = (ptr, arg) => {
   // call emscripten_unwind_to_js_event_loop to extend their lifetime beyond
   // their main function.  See comment in src/runtime_pthread.js for more.
   noExitRuntime = 0;
-  // Before we call the thread entry point, make sure any shared libraries
-  // have been loaded on this thread.  Otherwise our table might be not be
-  // in sync and might not contain the function pointer `ptr` at all.
-  __emscripten_dlsync_self();
   // pthread entry points are always of signature 'void *ThreadMain(void *arg)'
   // Native codebases sometimes spawn threads with other thread entry point
   // signatures, such as void ThreadMain(void *arg), void *ThreadMain(), or
@@ -1710,318 +1435,88 @@ var invokeEntryPoint = (ptr, arg) => {
   finish(result);
 };
 
-var newDSO = (name, handle, syms) => {
-  var dso = {
-    refcount: Infinity,
-    name,
-    exports: syms,
-    global: true
-  };
-  LDSO.loadedLibsByName[name] = dso;
-  if (handle != undefined) {
-    LDSO.loadedLibsByHandle[handle] = dso;
-  }
-  return dso;
+var noExitRuntime = true;
+
+var registerTLSInit = tlsInitFunc => PThread.tlsInitFunctions.push(tlsInitFunc);
+
+var setStackLimits = () => {
+  var stackLow = _emscripten_stack_get_base();
+  var stackHigh = _emscripten_stack_get_end();
+  ___set_stack_limits(stackLow, stackHigh);
 };
 
-var LDSO = {
-  loadedLibsByName: {},
-  loadedLibsByHandle: {},
-  init() {
-    // This function needs to run after the initial wasmImports object
-    // as been created.
-    assert(wasmImports);
-    newDSO("__main__", 0, wasmImports);
+/**
+   * @param {number} ptr
+   * @param {number} value
+   * @param {string} type
+   */ function setValue(ptr, value, type = "i8") {
+  if (type.endsWith("*")) type = "*";
+  switch (type) {
+   case "i1":
+    HEAP8[SAFE_HEAP_INDEX(HEAP8, ptr, "storing")] = value;
+    checkInt8(value);
+    break;
+
+   case "i8":
+    HEAP8[SAFE_HEAP_INDEX(HEAP8, ptr, "storing")] = value;
+    checkInt8(value);
+    break;
+
+   case "i16":
+    HEAP16[SAFE_HEAP_INDEX(HEAP16, ((ptr) >> 1), "storing")] = value;
+    checkInt16(value);
+    break;
+
+   case "i32":
+    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((ptr) >> 2), "storing")] = value;
+    checkInt32(value);
+    break;
+
+   case "i64":
+    HEAP64[SAFE_HEAP_INDEX(HEAP64, ((ptr) >> 3), "storing")] = BigInt(value);
+    checkInt64(value);
+    break;
+
+   case "float":
+    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((ptr) >> 2), "storing")] = value;
+    break;
+
+   case "double":
+    HEAPF64[SAFE_HEAP_INDEX(HEAPF64, ((ptr) >> 3), "storing")] = value;
+    break;
+
+   case "*":
+    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((ptr) >> 2), "storing")] = value;
+    break;
+
+   default:
+    abort(`invalid type for setValue: ${type}`);
   }
-};
+}
 
-var alignMemory = (size, alignment) => {
-  assert(alignment, "alignment argument is required");
-  return Math.ceil(size / alignment) * alignment;
-};
-
-var getMemory = size => {
-  // After the runtime is initialized, we must only use sbrk() normally.
-  if (runtimeInitialized) {
-    // Currently we don't support freeing of static data when modules are
-    // unloaded via dlclose.  This function is tagged as `noleakcheck` to
-    // avoid having this reported as leak.
-    return _calloc(size, 1);
-  }
-  var ret = ___heap_base;
-  // Keep __heap_base stack aligned.
-  var end = ret + alignMemory(size, 16);
-  //dbg(ret);
-  //dbg(HEAP8.length);
-  assert(end <= HEAP8.length, "failure to getMemory - memory growth etc. is not supported there, call malloc/sbrk directly or increase INITIAL_MEMORY");
-  ___heap_base = end;
-  // After allocating the memory from the start of the heap we need to ensure
-  // that once the program starts it doesn't use this region.  In relocatable
-  // mode we can just update the __heap_base symbol that we are exporting to
-  // the main module.
-  // When not relocatable `__heap_base` is fixed and exported by the main
-  // module, but we can update the `sbrk_ptr` value instead.  We call
-  // `_emscripten_get_sbrk_ptr` knowing that it is safe to call prior to
-  // runtime initialization (unlike, the higher level sbrk function)
-  if (!ENVIRONMENT_IS_PTHREAD) {
-    var sbrk_ptr = _emscripten_get_sbrk_ptr();
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((sbrk_ptr) >> 2), "storing")] = end;
-  }
-  return ret;
-};
-
-var isInternalSym = symName => [ "memory", "__memory_base", "__table_base", "__stack_pointer", "__indirect_function_table", "__cpp_exception", "__c_longjmp", "__wasm_apply_data_relocs", "__dso_handle", "__tls_size", "__tls_align", "__set_stack_limits", "_emscripten_tls_init", "__wasm_init_tls", "__wasm_call_ctors", "__start_em_asm", "__stop_em_asm", "__start_em_js", "__stop_em_js" ].includes(symName) || symName.startsWith("__em_js__");
-
-var updateTableMap = (offset, count) => {
-  if (functionsInTableMap) {
-    for (var i = offset; i < offset + count; i++) {
-      var item = getWasmTableEntry(i);
-      // Ignore null values.
-      if (item) {
-        functionsInTableMap.set(item, i);
-      }
-    }
+var warnOnce = text => {
+  warnOnce.shown ||= {};
+  if (!warnOnce.shown[text]) {
+    warnOnce.shown[text] = 1;
+    if (ENVIRONMENT_IS_NODE) text = "warning: " + text;
+    err(text);
   }
 };
 
-var functionsInTableMap;
+var wasmMemory;
 
-var getFunctionAddress = func => {
-  // First, create the map if this is the first use.
-  if (!functionsInTableMap) {
-    functionsInTableMap = new WeakMap;
-    updateTableMap(0, wasmTable.length);
-  }
-  return functionsInTableMap.get(func) || 0;
+var UTF8Decoder = new TextDecoder;
+
+var findStringEnd = (heapOrArray, idx, maxBytesToRead, ignoreNul) => {
+  var maxIdx = idx + maxBytesToRead;
+  if (ignoreNul) return maxIdx;
+  // TextDecoder needs to know the byte length in advance, it doesn't stop on
+  // null terminator by itself.
+  // As a tiny code save trick, compare idx against maxIdx using a negation,
+  // so that maxBytesToRead=undefined/NaN means Infinity.
+  while (heapOrArray[idx] && !(idx >= maxIdx)) ++idx;
+  return idx;
 };
-
-var freeTableIndexes = [];
-
-var getEmptyTableSlot = () => {
-  // Reuse a free index if there is one, otherwise grow.
-  if (freeTableIndexes.length) {
-    return freeTableIndexes.pop();
-  }
-  try {
-    // Grow the table
-    return wasmTable["grow"](1);
-  } catch (err) {
-    if (!(err instanceof RangeError)) {
-      throw err;
-    }
-    abort("Unable to grow wasm table. Set ALLOW_TABLE_GROWTH.");
-  }
-};
-
-/** @suppress{checkTypes} */ var setWasmTableEntry = (idx, func) => wasmTable.set(idx, func);
-
-var uleb128EncodeWithLen = arr => {
-  const n = arr.length;
-  assert(n < 16384);
-  // Note: this LEB128 length encoding produces extra byte for n < 128,
-  // but we don't care as it's only used in a temporary representation.
-  return [ (n % 128) | 128, n >> 7, ...arr ];
-};
-
-var wasmTypeCodes = {
-  "i": 127,
-  // i32
-  "p": 127,
-  // i32
-  "j": 126,
-  // i64
-  "f": 125,
-  // f32
-  "d": 124,
-  // f64
-  "e": 111
-};
-
-var generateTypePack = types => uleb128EncodeWithLen(Array.from(types, type => {
-  var code = wasmTypeCodes[type];
-  assert(code, `invalid signature char: ${type}`);
-  return code;
-}));
-
-var convertJsFunctionToWasm = (func, sig) => {
-  // Rest of the module is static
-  var bytes = Uint8Array.of(0, 97, 115, 109, // magic ("\0asm")
-  1, 0, 0, 0, // version: 1
-  1, // Type section code
-  // The module is static, with the exception of the type section, which is
-  // generated based on the signature passed in.
-  ...uleb128EncodeWithLen([ 1, // count: 1
-  96, // param types
-  ...generateTypePack(sig.slice(1)), // return types (for now only supporting [] if `void` and single [T] otherwise)
-  ...generateTypePack(sig[0] === "v" ? "" : sig[0]) ]), // The rest of the module is static
-  2, 7, // import section
-  // (import "e" "f" (func 0 (type 0)))
-  1, 1, 101, 1, 102, 0, 0, 7, 5, // export section
-  // (export "f" (func 0 (type 0)))
-  1, 1, 102, 0, 0);
-  // We can compile this wasm module synchronously because it is very small.
-  // This accepts an import (at "e.f"), that it reroutes to an export (at "f")
-  var module = new WebAssembly.Module(bytes);
-  var instance = new WebAssembly.Instance(module, {
-    "e": {
-      "f": func
-    }
-  });
-  var wrappedFunc = instance.exports["f"];
-  return wrappedFunc;
-};
-
-/** @param {string=} sig */ var addFunction = (func, sig) => {
-  assert(typeof func != "undefined");
-  // Check if the function is already in the table, to ensure each function
-  // gets a unique index.
-  var rtn = getFunctionAddress(func);
-  if (rtn) {
-    return rtn;
-  }
-  // It's not in the table, add it now.
-  // Make sure functionsInTableMap is actually up to date, that is, that this
-  // function is not actually in the wasm Table despite not being tracked in
-  // functionsInTableMap.
-  for (var i = 0; i < wasmTable.length; i++) {
-    assert(getWasmTableEntry(i) != func, "function in Table but not functionsInTableMap");
-  }
-  var ret = getEmptyTableSlot();
-  // Set the new value.
-  try {
-    // Attempting to call this with JS function will cause table.set() to fail
-    setWasmTableEntry(ret, func);
-  } catch (err) {
-    if (!(err instanceof TypeError)) {
-      throw err;
-    }
-    assert(typeof sig != "undefined", "Missing signature argument to addFunction: " + func);
-    var wrapped = convertJsFunctionToWasm(func, sig);
-    setWasmTableEntry(ret, wrapped);
-  }
-  functionsInTableMap.set(func, ret);
-  return ret;
-};
-
-/** @param {boolean=} replace */ var updateGOT = (exports, replace) => {
-  for (var symName in exports) {
-    if (isInternalSym(symName)) {
-      continue;
-    }
-    var value = exports[symName];
-    var existingEntry = GOT[symName] && GOT[symName].value != -1;
-    if (replace || !existingEntry) {
-      var newValue;
-      if (typeof value == "function") {
-        newValue = addFunction(value);
-      } else if (typeof value.value == "number") {
-        newValue = value;
-      } else {
-        // The GOT can only contain addresses (i.e data addresses or function
-        // addresses so we currently ignore other types export here.
-        continue;
-      }
-      GOT[symName] ??= new WebAssembly.Global({
-        "value": "i32",
-        "mutable": true
-      });
-      GOT[symName].value = newValue;
-    }
-  }
-};
-
-var isImmutableGlobal = val => {
-  if (val instanceof WebAssembly.Global) {
-    try {
-      val.value = val.value;
-    } catch {
-      return true;
-    }
-  }
-  return false;
-};
-
-var relocateExports = (exports, memoryBase = 0) => {
-  function relocateExport(name, value) {
-    // Detect immutable wasm global exports. These represent data addresses
-    // which are relative to `memoryBase`
-    if (isImmutableGlobal(value)) {
-      return new WebAssembly.Global({
-        "value": "i32"
-      }, value.value + memoryBase);
-    }
-    // Return unmodified value (no relocation required).
-    return value;
-  }
-  var relocated = {};
-  for (var e in exports) {
-    relocated[e] = relocateExport(e, exports[e]);
-  }
-  return relocated;
-};
-
-var isSymbolDefined = symName => {
-  // Ignore 'stub' symbols that are auto-generated as part of the original
-  // `wasmImports` used to instantiate the main module.
-  var existing = wasmImports[symName];
-  if (!existing || existing.stub) {
-    return false;
-  }
-  return true;
-};
-
-var createNamedFunction = (name, func) => Object.defineProperty(func, "name", {
-  value: name
-});
-
-var dynCall = (sig, ptr, args = [], promising = false) => {
-  assert(ptr, `null function pointer in dynCall`);
-  assert(!promising, "async dynCall is not supported in this mode");
-  assert(getWasmTableEntry(ptr), `missing table entry in dynCall: ${ptr}`);
-  var func = getWasmTableEntry(ptr);
-  var rtn = func(...args);
-  function convert(rtn) {
-    return rtn;
-  }
-  return convert(rtn);
-};
-
-var createInvokeFunction = sig => (ptr, ...args) => {
-  var sp = stackSave();
-  try {
-    return dynCall(sig, ptr, args);
-  } catch (e) {
-    stackRestore(sp);
-    // Create a try-catch guard that rethrows the Emscripten EH exception.
-    // Exceptions thrown from C++ will be a pointer (number) and longjmp
-    // will throw the number Infinity. Use the compact and fast "e !== e+0"
-    // test to check if e was not a Number.
-    if (e !== e + 0) throw e;
-    _setThrew(1, 0);
-    // In theory this if statement could be done on
-    // creating the function, but I just added this to
-    // save wasting code space as it only happens on exception.
-    if (sig[0] == "j") return 0n;
-  }
-};
-
-var resolveGlobalSymbol = (symName, direct = false) => {
-  var sym;
-  if (isSymbolDefined(symName)) {
-    sym = wasmImports[symName];
-  } else if (symName.startsWith("invoke_")) {
-    // Create (and cache) new invoke_ functions on demand.
-    sym = wasmImports[symName] = createNamedFunction(symName, createInvokeFunction(symName.split("_")[1]));
-  }
-  return {
-    sym,
-    name: symName
-  };
-};
-
-var onPostCtors = [];
-
-var addOnPostCtor = cb => onPostCtors.push(cb);
 
 /**
    * Given a pointer 'ptr' to a null-terminated UTF8-encoded string in the
@@ -2042,307 +1537,131 @@ var addOnPostCtor = cb => onPostCtors.push(cb);
   return UTF8Decoder.decode(HEAPU8.slice(ptr, end));
 };
 
-/**
-    * @param {string=} libName
-    * @param {Object=} localScope
-    * @param {number=} handle
-    */ var loadWebAssemblyModule = (binary, flags, libName, localScope, handle) => {
-  var metadata = getDylinkMetadata(binary);
-  // loadModule loads the wasm module after all its dependencies have been loaded.
-  // can be called both sync/async.
-  function loadModule() {
-    var originalTable = wasmTable;
-    // The first thread to load a given module needs to allocate the static
-    // table and memory regions.  Later threads re-use the same table region
-    // and can ignore the memory region (since memory is shared between
-    // threads already).
-    // If `handle` is specified then it is assumed that the calling thread has
-    // exclusive access to it for the duration of this function.  See the
-    // locking in `dynlink.c`.
-    var firstLoad = !handle || !HEAP8[SAFE_HEAP_INDEX(HEAP8, (handle) + (8), "loading")];
-    if (firstLoad) {
-      // alignments are powers of 2
-      var memAlign = Math.pow(2, metadata.memoryAlign);
-      // prepare memory
-      var memoryBase = metadata.memorySize ? alignMemory(getMemory(metadata.memorySize + memAlign), memAlign) : 0;
-      // TODO: add to cleanups
-      var tableBase = metadata.tableSize ? wasmTable.length : 0;
-      if (handle) {
-        HEAP8[SAFE_HEAP_INDEX(HEAP8, (handle) + (8), "storing")] = 1;
-        checkInt8(1);
-        HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((handle) + (12)) >> 2), "storing")] = memoryBase;
-        HEAP32[SAFE_HEAP_INDEX(HEAP32, (((handle) + (16)) >> 2), "storing")] = metadata.memorySize;
-        checkInt32(metadata.memorySize);
-        HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((handle) + (20)) >> 2), "storing")] = tableBase;
-        HEAP32[SAFE_HEAP_INDEX(HEAP32, (((handle) + (24)) >> 2), "storing")] = metadata.tableSize;
-        checkInt32(metadata.tableSize);
-      }
-    } else {
-      // Read the values for tableBase and memoryBase from shared memory. The
-      // thread that first loaded the DLL already set these values.
-      memoryBase = HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((handle) + (12)) >> 2), "loading")];
-      tableBase = HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((handle) + (20)) >> 2), "loading")];
-    }
-    if (metadata.tableSize) {
-      assert(wasmTable.length == tableBase, `unexpected table size while loading ${libName}: ${wasmTable.length}`);
-      wasmTable.grow(metadata.tableSize);
-    }
-    // This is the export map that we ultimately return.  We declare it here
-    // so it can be used within resolveSymbol.  We resolve symbols against
-    // this local symbol map in the case where they are not present on the
-    // global Module object.  We need this fallback because Modules sometime
-    // need to import their own symbols
-    var moduleExports;
-    function resolveSymbol(sym) {
-      var resolved = resolveGlobalSymbol(sym).sym;
-      if (!resolved && localScope) {
-        resolved = localScope[sym];
-      }
-      if (!resolved) {
-        resolved = moduleExports[sym];
-      }
-      assert(resolved, `undefined symbol '${sym}'. perhaps a side module was not linked in? if this global was expected to arrive from a system library, try to build the MAIN_MODULE with EMCC_FORCE_STDLIBS=1 in the environment`);
-      return resolved;
-    }
-    // TODO kill ↓↓↓ (except "symbols local to this module", it will likely be
-    // not needed if we require that if A wants symbols from B it has to link
-    // to B explicitly: similarly to -Wl,--no-undefined)
-    // wasm dynamic libraries are pure wasm, so they cannot assist in
-    // their own loading. When side module A wants to import something
-    // provided by a side module B that is loaded later, we need to
-    // add a layer of indirection, but worse, we can't even tell what
-    // to add the indirection for, without inspecting what A's imports
-    // are. To do that here, we use a JS proxy (another option would
-    // be to inspect the binary directly).
-    var proxyHandler = {
-      get(stubs, prop) {
-        // symbols that should be local to this module
-        switch (prop) {
-         case "__memory_base":
-          return memoryBase;
+var ___assert_fail = (condition, filename, line, func) => abort(`Assertion failed: ${UTF8ToString(condition)}, at: ` + [ filename ? UTF8ToString(filename) : "unknown filename", line, func ? UTF8ToString(func) : "unknown function" ]);
 
-         case "__table_base":
-          return tableBase;
-        }
-        if (prop in wasmImports && !wasmImports[prop].stub) {
-          // No stub needed, symbol already exists in symbol table
-          var res = wasmImports[prop];
-          return res;
-        }
-        // Return a stub function that will resolve the symbol
-        // when first called.
-        if (!(prop in stubs)) {
-          var resolved;
-          stubs[prop] = (...args) => {
-            resolved ||= resolveSymbol(prop);
-            return resolved(...args);
-          };
-        }
-        return stubs[prop];
-      }
-    };
-    var proxy = new Proxy({}, proxyHandler);
-    var GOTProxy = new Proxy(metadata.weakImports, GOTHandler);
-    var info = {
-      "GOT.mem": GOTProxy,
-      "GOT.func": GOTProxy,
-      "env": proxy,
-      "wasi_snapshot_preview1": proxy
-    };
-    function postInstantiation(module, instance) {
-      // the table should be unchanged
-      assert(wasmTable === originalTable);
-      if (!ENVIRONMENT_IS_PTHREAD && libName) {
-        // cache all loaded modules in `sharedModules`, which gets passed
-        // to new workers when they are created.
-        sharedModules[libName] = module;
-      }
-      // add new entries to functionsInTableMap
-      updateTableMap(tableBase, metadata.tableSize);
-      moduleExports = relocateExports(instance.exports, memoryBase);
-      updateGOT(moduleExports);
-      if (!flags.allowUndefined) {
-        reportUndefinedSymbols();
-      }
-      // If the runtime has already been initialized we set the stack limits
-      // now.  Otherwise this is delayed until `setDylinkStackLimits` is
-      // called after initialization.
-      if (moduleExports["__set_stack_limits"] && runtimeInitialized) {
-        moduleExports["__set_stack_limits"](_emscripten_stack_get_base(), _emscripten_stack_get_end());
-      }
-      function addEmAsm(addr, body) {
-        var args = [];
-        for (var arity = 0; ;arity++) {
-          var argName = "$" + arity;
-          if (!body.includes(argName)) break;
-          args.push(argName);
-        }
-        args = args.join(",");
-        var func = `(${args}) => { ${body} };`;
-        ASM_CONSTS[start] = eval(func);
-      }
-      // Add any EM_ASM functions that exist in the side module
-      if ("__start_em_asm" in moduleExports) {
-        var start = moduleExports["__start_em_asm"].value;
-        var stop = moduleExports["__stop_em_asm"].value;
-        while (start < stop) {
-          var jsString = UTF8ToString(start);
-          addEmAsm(start, jsString);
-          start = HEAPU8.indexOf(0, start) + 1;
-        }
-      }
-      function addEmJs(name, cSig, body) {
-        // The signature here is a C signature (e.g. "(int foo, char* bar)").
-        // See `create_em_js` in emcc.py` for the build-time version of this
-        // code.
-        var jsArgs = [];
-        cSig = cSig.slice(1, -1);
-        if (cSig != "void") {
-          cSig = cSig.split(",");
-          for (var arg of cSig) {
-            var jsArg = arg.split(" ").pop();
-            jsArgs.push(jsArg.replaceAll("*", ""));
-          }
-        }
-        var func = `(${jsArgs}) => ${body};`;
-        moduleExports[name] = eval(func);
-      }
-      for (var name in moduleExports) {
-        if (name.startsWith("__em_js__")) {
-          var start = moduleExports[name].value;
-          var jsString = UTF8ToString(start);
-          // EM_JS strings are stored in the data section in the form
-          // SIG<::>BODY.
-          var [sig, body] = jsString.split("<::>");
-          addEmJs(name.replace("__em_js__", ""), sig, body);
-          delete moduleExports[name];
-        }
-      }
-      // initialize the module
-      // Only one thread should call __wasm_call_ctors, but all threads need
-      // to call _emscripten_tls_init
-      registerTLSInit(moduleExports["_emscripten_tls_init"], instance.exports, metadata);
-      if (firstLoad) {
-        var applyRelocs = moduleExports["__wasm_apply_data_relocs"];
-        if (applyRelocs) {
-          if (runtimeInitialized) {
-            applyRelocs();
-          } else {
-            __RELOC_FUNCS__.push(applyRelocs);
-          }
-        }
-        var init = moduleExports["__wasm_call_ctors"];
-        if (init) {
-          if (runtimeInitialized) {
-            init();
-          } else {
-            // we aren't ready to run compiled code yet
-            addOnPostCtor(init);
-          }
-        }
-      }
-      return moduleExports;
-    }
-    if (flags.loadAsync) {
-      return (async () => {
-        var instance;
-        if (binary instanceof WebAssembly.Module) {
-          instance = new WebAssembly.Instance(binary, info);
-        } else {
-          // Destructuring assignment without declaration has to be wrapped
-          // with parens or parser will treat the l-value as an object
-          // literal instead.
-          (({module: binary, instance} = await WebAssembly.instantiate(binary, info)));
-        }
-        return postInstantiation(binary, instance);
-      })();
-    }
-    var module = binary instanceof WebAssembly.Module ? binary : new WebAssembly.Module(binary);
-    var instance = new WebAssembly.Instance(module, info);
-    return postInstantiation(module, instance);
+var ___call_sighandler = (fp, sig) => getWasmTableEntry(fp)(sig);
+
+class ExceptionInfo {
+  // excPtr - Thrown object pointer to wrap. Metadata pointer is calculated from it.
+  constructor(excPtr) {
+    this.excPtr = excPtr;
+    this.ptr = excPtr - 24;
   }
-  // We need to set rpath in flags based on the current library's rpath.
-  // We can't mutate flags or else if a depends on b and c and b depends on d,
-  // then c will be loaded with b's rpath instead of a's.
-  flags = {
-    ...flags,
-    rpath: {
-      parentLibPath: libName,
-      paths: metadata.runtimePaths
-    }
+  set_type(type) {
+    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((this.ptr) + (4)) >> 2), "storing")] = type;
+  }
+  get_type() {
+    return HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((this.ptr) + (4)) >> 2), "loading")];
+  }
+  set_destructor(destructor) {
+    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((this.ptr) + (8)) >> 2), "storing")] = destructor;
+  }
+  get_destructor() {
+    return HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((this.ptr) + (8)) >> 2), "loading")];
+  }
+  set_caught(caught) {
+    caught = caught ? 1 : 0;
+    HEAP8[SAFE_HEAP_INDEX(HEAP8, (this.ptr) + (12), "storing")] = caught;
+    checkInt8(caught);
+  }
+  get_caught() {
+    return HEAP8[SAFE_HEAP_INDEX(HEAP8, (this.ptr) + (12), "loading")] != 0;
+  }
+  set_rethrown(rethrown) {
+    rethrown = rethrown ? 1 : 0;
+    HEAP8[SAFE_HEAP_INDEX(HEAP8, (this.ptr) + (13), "storing")] = rethrown;
+    checkInt8(rethrown);
+  }
+  get_rethrown() {
+    return HEAP8[SAFE_HEAP_INDEX(HEAP8, (this.ptr) + (13), "loading")] != 0;
+  }
+  // Initialize native structure fields. Should be called once after allocated.
+  init(type, destructor) {
+    this.set_adjusted_ptr(0);
+    this.set_type(type);
+    this.set_destructor(destructor);
+  }
+  set_adjusted_ptr(adjustedPtr) {
+    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((this.ptr) + (16)) >> 2), "storing")] = adjustedPtr;
+  }
+  get_adjusted_ptr() {
+    return HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((this.ptr) + (16)) >> 2), "loading")];
+  }
+}
+
+var exceptionLast = 0;
+
+var uncaughtExceptionCount = 0;
+
+var ___cxa_throw = (ptr, type, destructor) => {
+  var info = new ExceptionInfo(ptr);
+  // Initialize ExceptionInfo content after it was allocated in __cxa_allocate_exception.
+  info.init(type, destructor);
+  exceptionLast = ptr;
+  uncaughtExceptionCount++;
+  assert(false, "Exception thrown, but exception catching is not enabled. Compile with -sNO_DISABLE_EXCEPTION_CATCHING or -sEXCEPTION_CATCHING_ALLOWED=[..] to catch.");
+};
+
+var ___handle_stack_overflow = requested => {
+  var base = _emscripten_stack_get_base();
+  var end = _emscripten_stack_get_end();
+  abort(`stack overflow (Attempt to set SP to ${ptrToString(requested)}` + `, with stack limits [${ptrToString(end)} - ${ptrToString(base)}` + "]). If you require more stack space build with -sSTACK_SIZE=<bytes>");
+};
+
+function pthreadCreateProxied(pthread_ptr, attr, startRoutine, arg) {
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(2, 0, 1, pthread_ptr, attr, startRoutine, arg);
+  return ___pthread_create_js(pthread_ptr, attr, startRoutine, arg);
+}
+
+var _emscripten_has_threading_support = () => !!globalThis.SharedArrayBuffer;
+
+var ___pthread_create_js = (pthread_ptr, attr, startRoutine, arg) => {
+  if (!_emscripten_has_threading_support()) {
+    dbg("pthread_create: environment does not support SharedArrayBuffer, pthreads are not available");
+    return 6;
+  }
+  // List of JS objects that will transfer ownership to the Worker hosting the thread
+  var transferList = [];
+  var error = 0;
+  // Synchronously proxy the thread creation to main thread if possible. If we
+  // need to transfer ownership of objects, then proxy asynchronously via
+  // postMessage.
+  if (ENVIRONMENT_IS_PTHREAD && (transferList.length === 0 || error)) {
+    return pthreadCreateProxied(pthread_ptr, attr, startRoutine, arg);
+  }
+  // If on the main thread, and accessing Canvas/OffscreenCanvas failed, abort
+  // with the detected error.
+  if (error) return error;
+  var threadParams = {
+    startRoutine,
+    pthread_ptr,
+    arg,
+    transferList
   };
-  // now load needed libraries and the module itself.
-  if (flags.loadAsync) {
-    return metadata.neededDynlibs.reduce((chain, needed) => chain.then(() => {
-      needed = findLibraryFS(needed, flags.rpath) ?? needed;
-      return loadDynamicLibrary(needed, flags, localScope);
-    }), Promise.resolve()).then(loadModule);
+  if (ENVIRONMENT_IS_PTHREAD) {
+    // The prepopulated pool of web workers that can host pthreads is stored
+    // in the main JS thread. Therefore if a pthread is attempting to spawn a
+    // new thread, the thread creation must be deferred to the main JS thread.
+    threadParams.cmd = "spawnThread";
+    postMessage(threadParams, transferList);
+    // When we defer thread creation this way, we have no way to detect thread
+    // creation synchronously today, so we have to assume success and return 0.
+    return 0;
   }
-  for (var needed of metadata.neededDynlibs) {
-    needed = findLibraryFS(needed, flags.rpath) ?? needed;
-    loadDynamicLibrary(needed, flags, localScope);
-  }
-  return loadModule();
+  // We are the main thread, so we have the pthread warmup pool in this
+  // thread and can fire off JS thread creation directly ourselves.
+  return spawnThread(threadParams);
 };
 
-var mergeLibSymbols = (exports, libName) => {
-  // add symbols into global namespace TODO: weak linking etc.
-  for (var [sym, exp] of Object.entries(exports)) {
-    if (isSymbolDefined(sym)) {
-      var curr = wasmImports[sym], next = exp;
-      // don't warn on functions - might be odr, linkonce_odr, etc.
-      if (!(typeof curr == "function" && typeof next == "function")) {
-        err(`warning: symbol '${sym}' from '${libName}' already exists (duplicate symbol? or weak linking, which isn't supported yet?)`);
-      }
-    }
-    // When RTLD_GLOBAL is enabled, the symbols defined by this shared object
-    // will be made available for symbol resolution of subsequently loaded
-    // shared objects.
-    // We should copy the symbols (which include methods and variables) from
-    // SIDE_MODULE to MAIN_MODULE.
-    const setImport = target => {
-      if (!isSymbolDefined(target)) {
-        wasmImports[target] = exp;
-      }
-    };
-    setImport(sym);
-  }
+var syscallGetVarargI = () => {
+  assert(SYSCALLS.varargs != undefined);
+  // the `+` prepended here is necessary to convince the JSCompiler that varargs is indeed a number.
+  var ret = HEAP32[SAFE_HEAP_INDEX(HEAP32, ((+SYSCALLS.varargs) >> 2), "loading")];
+  SYSCALLS.varargs += 4;
+  return ret;
 };
 
-var asyncLoad = async url => {
-  var arrayBuffer = await readAsync(url);
-  assert(arrayBuffer, `Loading data file "${url}" failed (no arrayBuffer).`);
-  return new Uint8Array(arrayBuffer);
-};
-
-var preloadPlugins = [];
-
-var registerWasmPlugin = () => {
-  // Use string keys here for public methods to avoid minification since the
-  // plugin consumer also uses string keys.
-  var wasmPlugin = {
-    promiseChainEnd: Promise.resolve(),
-    "canHandle": name => !Module["noWasmDecoding"] && name.endsWith(".so"),
-    "handle": async (byteArray, name) => // loadWebAssemblyModule can not load modules out-of-order, so rather
-    // than just running the promises in parallel, this makes a chain of
-    // promises to run in series.
-    wasmPlugin.promiseChainEnd = wasmPlugin.promiseChainEnd.then(async () => {
-      try {
-        var exports = await loadWebAssemblyModule(byteArray, {
-          loadAsync: true,
-          nodelete: true
-        }, name, {});
-      } catch (error) {
-        throw new Error(`failed to instantiate wasm: ${name}: ${error}`);
-      }
-      preloadedWasm[name] = exports;
-      return byteArray;
-    })
-  };
-  preloadPlugins.push(wasmPlugin);
-};
-
-var preloadedWasm = {};
+var syscallGetVarargP = syscallGetVarargI;
 
 var PATH = {
   isAbs: path => path.charAt(0) === "/",
@@ -2400,99 +1719,6 @@ var PATH = {
   basename: path => path && path.match(/([^\/]+|\/)\/*$/)[1],
   join: (...paths) => PATH.normalize(paths.join("/")),
   join2: (l, r) => PATH.normalize(l + "/" + r)
-};
-
-var replaceORIGIN = (parentLibName, rpath) => {
-  if (rpath.startsWith("$ORIGIN")) {
-    // TODO: what to do if we only know the relative path of the file? It will return "." here.
-    var origin = PATH.dirname(parentLibName);
-    return rpath.replace("$ORIGIN", origin);
-  }
-  return rpath;
-};
-
-var withStackSave = f => {
-  var stack = stackSave();
-  var ret = f();
-  stackRestore(stack);
-  return ret;
-};
-
-var lengthBytesUTF8 = str => {
-  var len = 0;
-  for (var i = 0; i < str.length; ++i) {
-    // Gotcha: charCodeAt returns a 16-bit word that is a UTF-16 encoded code
-    // unit, not a Unicode code point of the character! So decode
-    // UTF16->UTF32->UTF8.
-    // See http://unicode.org/faq/utf_bom.html#utf16-3
-    var c = str.charCodeAt(i);
-    // possibly a lead surrogate
-    if (c <= 127) {
-      len++;
-    } else if (c <= 2047) {
-      len += 2;
-    } else if (c >= 55296 && c <= 57343) {
-      len += 4;
-      ++i;
-    } else {
-      len += 3;
-    }
-  }
-  return len;
-};
-
-var stringToUTF8Array = (str, heap, outIdx, maxBytesToWrite) => {
-  assert(typeof str === "string", `stringToUTF8Array expects a string (got ${typeof str})`);
-  // Parameter maxBytesToWrite is not optional. Negative values, 0, null,
-  // undefined and false each don't write out any bytes.
-  if (!(maxBytesToWrite > 0)) return 0;
-  var startIdx = outIdx;
-  var endIdx = outIdx + maxBytesToWrite - 1;
-  // -1 for string null terminator.
-  for (var i = 0; i < str.length; ++i) {
-    // For UTF8 byte structure, see http://en.wikipedia.org/wiki/UTF-8#Description
-    // and https://www.ietf.org/rfc/rfc2279.txt
-    // and https://tools.ietf.org/html/rfc3629
-    var u = str.codePointAt(i);
-    if (u <= 127) {
-      if (outIdx >= endIdx) break;
-      heap[outIdx++] = u;
-    } else if (u <= 2047) {
-      if (outIdx + 1 >= endIdx) break;
-      heap[outIdx++] = 192 | (u >> 6);
-      heap[outIdx++] = 128 | (u & 63);
-    } else if (u <= 65535) {
-      if (outIdx + 2 >= endIdx) break;
-      heap[outIdx++] = 224 | (u >> 12);
-      heap[outIdx++] = 128 | ((u >> 6) & 63);
-      heap[outIdx++] = 128 | (u & 63);
-    } else {
-      if (outIdx + 3 >= endIdx) break;
-      if (u > 1114111) warnOnce("Invalid Unicode code point " + ptrToString(u) + " encountered when serializing a JS string to a UTF-8 string in wasm memory! (Valid unicode code points should be in range 0-0x10FFFF).");
-      heap[outIdx++] = 240 | (u >> 18);
-      heap[outIdx++] = 128 | ((u >> 12) & 63);
-      heap[outIdx++] = 128 | ((u >> 6) & 63);
-      heap[outIdx++] = 128 | (u & 63);
-      // Gotcha: if codePoint is over 0xFFFF, it is represented as a surrogate pair in UTF-16.
-      // We need to manually skip over the second code unit for correct iteration.
-      i++;
-    }
-  }
-  // Null-terminate the pointer to the buffer.
-  heap[outIdx] = 0;
-  return outIdx - startIdx;
-};
-
-var stringToUTF8 = (str, outPtr, maxBytesToWrite) => {
-  assert(typeof maxBytesToWrite == "number", "stringToUTF8(str, outPtr, maxBytesToWrite) is missing the third parameter that specifies the length of the output buffer!");
-  return stringToUTF8Array(str, HEAPU8, outPtr, maxBytesToWrite);
-};
-
-var stringToUTF8OnStack = str => {
-  var size = lengthBytesUTF8(str) + 1;
-  var ret = stackAlloc(size);
-  stringToUTF8(str, ret, size);
-  return ret;
 };
 
 var initRandomFill = () => {
@@ -2564,7 +1790,86 @@ var PATH_FS = {
   }
 };
 
+/**
+   * Given a pointer 'idx' to a null-terminated UTF8-encoded string in the given
+   * array that contains uint8 values, returns a copy of that string as a
+   * Javascript String object.
+   * heapOrArray is either a regular array, or a JavaScript typed array view.
+   * @param {number=} idx
+   * @param {number=} maxBytesToRead
+   * @param {boolean=} ignoreNul - If true, the function will not stop on a NUL character.
+   * @return {string}
+   */ var UTF8ArrayToString = (heapOrArray, idx = 0, maxBytesToRead, ignoreNul) => {
+  var endPtr = findStringEnd(heapOrArray, idx, maxBytesToRead, ignoreNul);
+  return UTF8Decoder.decode(heapOrArray.buffer ? heapOrArray.slice(idx, endPtr) : new Uint8Array(heapOrArray.slice(idx, endPtr)));
+};
+
 var FS_stdin_getChar_buffer = [];
+
+var lengthBytesUTF8 = str => {
+  var len = 0;
+  for (var i = 0; i < str.length; ++i) {
+    // Gotcha: charCodeAt returns a 16-bit word that is a UTF-16 encoded code
+    // unit, not a Unicode code point of the character! So decode
+    // UTF16->UTF32->UTF8.
+    // See http://unicode.org/faq/utf_bom.html#utf16-3
+    var c = str.charCodeAt(i);
+    // possibly a lead surrogate
+    if (c <= 127) {
+      len++;
+    } else if (c <= 2047) {
+      len += 2;
+    } else if (c >= 55296 && c <= 57343) {
+      len += 4;
+      ++i;
+    } else {
+      len += 3;
+    }
+  }
+  return len;
+};
+
+var stringToUTF8Array = (str, heap, outIdx, maxBytesToWrite) => {
+  assert(typeof str === "string", `stringToUTF8Array expects a string (got ${typeof str})`);
+  // Parameter maxBytesToWrite is not optional. Negative values, 0, null,
+  // undefined and false each don't write out any bytes.
+  if (!(maxBytesToWrite > 0)) return 0;
+  var startIdx = outIdx;
+  var endIdx = outIdx + maxBytesToWrite - 1;
+  // -1 for string null terminator.
+  for (var i = 0; i < str.length; ++i) {
+    // For UTF8 byte structure, see http://en.wikipedia.org/wiki/UTF-8#Description
+    // and https://www.ietf.org/rfc/rfc2279.txt
+    // and https://tools.ietf.org/html/rfc3629
+    var u = str.codePointAt(i);
+    if (u <= 127) {
+      if (outIdx >= endIdx) break;
+      heap[outIdx++] = u;
+    } else if (u <= 2047) {
+      if (outIdx + 1 >= endIdx) break;
+      heap[outIdx++] = 192 | (u >> 6);
+      heap[outIdx++] = 128 | (u & 63);
+    } else if (u <= 65535) {
+      if (outIdx + 2 >= endIdx) break;
+      heap[outIdx++] = 224 | (u >> 12);
+      heap[outIdx++] = 128 | ((u >> 6) & 63);
+      heap[outIdx++] = 128 | (u & 63);
+    } else {
+      if (outIdx + 3 >= endIdx) break;
+      if (u > 1114111) warnOnce("Invalid Unicode code point " + ptrToString(u) + " encountered when serializing a JS string to a UTF-8 string in wasm memory! (Valid unicode code points should be in range 0-0x10FFFF).");
+      heap[outIdx++] = 240 | (u >> 18);
+      heap[outIdx++] = 128 | ((u >> 12) & 63);
+      heap[outIdx++] = 128 | ((u >> 6) & 63);
+      heap[outIdx++] = 128 | (u & 63);
+      // Gotcha: if codePoint is over 0xFFFF, it is represented as a surrogate pair in UTF-16.
+      // We need to manually skip over the second code unit for correct iteration.
+      i++;
+    }
+  }
+  // Null-terminate the pointer to the buffer.
+  heap[outIdx] = 0;
+  return outIdx - startIdx;
+};
 
 /** @type {function(string, boolean=, number=)} */ var intArrayFromString = (stringy, dontAddNull, length) => {
   var len = length > 0 ? length : lengthBytesUTF8(stringy) + 1;
@@ -2739,13 +2044,8 @@ var TTY = {
   }
 };
 
-var zeroMemory = (ptr, size) => HEAPU8.fill(0, ptr, ptr + size);
-
 var mmapAlloc = size => {
-  size = alignMemory(size, 65536);
-  var ptr = _emscripten_builtin_memalign(65536, size);
-  if (ptr) zeroMemory(ptr, size);
-  return ptr;
+  abort("internal error: mmapAlloc called but `emscripten_builtin_memalign` native symbol not exported");
 };
 
 var MEMFS = {
@@ -3577,6 +2877,12 @@ var ERRNO_CODES = {
   "ESTRPIPE": 135
 };
 
+var asyncLoad = async url => {
+  var arrayBuffer = await readAsync(url);
+  assert(arrayBuffer, `Loading data file "${url}" failed (no arrayBuffer).`);
+  return new Uint8Array(arrayBuffer);
+};
+
 var FS_createDataFile = (...args) => FS.createDataFile(...args);
 
 var getUniqueRunDependency = id => {
@@ -3586,6 +2892,8 @@ var getUniqueRunDependency = id => {
     id = orig + Math.random();
   }
 };
+
+var preloadPlugins = [];
 
 var FS_handledByPreloadPlugin = async (byteArray, fullname) => {
   // Ensure plugins are ready.
@@ -5288,402 +4596,6 @@ var FS = {
   }
 };
 
-var findLibraryFS = (libName, rpath) => {
-  // If we're preloading a dynamic library, the runtime is not ready to call
-  // __wasmfs_identify or __emscripten_find_dylib. So just quit out.
-  // This means that DT_NEEDED for the main module and transitive dependencies
-  // of it won't work with this code path. Similarly, it means that calling
-  // loadDynamicLibrary in a preRun hook can't use this code path.
-  if (!runtimeInitialized) {
-    return undefined;
-  }
-  if (PATH.isAbs(libName)) {
-    try {
-      FS.lookupPath(libName);
-      return libName;
-    } catch (e) {
-      return undefined;
-    }
-  }
-  var rpathResolved = (rpath?.paths || []).map(p => replaceORIGIN(rpath?.parentLibPath, p));
-  return withStackSave(() => {
-    // In dylink.c we use: `char buf[2*NAME_MAX+2];` and NAME_MAX is 255.
-    // So we use the same size here.
-    var bufSize = 2 * 255 + 2;
-    var buf = stackAlloc(bufSize);
-    var rpathC = stringToUTF8OnStack(rpathResolved.join(":"));
-    var libNameC = stringToUTF8OnStack(libName);
-    var resLibNameC = __emscripten_find_dylib(buf, rpathC, libNameC, bufSize);
-    return resLibNameC ? UTF8ToString(resLibNameC) : undefined;
-  });
-};
-
-/**
-     * @param {number=} handle
-     * @param {Object=} localScope
-     */ function loadDynamicLibrary(libName, flags = {
-  global: true,
-  nodelete: true
-}, localScope, handle) {
-  // when loadDynamicLibrary did not have flags, libraries were loaded
-  // globally & permanently
-  var dso = LDSO.loadedLibsByName[libName];
-  if (dso) {
-    // the library is being loaded or has been loaded already.
-    assert(dso.exports !== "loading", `Attempt to load '${libName}' twice before the first load completed`);
-    if (!flags.global) {
-      if (localScope) {
-        Object.assign(localScope, dso.exports);
-      }
-    } else if (!dso.global) {
-      // The library was previously loaded only locally but now
-      // we have a request with global=true.
-      dso.global = true;
-      mergeLibSymbols(dso.exports, libName);
-    }
-    // same for "nodelete"
-    if (flags.nodelete && dso.refcount !== Infinity) {
-      dso.refcount = Infinity;
-    }
-    dso.refcount++;
-    if (handle) {
-      LDSO.loadedLibsByHandle[handle] = dso;
-    }
-    return flags.loadAsync ? Promise.resolve(true) : true;
-  }
-  // allocate new DSO
-  dso = newDSO(libName, handle, "loading");
-  dso.refcount = flags.nodelete ? Infinity : 1;
-  dso.global = flags.global;
-  // libName -> libData
-  function loadLibData() {
-    var sharedMod = sharedModules[libName];
-    if (sharedMod) {
-      return flags.loadAsync ? Promise.resolve(sharedMod) : sharedMod;
-    }
-    // for wasm, we can use fetch for async, but for fs mode we can only imitate it
-    if (handle) {
-      var data = HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((handle) + (28)) >> 2), "loading")];
-      var dataSize = HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((handle) + (32)) >> 2), "loading")];
-      if (data && dataSize) {
-        var libData = HEAP8.slice(data, data + dataSize);
-        return flags.loadAsync ? Promise.resolve(libData) : libData;
-      }
-    }
-    var f = findLibraryFS(libName, flags.rpath);
-    if (f) {
-      var libData = FS.readFile(f, {
-        encoding: "binary"
-      });
-      return flags.loadAsync ? Promise.resolve(libData) : libData;
-    }
-    var libFile = locateFile(libName);
-    if (flags.loadAsync) {
-      return asyncLoad(libFile);
-    }
-    // load the binary synchronously
-    if (!readBinary) {
-      throw new Error(`${libFile}: file not found, and synchronous loading of external files is not available`);
-    }
-    return readBinary(libFile);
-  }
-  // libName -> exports
-  function getExports() {
-    // lookup preloaded cache first
-    var preloaded = preloadedWasm[libName];
-    if (preloaded) {
-      return flags.loadAsync ? Promise.resolve(preloaded) : preloaded;
-    }
-    // module not preloaded - load lib data and create new module from it
-    if (flags.loadAsync) {
-      return loadLibData().then(libData => loadWebAssemblyModule(libData, flags, libName, localScope, handle));
-    }
-    return loadWebAssemblyModule(loadLibData(), flags, libName, localScope, handle);
-  }
-  // module for lib is loaded - update the dso & global namespace
-  function moduleLoaded(exports) {
-    if (dso.global) {
-      mergeLibSymbols(exports, libName);
-    } else if (localScope) {
-      Object.assign(localScope, exports);
-    }
-    dso.exports = exports;
-  }
-  if (flags.loadAsync) {
-    return getExports().then(exports => {
-      moduleLoaded(exports);
-      return true;
-    });
-  }
-  moduleLoaded(getExports());
-  return true;
-}
-
-var reportUndefinedSymbols = () => {
-  for (var [symName, entry] of Object.entries(GOT)) {
-    if (entry.value == -1) {
-      var value = resolveGlobalSymbol(symName, true).sym;
-      if (!value && !entry.required) {
-        // Ignore undefined symbols that are imported as weak.
-        entry.value = 0;
-        continue;
-      }
-      assert(value, `undefined symbol '${symName}'. perhaps a side module was not linked in? if this global was expected to arrive from a system library, try to build the MAIN_MODULE with EMCC_FORCE_STDLIBS=1 in the environment`);
-      if (typeof value == "function") {
-        /** @suppress {checkTypes} */ entry.value = addFunction(value, value.sig);
-      } else if (typeof value == "number") {
-        entry.value = value;
-      } else if (typeof value.value == "number") {
-        entry.value = value;
-      } else {
-        throw new Error(`bad export type for '${symName}': ${typeof value} (${value})`);
-      }
-    }
-  }
-};
-
-var loadDylibs = async () => {
-  if (!dynamicLibraries.length) {
-    reportUndefinedSymbols();
-    return;
-  }
-  addRunDependency("loadDylibs");
-  // Load binaries asynchronously
-  for (var lib of dynamicLibraries) {
-    await loadDynamicLibrary(lib, {
-      loadAsync: true,
-      global: true,
-      nodelete: true,
-      allowUndefined: true
-    });
-  }
-  // we got them all, wonderful
-  reportUndefinedSymbols();
-  removeRunDependency("loadDylibs");
-};
-
-var noExitRuntime = true;
-
-var registerTLSInit = (tlsInitFunc, moduleExports, metadata) => {
-  // In relocatable builds, we use the result of calling tlsInitFunc
-  // (`_emscripten_tls_init`) to relocate the TLS exports of the module
-  // according to this new __tls_base.
-  function tlsInitWrapper() {
-    var __tls_base = tlsInitFunc();
-    if (!__tls_base) {
-      // __tls_base should never be zero if there are tls exports
-      assert(__tls_base || metadata.tlsExports.size == 0);
-      return;
-    }
-    var tlsExports = {};
-    metadata.tlsExports.forEach(s => tlsExports[s] = moduleExports[s]);
-    updateGOT(relocateExports(tlsExports, __tls_base), /*replace=*/ true);
-  }
-  // Register this function so that its gets called for each thread on
-  // startup.
-  PThread.tlsInitFunctions.push(tlsInitWrapper);
-  // If the main thread is already running we also need to call this function
-  // now.  If the main thread is not yet running this will happen when it
-  // is initialized and processes `PThread.tlsInitFunctions`.
-  if (runtimeInitialized) {
-    tlsInitWrapper();
-  }
-};
-
-var setDylinkStackLimits = (stackTop, stackMax) => {
-  for (var name in LDSO.loadedLibsByName) {
-    var lib = LDSO.loadedLibsByName[name];
-    lib.exports["__set_stack_limits"]?.(stackTop, stackMax);
-  }
-};
-
-var setStackLimits = () => {
-  var stackLow = _emscripten_stack_get_base();
-  var stackHigh = _emscripten_stack_get_end();
-  // With dynamic linking we could have any number of pre-loaded libraries
-  // that each need to have their stack limits set.
-  setDylinkStackLimits(stackLow, stackHigh);
-};
-
-/**
-   * @param {number} ptr
-   * @param {number} value
-   * @param {string} type
-   */ function setValue(ptr, value, type = "i8") {
-  if (type.endsWith("*")) type = "*";
-  switch (type) {
-   case "i1":
-    HEAP8[SAFE_HEAP_INDEX(HEAP8, ptr, "storing")] = value;
-    checkInt8(value);
-    break;
-
-   case "i8":
-    HEAP8[SAFE_HEAP_INDEX(HEAP8, ptr, "storing")] = value;
-    checkInt8(value);
-    break;
-
-   case "i16":
-    HEAP16[SAFE_HEAP_INDEX(HEAP16, ((ptr) >> 1), "storing")] = value;
-    checkInt16(value);
-    break;
-
-   case "i32":
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((ptr) >> 2), "storing")] = value;
-    checkInt32(value);
-    break;
-
-   case "i64":
-    HEAP64[SAFE_HEAP_INDEX(HEAP64, ((ptr) >> 3), "storing")] = BigInt(value);
-    checkInt64(value);
-    break;
-
-   case "float":
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((ptr) >> 2), "storing")] = value;
-    break;
-
-   case "double":
-    HEAPF64[SAFE_HEAP_INDEX(HEAPF64, ((ptr) >> 3), "storing")] = value;
-    break;
-
-   case "*":
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((ptr) >> 2), "storing")] = value;
-    break;
-
-   default:
-    abort(`invalid type for setValue: ${type}`);
-  }
-}
-
-var wasmMemory;
-
-var ___assert_fail = (condition, filename, line, func) => abort(`Assertion failed: ${UTF8ToString(condition)}, at: ` + [ filename ? UTF8ToString(filename) : "unknown filename", line, func ? UTF8ToString(func) : "unknown function" ]);
-
-___assert_fail.sig = "vppip";
-
-var ___call_sighandler = (fp, sig) => getWasmTableEntry(fp)(sig);
-
-___call_sighandler.sig = "vpi";
-
-class ExceptionInfo {
-  // excPtr - Thrown object pointer to wrap. Metadata pointer is calculated from it.
-  constructor(excPtr) {
-    this.excPtr = excPtr;
-    this.ptr = excPtr - 24;
-  }
-  set_type(type) {
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((this.ptr) + (4)) >> 2), "storing")] = type;
-  }
-  get_type() {
-    return HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((this.ptr) + (4)) >> 2), "loading")];
-  }
-  set_destructor(destructor) {
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((this.ptr) + (8)) >> 2), "storing")] = destructor;
-  }
-  get_destructor() {
-    return HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((this.ptr) + (8)) >> 2), "loading")];
-  }
-  set_caught(caught) {
-    caught = caught ? 1 : 0;
-    HEAP8[SAFE_HEAP_INDEX(HEAP8, (this.ptr) + (12), "storing")] = caught;
-    checkInt8(caught);
-  }
-  get_caught() {
-    return HEAP8[SAFE_HEAP_INDEX(HEAP8, (this.ptr) + (12), "loading")] != 0;
-  }
-  set_rethrown(rethrown) {
-    rethrown = rethrown ? 1 : 0;
-    HEAP8[SAFE_HEAP_INDEX(HEAP8, (this.ptr) + (13), "storing")] = rethrown;
-    checkInt8(rethrown);
-  }
-  get_rethrown() {
-    return HEAP8[SAFE_HEAP_INDEX(HEAP8, (this.ptr) + (13), "loading")] != 0;
-  }
-  // Initialize native structure fields. Should be called once after allocated.
-  init(type, destructor) {
-    this.set_adjusted_ptr(0);
-    this.set_type(type);
-    this.set_destructor(destructor);
-  }
-  set_adjusted_ptr(adjustedPtr) {
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((this.ptr) + (16)) >> 2), "storing")] = adjustedPtr;
-  }
-  get_adjusted_ptr() {
-    return HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((this.ptr) + (16)) >> 2), "loading")];
-  }
-}
-
-var exceptionLast = 0;
-
-var uncaughtExceptionCount = 0;
-
-var ___cxa_throw = (ptr, type, destructor) => {
-  var info = new ExceptionInfo(ptr);
-  // Initialize ExceptionInfo content after it was allocated in __cxa_allocate_exception.
-  info.init(type, destructor);
-  exceptionLast = ptr;
-  uncaughtExceptionCount++;
-  assert(false, "Exception thrown, but exception catching is not enabled. Compile with -sNO_DISABLE_EXCEPTION_CATCHING or -sEXCEPTION_CATCHING_ALLOWED=[..] to catch. (note: in dynamic linking, if a side module wants exceptions, the main module must be built with that support)");
-};
-
-___cxa_throw.sig = "vppp";
-
-var ___handle_stack_overflow = requested => {
-  var base = _emscripten_stack_get_base();
-  var end = _emscripten_stack_get_end();
-  abort(`stack overflow (Attempt to set SP to ${ptrToString(requested)}` + `, with stack limits [${ptrToString(end)} - ${ptrToString(base)}` + "]). If you require more stack space build with -sSTACK_SIZE=<bytes>");
-};
-
-___handle_stack_overflow.sig = "vp";
-
-function pthreadCreateProxied(pthread_ptr, attr, startRoutine, arg) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(2, 0, 1, pthread_ptr, attr, startRoutine, arg);
-  return ___pthread_create_js(pthread_ptr, attr, startRoutine, arg);
-}
-
-var _emscripten_has_threading_support = () => !!globalThis.SharedArrayBuffer;
-
-_emscripten_has_threading_support.sig = "i";
-
-var ___pthread_create_js = (pthread_ptr, attr, startRoutine, arg) => {
-  if (!_emscripten_has_threading_support()) {
-    dbg("pthread_create: environment does not support SharedArrayBuffer, pthreads are not available");
-    return 6;
-  }
-  // List of JS objects that will transfer ownership to the Worker hosting the thread
-  var transferList = [];
-  var error = 0;
-  // Synchronously proxy the thread creation to main thread if possible. If we
-  // need to transfer ownership of objects, then proxy asynchronously via
-  // postMessage.
-  if (ENVIRONMENT_IS_PTHREAD && (transferList.length === 0 || error)) {
-    return pthreadCreateProxied(pthread_ptr, attr, startRoutine, arg);
-  }
-  // If on the main thread, and accessing Canvas/OffscreenCanvas failed, abort
-  // with the detected error.
-  if (error) return error;
-  var threadParams = {
-    startRoutine,
-    pthread_ptr,
-    arg,
-    transferList
-  };
-  if (ENVIRONMENT_IS_PTHREAD) {
-    // The prepopulated pool of web workers that can host pthreads is stored
-    // in the main JS thread. Therefore if a pthread is attempting to spawn a
-    // new thread, the thread creation must be deferred to the main JS thread.
-    threadParams.cmd = "spawnThread";
-    postMessage(threadParams, transferList);
-    // When we defer thread creation this way, we have no way to detect thread
-    // creation synchronously today, so we have to assume success and return 0.
-    return 0;
-  }
-  // We are the main thread, so we have the pthread warmup pool in this
-  // thread and can fire off JS thread creation directly ourselves.
-  return spawnThread(threadParams);
-};
-
-___pthread_create_js.sig = "ipppp";
-
 var SYSCALLS = {
   calculateAt(dirfd, path, allowEmpty) {
     if (PATH.isAbs(path)) {
@@ -5788,94 +4700,8 @@ var SYSCALLS = {
   }
 };
 
-function ___syscall_chdir(path) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(3, 0, 1, path);
-  try {
-    path = SYSCALLS.getStr(path);
-    FS.chdir(path);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_chdir.sig = "ip";
-
-function ___syscall_chmod(path, mode) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(4, 0, 1, path, mode);
-  try {
-    path = SYSCALLS.getStr(path);
-    FS.chmod(path, mode);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_chmod.sig = "ipi";
-
-function ___syscall_dup3(fd, newfd, flags) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(5, 0, 1, fd, newfd, flags);
-  try {
-    var old = SYSCALLS.getStreamFromFD(fd);
-    assert(!flags);
-    if (old.fd === newfd) return -28;
-    // Check newfd is within range of valid open file descriptors.
-    if (newfd < 0 || newfd >= FS.MAX_OPEN_FDS) return -8;
-    var existing = FS.getStream(newfd);
-    if (existing) FS.close(existing);
-    return FS.dupStream(old, newfd).fd;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_dup3.sig = "iiii";
-
-function ___syscall_fchmod(fd, mode) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(6, 0, 1, fd, mode);
-  try {
-    FS.fchmod(fd, mode);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_fchmod.sig = "iii";
-
-function ___syscall_fchmodat2(dirfd, path, mode, flags) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(7, 0, 1, dirfd, path, mode, flags);
-  try {
-    var nofollow = flags & 256;
-    path = SYSCALLS.getStr(path);
-    path = SYSCALLS.calculateAt(dirfd, path);
-    FS.chmod(path, mode, nofollow);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_fchmodat2.sig = "iipii";
-
-var syscallGetVarargI = () => {
-  assert(SYSCALLS.varargs != undefined);
-  // the `+` prepended here is necessary to convince the JSCompiler that varargs is indeed a number.
-  var ret = HEAP32[SAFE_HEAP_INDEX(HEAP32, ((+SYSCALLS.varargs) >> 2), "loading")];
-  SYSCALLS.varargs += 4;
-  return ret;
-};
-
-var syscallGetVarargP = syscallGetVarargI;
-
 function ___syscall_fcntl64(fd, cmd, varargs) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(8, 0, 1, fd, cmd, varargs);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(3, 0, 1, fd, cmd, varargs);
   SYSCALLS.varargs = varargs;
   try {
     var stream = SYSCALLS.getStreamFromFD(fd);
@@ -5934,10 +4760,8 @@ function ___syscall_fcntl64(fd, cmd, varargs) {
   }
 }
 
-___syscall_fcntl64.sig = "iiip";
-
 function ___syscall_fstat64(fd, buf) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(9, 0, 1, fd, buf);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(4, 0, 1, fd, buf);
   try {
     return SYSCALLS.writeStat(buf, FS.fstat(fd));
   } catch (e) {
@@ -5946,63 +4770,13 @@ function ___syscall_fstat64(fd, buf) {
   }
 }
 
-___syscall_fstat64.sig = "iip";
-
-function ___syscall_fstatfs64(fd, size, buf) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(10, 0, 1, fd, size, buf);
-  try {
-    assert(size === 88);
-    var stream = SYSCALLS.getStreamFromFD(fd);
-    SYSCALLS.writeStatFs(buf, FS.statfsStream(stream));
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_fstatfs64.sig = "iipp";
-
-var INT53_MAX = 9007199254740992;
-
-var INT53_MIN = -9007199254740992;
-
-var bigintToI53Checked = num => (num < INT53_MIN || num > INT53_MAX) ? NaN : Number(num);
-
-function ___syscall_ftruncate64(fd, length) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(11, 0, 1, fd, length);
-  length = bigintToI53Checked(length);
-  try {
-    if (isNaN(length)) return -61;
-    FS.ftruncate(fd, length);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_ftruncate64.sig = "iij";
-
-function ___syscall_getcwd(buf, size) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(12, 0, 1, buf, size);
-  try {
-    if (size === 0) return -28;
-    var cwd = FS.cwd();
-    var cwdLengthInBytes = lengthBytesUTF8(cwd) + 1;
-    if (size < cwdLengthInBytes) return -68;
-    stringToUTF8(cwd, buf, size);
-    return cwdLengthInBytes;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_getcwd.sig = "ipp";
+var stringToUTF8 = (str, outPtr, maxBytesToWrite) => {
+  assert(typeof maxBytesToWrite == "number", "stringToUTF8(str, outPtr, maxBytesToWrite) is missing the third parameter that specifies the length of the output buffer!");
+  return stringToUTF8Array(str, HEAPU8, outPtr, maxBytesToWrite);
+};
 
 function ___syscall_getdents64(fd, dirp, count) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(13, 0, 1, fd, dirp, count);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(5, 0, 1, fd, dirp, count);
   try {
     var stream = SYSCALLS.getStreamFromFD(fd);
     stream.getdents ||= FS.readdir(stream.path);
@@ -6062,10 +4836,8 @@ function ___syscall_getdents64(fd, dirp, count) {
   }
 }
 
-___syscall_getdents64.sig = "iipp";
-
 function ___syscall_ioctl(fd, op, varargs) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(14, 0, 1, fd, op, varargs);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(6, 0, 1, fd, op, varargs);
   SYSCALLS.varargs = varargs;
   try {
     var stream = SYSCALLS.getStreamFromFD(fd);
@@ -6195,10 +4967,8 @@ function ___syscall_ioctl(fd, op, varargs) {
   }
 }
 
-___syscall_ioctl.sig = "iiip";
-
 function ___syscall_lstat64(path, buf) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(15, 0, 1, path, buf);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(7, 0, 1, path, buf);
   try {
     path = SYSCALLS.getStr(path);
     return SYSCALLS.writeStat(buf, FS.lstat(path));
@@ -6208,25 +4978,8 @@ function ___syscall_lstat64(path, buf) {
   }
 }
 
-___syscall_lstat64.sig = "ipp";
-
-function ___syscall_mkdirat(dirfd, path, mode) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(16, 0, 1, dirfd, path, mode);
-  try {
-    path = SYSCALLS.getStr(path);
-    path = SYSCALLS.calculateAt(dirfd, path);
-    FS.mkdir(path, mode, 0);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_mkdirat.sig = "iipi";
-
 function ___syscall_newfstatat(dirfd, path, buf, flags) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(17, 0, 1, dirfd, path, buf, flags);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(8, 0, 1, dirfd, path, buf, flags);
   try {
     path = SYSCALLS.getStr(path);
     var nofollow = flags & 256;
@@ -6241,10 +4994,8 @@ function ___syscall_newfstatat(dirfd, path, buf, flags) {
   }
 }
 
-___syscall_newfstatat.sig = "iippi";
-
 function ___syscall_openat(dirfd, path, flags, varargs) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(18, 0, 1, dirfd, path, flags, varargs);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(9, 0, 1, dirfd, path, flags, varargs);
   SYSCALLS.varargs = varargs;
   try {
     path = SYSCALLS.getStr(path);
@@ -6257,49 +5008,8 @@ function ___syscall_openat(dirfd, path, flags, varargs) {
   }
 }
 
-___syscall_openat.sig = "iipip";
-
-function ___syscall_readlinkat(dirfd, path, buf, bufsize) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(19, 0, 1, dirfd, path, buf, bufsize);
-  try {
-    path = SYSCALLS.getStr(path);
-    path = SYSCALLS.calculateAt(dirfd, path);
-    if (bufsize <= 0) return -28;
-    var ret = FS.readlink(path);
-    var len = Math.min(bufsize, lengthBytesUTF8(ret));
-    var endChar = HEAP8[SAFE_HEAP_INDEX(HEAP8, buf + len, "loading")];
-    stringToUTF8(ret, buf, bufsize + 1);
-    // readlink is one of the rare functions that write out a C string, but does never append a null to the output buffer(!)
-    // stringToUTF8() always appends a null byte, so restore the character under the null byte after the write.
-    HEAP8[SAFE_HEAP_INDEX(HEAP8, buf + len, "storing")] = endChar;
-    return len;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_readlinkat.sig = "iippp";
-
-function ___syscall_renameat(olddirfd, oldpath, newdirfd, newpath) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(20, 0, 1, olddirfd, oldpath, newdirfd, newpath);
-  try {
-    oldpath = SYSCALLS.getStr(oldpath);
-    newpath = SYSCALLS.getStr(newpath);
-    oldpath = SYSCALLS.calculateAt(olddirfd, oldpath);
-    newpath = SYSCALLS.calculateAt(newdirfd, newpath);
-    FS.rename(oldpath, newpath);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_renameat.sig = "iipip";
-
 function ___syscall_rmdir(path) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(21, 0, 1, path);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(10, 0, 1, path);
   try {
     path = SYSCALLS.getStr(path);
     FS.rmdir(path);
@@ -6310,10 +5020,8 @@ function ___syscall_rmdir(path) {
   }
 }
 
-___syscall_rmdir.sig = "ip";
-
 function ___syscall_stat64(path, buf) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(22, 0, 1, path, buf);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(11, 0, 1, path, buf);
   try {
     path = SYSCALLS.getStr(path);
     return SYSCALLS.writeStat(buf, FS.stat(path));
@@ -6323,56 +5031,8 @@ function ___syscall_stat64(path, buf) {
   }
 }
 
-___syscall_stat64.sig = "ipp";
-
-function ___syscall_statfs64(path, size, buf) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(23, 0, 1, path, size, buf);
-  try {
-    assert(size === 88);
-    SYSCALLS.writeStatFs(buf, FS.statfs(SYSCALLS.getStr(path)));
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_statfs64.sig = "ippp";
-
-function ___syscall_symlinkat(target, dirfd, linkpath) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(24, 0, 1, target, dirfd, linkpath);
-  try {
-    target = SYSCALLS.getStr(target);
-    linkpath = SYSCALLS.getStr(linkpath);
-    linkpath = SYSCALLS.calculateAt(dirfd, linkpath);
-    FS.symlink(target, linkpath);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_symlinkat.sig = "ipip";
-
-function ___syscall_truncate64(path, length) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(25, 0, 1, path, length);
-  length = bigintToI53Checked(length);
-  try {
-    if (isNaN(length)) return -61;
-    path = SYSCALLS.getStr(path);
-    FS.truncate(path, length);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_truncate64.sig = "ipj";
-
 function ___syscall_unlinkat(dirfd, path, flags) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(26, 0, 1, dirfd, path, flags);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(12, 0, 1, dirfd, path, flags);
   try {
     path = SYSCALLS.getStr(path);
     path = SYSCALLS.calculateAt(dirfd, path);
@@ -6390,141 +5050,15 @@ function ___syscall_unlinkat(dirfd, path, flags) {
   }
 }
 
-___syscall_unlinkat.sig = "iipi";
-
-var readI53FromI64 = ptr => HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((ptr) >> 2), "loading")] + HEAP32[SAFE_HEAP_INDEX(HEAP32, (((ptr) + (4)) >> 2), "loading")] * 4294967296;
-
-function ___syscall_utimensat(dirfd, path, times, flags) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(27, 0, 1, dirfd, path, times, flags);
-  try {
-    path = SYSCALLS.getStr(path);
-    assert(!flags);
-    path = SYSCALLS.calculateAt(dirfd, path, true);
-    var now = Date.now(), atime, mtime;
-    if (!times) {
-      atime = now;
-      mtime = now;
-    } else {
-      var seconds = readI53FromI64(times);
-      var nanoseconds = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((times) + (8)) >> 2), "loading")];
-      if (nanoseconds == 1073741823) {
-        atime = now;
-      } else if (nanoseconds == 1073741822) {
-        atime = null;
-      } else {
-        atime = (seconds * 1e3) + (nanoseconds / (1e3 * 1e3));
-      }
-      times += 16;
-      seconds = readI53FromI64(times);
-      nanoseconds = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((times) + (8)) >> 2), "loading")];
-      if (nanoseconds == 1073741823) {
-        mtime = now;
-      } else if (nanoseconds == 1073741822) {
-        mtime = null;
-      } else {
-        mtime = (seconds * 1e3) + (nanoseconds / (1e3 * 1e3));
-      }
-    }
-    // null here means UTIME_OMIT was passed. If both were set to UTIME_OMIT then
-    // we can skip the call completely.
-    if ((mtime ?? atime) !== null) {
-      FS.utime(path, atime, mtime);
-    }
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_utimensat.sig = "iippi";
-
 var __abort_js = () => abort("native code called abort()");
 
-__abort_js.sig = "v";
-
-var dlSetError = msg => {
-  var sp = stackSave();
-  var cmsg = stringToUTF8OnStack(msg);
-  ___dl_seterr(cmsg, 0);
-  stackRestore(sp);
+var __emscripten_init_main_thread_js = tb => {
+  // Pass the thread address to the native code where they are stored in wasm
+  // globals which act as a form of TLS. Global constructors trying
+  // to access this value will read the wrong value, but that is UB anyway.
+  __emscripten_thread_init(tb, /*is_main=*/ !ENVIRONMENT_IS_WORKER, /*is_runtime=*/ 1, /*can_block=*/ !ENVIRONMENT_IS_WEB, /*default_stacksize=*/ 1048576, /*start_profiling=*/ false);
+  PThread.threadInitTLS();
 };
-
-var dlopenInternal = (handle, jsflags) => {
-  // void *dlopen(const char *file, int mode);
-  // http://pubs.opengroup.org/onlinepubs/009695399/functions/dlopen.html
-  var filename = UTF8ToString(handle + 36);
-  var flags = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((handle) + (4)) >> 2), "loading")];
-  filename = PATH.normalize(filename);
-  var searchpaths = [];
-  var global = Boolean(flags & 256);
-  var localScope = global ? null : {};
-  // We don't care about RTLD_NOW and RTLD_LAZY.
-  var combinedFlags = {
-    global,
-    nodelete: Boolean(flags & 4096),
-    loadAsync: jsflags.loadAsync
-  };
-  if (jsflags.loadAsync) {
-    return loadDynamicLibrary(filename, combinedFlags, localScope, handle);
-  }
-  try {
-    return loadDynamicLibrary(filename, combinedFlags, localScope, handle);
-  } catch (e) {
-    err(`error loading dynamic library ${filename}: ${e}`);
-    dlSetError(`could not load dynamic lib: ${filename}\n${e}`);
-    return 0;
-  }
-};
-
-var __dlopen_js = handle => dlopenInternal(handle, {
-  loadAsync: false
-});
-
-__dlopen_js.sig = "pp";
-
-var __dlsym_catchup_js = (handle, symbolIndex) => {
-  var lib = LDSO.loadedLibsByHandle[handle];
-  var symDict = lib.exports;
-  var symName = Object.keys(symDict)[symbolIndex];
-  var sym = symDict[symName];
-  var result = addFunction(sym, sym.sig);
-  return result;
-};
-
-__dlsym_catchup_js.sig = "ppi";
-
-var __dlsym_js = (handle, symbol, symbolIndex) => {
-  // void *dlsym(void *restrict handle, const char *restrict name);
-  // http://pubs.opengroup.org/onlinepubs/009695399/functions/dlsym.html
-  symbol = UTF8ToString(symbol);
-  var result;
-  var newSymIndex;
-  var lib = LDSO.loadedLibsByHandle[handle];
-  assert(lib, `Tried to dlsym() from an unopened handle: ${handle}`);
-  newSymIndex = Object.keys(lib.exports).indexOf(symbol);
-  if (newSymIndex == -1 || lib.exports[symbol].stub) {
-    dlSetError(`Tried to lookup unknown symbol "${symbol}" in dynamic lib: ${lib.name}`);
-    return 0;
-  }
-  result = lib.exports[symbol];
-  if (typeof result == "function") {
-    var addr = getFunctionAddress(result);
-    if (addr) {
-      result = addr;
-    } else {
-      // Insert the function into the wasm table.  If it's a direct wasm
-      // function the second argument will not be needed.  If it's a JS
-      // function we rely on the `sig` attribute being set based on the
-      // `<func>__sig` specified in library JS file.
-      result = addFunction(result, result.sig);
-      HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((symbolIndex) >> 2), "storing")] = newSymIndex;
-    }
-  }
-  return result;
-};
-
-__dlsym_js.sig = "pppp";
 
 var handleException = e => {
   // Certain exception types we do not treat as errors since they are used for
@@ -6575,389 +5109,6 @@ var callUserCallback = func => {
   }
 };
 
-var runtimeKeepalivePush = () => {
-  runtimeKeepaliveCounter += 1;
-};
-
-runtimeKeepalivePush.sig = "v";
-
-var runtimeKeepalivePop = () => {
-  assert(runtimeKeepaliveCounter > 0);
-  runtimeKeepaliveCounter -= 1;
-};
-
-runtimeKeepalivePop.sig = "v";
-
-var __emscripten_dlopen_js = (handle, onsuccess, onerror, user_data) => {
-  /** @param {Object=} e */ function errorCallback(e) {
-    var filename = UTF8ToString(handle + 36);
-    dlSetError(`'Could not load dynamic lib: ${filename}\n${e}`);
-    runtimeKeepalivePop();
-    callUserCallback(() => getWasmTableEntry(onerror)(handle, user_data));
-  }
-  function successCallback() {
-    runtimeKeepalivePop();
-    callUserCallback(() => getWasmTableEntry(onsuccess)(handle, user_data));
-  }
-  runtimeKeepalivePush();
-  var promise = dlopenInternal(handle, {
-    loadAsync: true
-  });
-  if (promise) {
-    promise.then(successCallback, errorCallback);
-  } else {
-    errorCallback();
-  }
-};
-
-__emscripten_dlopen_js.sig = "vpppp";
-
-class HandleAllocator {
-  allocated=[ undefined ];
-  freelist=[];
-  get(id) {
-    assert(this.allocated[id] !== undefined, `invalid handle: ${id}`);
-    return this.allocated[id];
-  }
-  has(id) {
-    return this.allocated[id] !== undefined;
-  }
-  allocate(handle) {
-    var id = this.freelist.pop() || this.allocated.length;
-    this.allocated[id] = handle;
-    return id;
-  }
-  free(id) {
-    assert(this.allocated[id] !== undefined);
-    // Set the slot to `undefined` rather than using `delete` here since
-    // apparently arrays with holes in them can be less efficient.
-    this.allocated[id] = undefined;
-    this.freelist.push(id);
-  }
-}
-
-var promiseMap = new HandleAllocator;
-
-var makePromise = () => {
-  var promiseInfo = {};
-  promiseInfo.promise = new Promise((resolve, reject) => {
-    promiseInfo.reject = reject;
-    promiseInfo.resolve = resolve;
-  });
-  promiseInfo.id = promiseMap.allocate(promiseInfo);
-  return promiseInfo;
-};
-
-var dlsyncThreadsAsync = async () => {
-  const caller = PThread.currentProxiedOperationCallerThread;
-  assert(!ENVIRONMENT_IS_PTHREAD, "Internal Error! dlsyncThreadsAsync() can only ever be called from main thread");
-  assert(Object.keys(PThread.outstandingPromises).length === 0);
-  const promises = [];
-  // This first promise resolves once the main thread has loaded all modules.
-  var info = makePromise();
-  promises.push(info.promise);
-  __emscripten_dlsync_self_async(info.id);
-  // We then create a sequence of promises, one per thread, that resolve once
-  // each thread has performed its sync using _emscripten_proxy_dlsync.
-  // Any new threads that are created after this call will automatically be
-  // in sync because we call `__emscripten_dlsync_self` in
-  // invokeEntryPoint before the threads entry point is called.
-  for (const ptr of Object.keys(PThread.pthreads)) {
-    const pthread_ptr = Number(ptr);
-    if (pthread_ptr !== caller && !PThread.finishedThreads.has(pthread_ptr)) {
-      info = makePromise();
-      __emscripten_proxy_dlsync_async(pthread_ptr, info.id);
-      PThread.outstandingPromises[pthread_ptr] = info;
-      promises.push(info.promise);
-    }
-  }
-  await Promise.all(promises);
-  PThread.outstandingPromises = {};
-};
-
-function __emscripten_dlsync_threads() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(28, 0, 2);
-  const callingThread = PThread.currentProxiedOperationCallerThread;
-  if (callingThread) {
-    return dlsyncThreadsAsync();
-  }
-  for (const ptr of Object.keys(PThread.pthreads)) {
-    const pthread_ptr = Number(ptr);
-    if (!PThread.finishedThreads.has(pthread_ptr)) {
-      __emscripten_proxy_dlsync(pthread_ptr);
-    }
-  }
-}
-
-__emscripten_dlsync_threads.sig = "v";
-
-var onExits = [];
-
-var addOnExit = cb => onExits.push(cb);
-
-var JSEvents = {
-  removeAllEventListeners() {
-    while (JSEvents.eventHandlers.length) {
-      JSEvents._removeHandler(JSEvents.eventHandlers.length - 1);
-    }
-    JSEvents.deferredCalls = [];
-  },
-  inEventHandler: 0,
-  deferredCalls: [],
-  deferCall(targetFunction, precedence, argsList) {
-    function arraysHaveEqualContent(arrA, arrB) {
-      if (arrA.length != arrB.length) return false;
-      for (var i in arrA) {
-        if (arrA[i] != arrB[i]) return false;
-      }
-      return true;
-    }
-    // Test if the given call was already queued, and if so, don't add it again.
-    for (var call of JSEvents.deferredCalls) {
-      if (call.targetFunction == targetFunction && arraysHaveEqualContent(call.argsList, argsList)) {
-        return;
-      }
-    }
-    JSEvents.deferredCalls.push({
-      targetFunction,
-      precedence,
-      argsList
-    });
-    JSEvents.deferredCalls.sort((x, y) => x.precedence < y.precedence);
-  },
-  removeDeferredCalls(targetFunction) {
-    JSEvents.deferredCalls = JSEvents.deferredCalls.filter(call => call.targetFunction != targetFunction);
-  },
-  canPerformEventHandlerRequests() {
-    if (navigator.userActivation) {
-      // Verify against transient activation status from UserActivation API
-      // whether it is possible to perform a request here without needing to defer. See
-      // https://developer.mozilla.org/en-US/docs/Web/Security/User_activation#transient_activation
-      // and https://caniuse.com/mdn-api_useractivation
-      // At the time of writing, Firefox does not support this API: https://bugzil.la/1791079
-      return navigator.userActivation.isActive;
-    }
-    return JSEvents.inEventHandler && JSEvents.currentEventHandler.allowsDeferredCalls;
-  },
-  runDeferredCalls() {
-    if (!JSEvents.canPerformEventHandlerRequests()) {
-      return;
-    }
-    var deferredCalls = JSEvents.deferredCalls;
-    JSEvents.deferredCalls = [];
-    for (var call of deferredCalls) {
-      call.targetFunction(...call.argsList);
-    }
-  },
-  eventHandlers: [],
-  removeAllHandlersOnTarget: (target, eventTypeString) => {
-    for (var i = 0; i < JSEvents.eventHandlers.length; ++i) {
-      if (JSEvents.eventHandlers[i].target == target && (!eventTypeString || eventTypeString == JSEvents.eventHandlers[i].eventTypeString)) {
-        JSEvents._removeHandler(i--);
-      }
-    }
-  },
-  _removeHandler(i) {
-    var h = JSEvents.eventHandlers[i];
-    h.target.removeEventListener(h.eventTypeString, h.eventListenerFunc, h.useCapture);
-    JSEvents.eventHandlers.splice(i, 1);
-  },
-  registerOrRemoveHandler(eventHandler) {
-    if (!eventHandler.target) {
-      err("registerOrRemoveHandler: the target element for event handler registration does not exist, when processing the following event handler registration:");
-      console.dir(eventHandler);
-      return -4;
-    }
-    if (eventHandler.callbackfunc) {
-      eventHandler.eventListenerFunc = function(event) {
-        // Increment nesting count for the event handler.
-        ++JSEvents.inEventHandler;
-        JSEvents.currentEventHandler = eventHandler;
-        // Process any old deferred calls the user has placed.
-        JSEvents.runDeferredCalls();
-        // Process the actual event, calls back to user C code handler.
-        eventHandler.handlerFunc(event);
-        // Process any new deferred calls that were placed right now from this event handler.
-        JSEvents.runDeferredCalls();
-        // Out of event handler - restore nesting count.
-        --JSEvents.inEventHandler;
-      };
-      eventHandler.target.addEventListener(eventHandler.eventTypeString, eventHandler.eventListenerFunc, eventHandler.useCapture);
-      JSEvents.eventHandlers.push(eventHandler);
-    } else {
-      for (var i = 0; i < JSEvents.eventHandlers.length; ++i) {
-        if (JSEvents.eventHandlers[i].target == eventHandler.target && JSEvents.eventHandlers[i].eventTypeString == eventHandler.eventTypeString) {
-          JSEvents._removeHandler(i--);
-        }
-      }
-    }
-    return 0;
-  },
-  removeSingleHandler(eventHandler) {
-    let success = false;
-    for (let i = 0; i < JSEvents.eventHandlers.length; ++i) {
-      const handler = JSEvents.eventHandlers[i];
-      if (handler.target === eventHandler.target && handler.eventTypeId === eventHandler.eventTypeId && handler.callbackfunc === eventHandler.callbackfunc && handler.userData === eventHandler.userData) {
-        // in some very rare cases (ex: Safari / fullscreen events), there is more than 1 handler (eventTypeString is different)
-        JSEvents._removeHandler(i--);
-        success = true;
-      }
-    }
-    return success ? 0 : -5;
-  },
-  getTargetThreadForEventCallback(targetThread) {
-    switch (targetThread) {
-     case 1:
-      // The event callback for the current event should be called on the
-      // main browser thread. (0 == don't proxy)
-      return 0;
-
-     case 2:
-      // The event callback for the current event should be backproxied to
-      // the thread that is registering the event.
-      // This can be 0 in the case that the caller uses
-      // EM_CALLBACK_THREAD_CONTEXT_CALLING_THREAD but on the main thread
-      // itself.
-      return PThread.currentProxiedOperationCallerThread;
-
-     default:
-      // The event callback for the current event should be proxied to the
-      // given specific thread.
-      return targetThread;
-    }
-  },
-  getNodeNameForTarget(target) {
-    if (!target) return "";
-    if (target == window) return "#window";
-    if (target == screen) return "#screen";
-    return target?.nodeName || "";
-  },
-  fullscreenEnabled() {
-    return document.fullscreenEnabled || document.webkitFullscreenEnabled;
-  }
-};
-
-function __emscripten_get_last_devicemotion_event() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(29, 0, 1);
-  return JSEvents.deviceMotionEvent;
-}
-
-__emscripten_get_last_devicemotion_event.sig = "p";
-
-function __emscripten_get_last_deviceorientation_event() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(30, 0, 1);
-  return JSEvents.deviceOrientationEvent;
-}
-
-__emscripten_get_last_deviceorientation_event.sig = "p";
-
-function __emscripten_get_last_mouse_event() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(31, 0, 1);
-  return JSEvents.mouseEvent;
-}
-
-__emscripten_get_last_mouse_event.sig = "p";
-
-var __emscripten_init_main_thread_js = tb => {
-  // Pass the thread address to the native code where they are stored in wasm
-  // globals which act as a form of TLS. Global constructors trying
-  // to access this value will read the wrong value, but that is UB anyway.
-  __emscripten_thread_init(tb, /*is_main=*/ !ENVIRONMENT_IS_WORKER, /*is_runtime=*/ 1, /*can_block=*/ !ENVIRONMENT_IS_WEB, /*default_stacksize=*/ 1048576, /*start_profiling=*/ false);
-  PThread.threadInitTLS();
-};
-
-__emscripten_init_main_thread_js.sig = "vp";
-
-var jsStackTrace = () => (new Error).stack.toString();
-
-/** @param {number=} flags */ var getCallstack = flags => {
-  var callstack = jsStackTrace();
-  if (flags & 8) {
-    warnOnce("emscripten_log with EM_LOG_C_STACK no longer has any effect");
-  }
-  // Process all lines:
-  var lines = callstack.split("\n");
-  callstack = "";
-  // Extract components of form:
-  // '       Object._main@http://server.com:4324:12'
-  var firefoxRe = new RegExp("\\s*(.*?)@(.*?):([0-9]+):([0-9]+)");
-  // Extract components of form:
-  // '    at Object._main (http://server.com/file.html:4324:12)'
-  var chromeRe = new RegExp("\\s*at (.*?) \\((.*):(.*):(.*)\\)");
-  for (var line of lines) {
-    var symbolName = "";
-    var file = "";
-    var lineno = 0;
-    var column = 0;
-    var parts = chromeRe.exec(line);
-    if (parts?.length == 5) {
-      symbolName = parts[1];
-      file = parts[2];
-      lineno = parts[3];
-      column = parts[4];
-    } else {
-      parts = firefoxRe.exec(line);
-      if (parts?.length >= 4) {
-        symbolName = parts[1];
-        file = parts[2];
-        lineno = parts[3];
-        // Old Firefox doesn't carry column information, but in new FF30, it
-        // is present. See https://bugzil.la/762556
-        column = parts[4] | 0;
-      } else {
-        // Was not able to extract this line for demangling/sourcemapping
-        // purposes. Output it as-is.
-        callstack += line + "\n";
-        continue;
-      }
-    }
-    // Find the symbols in the callstack that corresponds to the functions that
-    // report callstack information, and remove everything up to these from the
-    // output.
-    if (symbolName == "_emscripten_log" || symbolName == "_emscripten_get_callstack") {
-      callstack = "";
-      continue;
-    }
-    if ((flags & 24)) {
-      if (flags & 64) {
-        file = file.substring(file.replace(/\\/g, "/").lastIndexOf("/") + 1);
-      }
-      callstack += `    at ${symbolName} (${file}:${lineno}:${column})\n`;
-    }
-  }
-  // Trim extra whitespace at the end of the output.
-  callstack = callstack.replace(/\s+$/, "");
-  return callstack;
-};
-
-var __emscripten_log_formatted = (flags, str) => {
-  str = UTF8ToString(str);
-  if (flags & 24) {
-    str = str.replace(/\s+$/, "");
-    // Ensure the message and the callstack are joined cleanly with exactly one newline.
-    str += (str.length > 0 ? "\n" : "") + getCallstack(flags);
-  }
-  if (flags & 1) {
-    if (flags & 4) {
-      console.error(str);
-    } else if (flags & 2) {
-      console.warn(str);
-    } else if (flags & 512) {
-      console.info(str);
-    } else if (flags & 256) {
-      console.debug(str);
-    } else {
-      console.log(str);
-    }
-  } else if (flags & 6) {
-    err(str);
-  } else {
-    out(str);
-  }
-};
-
-__emscripten_log_formatted.sig = "vip";
-
 var waitAsyncPolyfilled = (!Atomics.waitAsync || globalThis.Deno || (globalThis.navigator?.userAgent && Number((navigator.userAgent.match(/Chrom(e|ium)\/([0-9]+)\./) || [])[2]) < 91));
 
 var __emscripten_thread_mailbox_await = pthread_ptr => {
@@ -6973,8 +5124,6 @@ var __emscripten_thread_mailbox_await = pthread_ptr => {
     Atomics.store(HEAP32, ((waitingAsync) >> 2), 1);
   }
 };
-
-__emscripten_thread_mailbox_await.sig = "vp";
 
 var checkMailbox = () => callUserCallback(() => {
   // Only check the mailbox if we have a live pthread runtime. We implement
@@ -7013,8 +5162,6 @@ var __emscripten_notify_mailbox_postmessage = (targetThread, currThreadId) => {
     });
   }
 };
-
-__emscripten_notify_mailbox_postmessage.sig = "vpp";
 
 var proxiedJSCallArgs = [];
 
@@ -7055,14 +5202,10 @@ var __emscripten_receive_on_main_thread_js = (funcIndex, emAsmAddr, callingThrea
   return rtn;
 };
 
-__emscripten_receive_on_main_thread_js.sig = "dippippp";
-
 var __emscripten_runtime_keepalive_clear = () => {
   noExitRuntime = false;
   runtimeKeepaliveCounter = 0;
 };
-
-__emscripten_runtime_keepalive_clear.sig = "v";
 
 var __emscripten_thread_cleanup = thread => {
   // Called when a thread needs to be cleaned up so it can be reused.
@@ -7076,21 +5219,6 @@ var __emscripten_thread_cleanup = thread => {
   });
 };
 
-__emscripten_thread_cleanup.sig = "vp";
-
-var __emscripten_thread_exit_joinable = thread => {
-  // Called when a thread exits and is joinable.  We mark these threads
-  // as finished, which means they are in state where are no longer actually
-  // running, but remain around waiting to be joined.  In this state they
-  // cannot run any more proxied work.
-  if (!ENVIRONMENT_IS_PTHREAD) markAsFinished(thread); else postMessage({
-    cmd: "markAsFinished",
-    thread
-  });
-};
-
-__emscripten_thread_exit_joinable.sig = "vp";
-
 var __emscripten_thread_set_strongref = thread => {
   // Called when a thread needs to be strongly referenced.
   // Currently only used for:
@@ -7101,33 +5229,6 @@ var __emscripten_thread_set_strongref = thread => {
     PThread.pthreads[thread].ref();
   }
 };
-
-__emscripten_thread_set_strongref.sig = "vp";
-
-function __gmtime_js(time, tmPtr) {
-  time = bigintToI53Checked(time);
-  var date = new Date(time * 1e3);
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, ((tmPtr) >> 2), "storing")] = date.getUTCSeconds();
-  checkInt32(date.getUTCSeconds());
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (4)) >> 2), "storing")] = date.getUTCMinutes();
-  checkInt32(date.getUTCMinutes());
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (8)) >> 2), "storing")] = date.getUTCHours();
-  checkInt32(date.getUTCHours());
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (12)) >> 2), "storing")] = date.getUTCDate();
-  checkInt32(date.getUTCDate());
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (16)) >> 2), "storing")] = date.getUTCMonth();
-  checkInt32(date.getUTCMonth());
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (20)) >> 2), "storing")] = date.getUTCFullYear() - 1900;
-  checkInt32(date.getUTCFullYear() - 1900);
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (24)) >> 2), "storing")] = date.getUTCDay();
-  checkInt32(date.getUTCDay());
-  var start = Date.UTC(date.getUTCFullYear(), 0, 1, 0, 0, 0, 0);
-  var yday = ((date.getTime() - start) / (1e3 * 60 * 60 * 24)) | 0;
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (28)) >> 2), "storing")] = yday;
-  checkInt32(yday);
-}
-
-__gmtime_js.sig = "vjp";
 
 var isLeapYear = year => year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
 
@@ -7142,6 +5243,12 @@ var ydayFromDate = date => {
   // -1 since it's days since Jan 1
   return yday;
 };
+
+var INT53_MAX = 9007199254740992;
+
+var INT53_MIN = -9007199254740992;
+
+var bigintToI53Checked = num => (num < INT53_MIN || num > INT53_MAX) ? NaN : Number(num);
 
 function __localtime_js(time, tmPtr) {
   time = bigintToI53Checked(time);
@@ -7173,8 +5280,6 @@ function __localtime_js(time, tmPtr) {
   HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (32)) >> 2), "storing")] = dst;
   checkInt32(dst);
 }
-
-__localtime_js.sig = "vjp";
 
 var __mktime_js = function(tmPtr) {
   var ret = (() => {
@@ -7227,55 +5332,6 @@ var __mktime_js = function(tmPtr) {
   return BigInt(ret);
 };
 
-__mktime_js.sig = "jp";
-
-var timers = {};
-
-var _emscripten_get_now = () => performance.timeOrigin + performance.now();
-
-_emscripten_get_now.sig = "d";
-
-function __setitimer_js(which, timeout_ms) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(32, 0, 1, which, timeout_ms);
-  // First, clear any existing timer.
-  if (timers[which]) {
-    clearTimeout(timers[which].id);
-    delete timers[which];
-  }
-  // A timeout of zero simply cancels the current timeout so we have nothing
-  // more to do.
-  if (!timeout_ms) return 0;
-  var id = setTimeout(() => {
-    assert(which in timers);
-    delete timers[which];
-    callUserCallback(() => __emscripten_timeout(which, _emscripten_get_now()));
-  }, timeout_ms);
-  timers[which] = {
-    id,
-    timeout_ms
-  };
-  return 0;
-}
-
-__setitimer_js.sig = "iid";
-
-var __timegm_js = function(tmPtr) {
-  var ret = (() => {
-    var time = Date.UTC(HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (20)) >> 2), "loading")] + 1900, HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (16)) >> 2), "loading")], HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (12)) >> 2), "loading")], HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (8)) >> 2), "loading")], HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (4)) >> 2), "loading")], HEAP32[SAFE_HEAP_INDEX(HEAP32, ((tmPtr) >> 2), "loading")], 0);
-    var date = new Date(time);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (24)) >> 2), "storing")] = date.getUTCDay();
-    checkInt32(date.getUTCDay());
-    var start = Date.UTC(date.getUTCFullYear(), 0, 1, 0, 0, 0, 0);
-    var yday = ((date.getTime() - start) / (1e3 * 60 * 60 * 24)) | 0;
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (28)) >> 2), "storing")] = yday;
-    checkInt32(yday);
-    return date.getTime() / 1e3;
-  })();
-  return BigInt(ret);
-};
-
-__timegm_js.sig = "jp";
-
 var __tzset_js = (timezone, daylight, std_name, dst_name) => {
   // TODO: Use (malleable) environment variables instead of system settings.
   var currentYear = (new Date).getFullYear();
@@ -7323,11 +5379,9 @@ var __tzset_js = (timezone, daylight, std_name, dst_name) => {
   }
 };
 
-__tzset_js.sig = "vpppp";
+var _emscripten_get_now = () => performance.timeOrigin + performance.now();
 
 var _emscripten_date_now = () => Date.now();
-
-_emscripten_date_now.sig = "d";
 
 var nowIsMonotonic = 1;
 
@@ -7354,11 +5408,18 @@ function _clock_time_get(clk_id, ignored_precision, ptime) {
   return 0;
 }
 
-_clock_time_get.sig = "iijp";
-
 function getFullscreenElement() {
   return document.fullscreenElement || document.mozFullScreenElement || document.webkitFullscreenElement || document.webkitCurrentFullScreenElement || document.msFullscreenElement;
 }
+
+var runtimeKeepalivePush = () => {
+  runtimeKeepaliveCounter += 1;
+};
+
+var runtimeKeepalivePop = () => {
+  assert(runtimeKeepaliveCounter > 0);
+  runtimeKeepaliveCounter -= 1;
+};
 
 /** @param {number=} timeout */ var safeSetTimeout = (func, timeout) => {
   runtimeKeepalivePush();
@@ -7892,7 +5953,7 @@ var EGL = {
 };
 
 function _eglBindAPI(api) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(33, 0, 1, api);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(13, 0, 1, api);
   if (api == 12448) {
     EGL.setErrorCode(12288);
     return 1;
@@ -7902,14 +5963,10 @@ function _eglBindAPI(api) {
   return 0;
 }
 
-_eglBindAPI.sig = "ii";
-
 function _eglChooseConfig(display, attrib_list, configs, config_size, numConfigs) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(34, 0, 1, display, attrib_list, configs, config_size, numConfigs);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(14, 0, 1, display, attrib_list, configs, config_size, numConfigs);
   return EGL.chooseConfig(display, attrib_list, configs, config_size, numConfigs);
 }
-
-_eglChooseConfig.sig = "ipppip";
 
 var GLctx;
 
@@ -8119,7 +6176,7 @@ var GL = {
 };
 
 function _eglCreateContext(display, config, hmm, contextAttribs) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(35, 0, 1, display, config, hmm, contextAttribs);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(15, 0, 1, display, config, hmm, contextAttribs);
   if (display != 62e3) {
     EGL.setErrorCode(12296);
     return 0;
@@ -8163,10 +6220,8 @@ function _eglCreateContext(display, config, hmm, contextAttribs) {
   }
 }
 
-_eglCreateContext.sig = "ppppp";
-
 function _eglCreateWindowSurface(display, config, win, attrib_list) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(36, 0, 1, display, config, win, attrib_list);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(16, 0, 1, display, config, win, attrib_list);
   if (display != 62e3) {
     EGL.setErrorCode(12296);
     return 0;
@@ -8183,10 +6238,8 @@ function _eglCreateWindowSurface(display, config, win, attrib_list) {
   return 62006;
 }
 
-_eglCreateWindowSurface.sig = "pppip";
-
 function _eglDestroyContext(display, context) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(37, 0, 1, display, context);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(17, 0, 1, display, context);
   if (display != 62e3) {
     EGL.setErrorCode(12296);
     return 0;
@@ -8203,10 +6256,8 @@ function _eglDestroyContext(display, context) {
   return 1;
 }
 
-_eglDestroyContext.sig = "ipp";
-
 function _eglDestroySurface(display, surface) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(38, 0, 1, display, surface);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(18, 0, 1, display, surface);
   if (display != 62e3) {
     EGL.setErrorCode(12296);
     return 0;
@@ -8225,10 +6276,8 @@ function _eglDestroySurface(display, surface) {
   return 1;
 }
 
-_eglDestroySurface.sig = "ipp";
-
 function _eglGetConfigAttrib(display, config, attribute, value) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(39, 0, 1, display, config, attribute, value);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(19, 0, 1, display, config, attribute, value);
   if (display != 62e3) {
     EGL.setErrorCode(12296);
     return 0;
@@ -8431,10 +6480,8 @@ function _eglGetConfigAttrib(display, config, attribute, value) {
   }
 }
 
-_eglGetConfigAttrib.sig = "ippip";
-
 function _eglGetDisplay(nativeDisplayType) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(40, 0, 1, nativeDisplayType);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(20, 0, 1, nativeDisplayType);
   EGL.setErrorCode(12288);
   // Emscripten EGL implementation "emulates" X11, and eglGetDisplay is
   // expected to accept/receive a pointer to an X11 Display object (or
@@ -8445,17 +6492,13 @@ function _eglGetDisplay(nativeDisplayType) {
   return 62e3;
 }
 
-_eglGetDisplay.sig = "pp";
-
 function _eglGetError() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(41, 0, 1);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(21, 0, 1);
   return EGL.errorCode;
 }
 
-_eglGetError.sig = "i";
-
 function _eglInitialize(display, majorVersion, minorVersion) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(42, 0, 1, display, majorVersion, minorVersion);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(22, 0, 1, display, majorVersion, minorVersion);
   if (display != 62e3) {
     EGL.setErrorCode(12296);
     return 0;
@@ -8473,10 +6516,8 @@ function _eglInitialize(display, majorVersion, minorVersion) {
   return 1;
 }
 
-_eglInitialize.sig = "ippp";
-
 function _eglMakeCurrent(display, draw, read, context) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(43, 0, 1, display, draw, read, context);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(23, 0, 1, display, draw, read, context);
   if (display != 62e3) {
     EGL.setErrorCode(12296);
     return 0;
@@ -8498,8 +6539,6 @@ function _eglMakeCurrent(display, draw, read, context) {
   return 1;
 }
 
-_eglMakeCurrent.sig = "ipppp";
-
 var stringToNewUTF8 = str => {
   var size = lengthBytesUTF8(str) + 1;
   var ret = _malloc(size);
@@ -8508,7 +6547,7 @@ var stringToNewUTF8 = str => {
 };
 
 function _eglQueryString(display, name) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(44, 0, 1, display, name);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(24, 0, 1, display, name);
   if (display != 62e3) {
     EGL.setErrorCode(12296);
     return 0;
@@ -8543,10 +6582,8 @@ function _eglQueryString(display, name) {
   return ret;
 }
 
-_eglQueryString.sig = "ppi";
-
 function _eglSwapBuffers(dpy, surface) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(45, 0, 1, dpy, surface);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(25, 0, 1, dpy, surface);
   if (!EGL.defaultDisplayInitialized) {
     EGL.setErrorCode(12289);
   } else if (!GLctx) {
@@ -8563,8 +6600,6 @@ function _eglSwapBuffers(dpy, surface) {
   }
   return 0;
 }
-
-_eglSwapBuffers.sig = "ipp";
 
 /**
    * @param {number=} arg
@@ -8787,10 +6822,8 @@ var _emscripten_set_main_loop_timing = (mode, value) => {
   return 0;
 };
 
-_emscripten_set_main_loop_timing.sig = "iii";
-
 function _eglSwapInterval(display, interval) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(46, 0, 1, display, interval);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(26, 0, 1, display, interval);
   if (display != 62e3) {
     EGL.setErrorCode(12296);
     return 0;
@@ -8800,10 +6833,8 @@ function _eglSwapInterval(display, interval) {
   return 1;
 }
 
-_eglSwapInterval.sig = "ipi";
-
 function _eglTerminate(display) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(47, 0, 1, display);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(27, 0, 1, display);
   if (display != 62e3) {
     EGL.setErrorCode(12296);
     return 0;
@@ -8816,27 +6847,19 @@ function _eglTerminate(display) {
   return 1;
 }
 
-_eglTerminate.sig = "ip";
-
 function _eglWaitClient() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(48, 0, 1);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(28, 0, 1);
   EGL.setErrorCode(12288);
   return 1;
 }
-
-_eglWaitClient.sig = "i";
 
 var _eglWaitGL = _eglWaitClient;
 
-_eglWaitGL.sig = "i";
-
 function _eglWaitNative(nativeEngineId) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(49, 0, 1, nativeEngineId);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(29, 0, 1, nativeEngineId);
   EGL.setErrorCode(12288);
   return 1;
 }
-
-_eglWaitNative.sig = "ii";
 
 var readEmAsmArgsArray = [];
 
@@ -8875,8 +6898,6 @@ var runEmAsmFunction = (code, sigPtr, argbuf) => {
 
 var _emscripten_asm_const_int = (code, sigPtr, argbuf) => runEmAsmFunction(code, sigPtr, argbuf);
 
-_emscripten_asm_const_int.sig = "ippp";
-
 var runMainThreadEmAsm = (emAsmAddr, sigPtr, argbuf, sync) => {
   var args = readEmAsmArgs(sigPtr, argbuf);
   if (ENVIRONMENT_IS_PTHREAD) {
@@ -8897,18 +6918,12 @@ var runMainThreadEmAsm = (emAsmAddr, sigPtr, argbuf, sync) => {
 
 var _emscripten_asm_const_int_sync_on_main_thread = (emAsmAddr, sigPtr, argbuf) => runMainThreadEmAsm(emAsmAddr, sigPtr, argbuf, 1);
 
-_emscripten_asm_const_int_sync_on_main_thread.sig = "ippp";
-
 var _emscripten_asm_const_ptr_sync_on_main_thread = (emAsmAddr, sigPtr, argbuf) => runMainThreadEmAsm(emAsmAddr, sigPtr, argbuf, 1);
-
-_emscripten_asm_const_ptr_sync_on_main_thread.sig = "pppp";
 
 var _emscripten_cancel_main_loop = () => {
   MainLoop.pause();
   MainLoop.func = null;
 };
-
-_emscripten_cancel_main_loop.sig = "v";
 
 var _emscripten_check_blocking_allowed = () => {
   if (ENVIRONMENT_IS_NODE) return;
@@ -8917,49 +6932,149 @@ var _emscripten_check_blocking_allowed = () => {
   warnOnce("Blocking on the main thread is very dangerous, see https://emscripten.org/docs/porting/pthreads.html#blocking-on-the-main-browser-thread");
 };
 
-_emscripten_check_blocking_allowed.sig = "v";
+var onExits = [];
 
-var _emscripten_console_error = str => {
-  assert(typeof str == "number");
-  console.error(UTF8ToString(str));
+var JSEvents = {
+  removeAllEventListeners() {
+    while (JSEvents.eventHandlers.length) {
+      JSEvents._removeHandler(JSEvents.eventHandlers.length - 1);
+    }
+    JSEvents.deferredCalls = [];
+  },
+  inEventHandler: 0,
+  deferredCalls: [],
+  deferCall(targetFunction, precedence, argsList) {
+    function arraysHaveEqualContent(arrA, arrB) {
+      if (arrA.length != arrB.length) return false;
+      for (var i in arrA) {
+        if (arrA[i] != arrB[i]) return false;
+      }
+      return true;
+    }
+    // Test if the given call was already queued, and if so, don't add it again.
+    for (var call of JSEvents.deferredCalls) {
+      if (call.targetFunction == targetFunction && arraysHaveEqualContent(call.argsList, argsList)) {
+        return;
+      }
+    }
+    JSEvents.deferredCalls.push({
+      targetFunction,
+      precedence,
+      argsList
+    });
+    JSEvents.deferredCalls.sort((x, y) => x.precedence < y.precedence);
+  },
+  removeDeferredCalls(targetFunction) {
+    JSEvents.deferredCalls = JSEvents.deferredCalls.filter(call => call.targetFunction != targetFunction);
+  },
+  canPerformEventHandlerRequests() {
+    if (navigator.userActivation) {
+      // Verify against transient activation status from UserActivation API
+      // whether it is possible to perform a request here without needing to defer. See
+      // https://developer.mozilla.org/en-US/docs/Web/Security/User_activation#transient_activation
+      // and https://caniuse.com/mdn-api_useractivation
+      // At the time of writing, Firefox does not support this API: https://bugzil.la/1791079
+      return navigator.userActivation.isActive;
+    }
+    return JSEvents.inEventHandler && JSEvents.currentEventHandler.allowsDeferredCalls;
+  },
+  runDeferredCalls() {
+    if (!JSEvents.canPerformEventHandlerRequests()) {
+      return;
+    }
+    var deferredCalls = JSEvents.deferredCalls;
+    JSEvents.deferredCalls = [];
+    for (var call of deferredCalls) {
+      call.targetFunction(...call.argsList);
+    }
+  },
+  eventHandlers: [],
+  removeAllHandlersOnTarget: (target, eventTypeString) => {
+    for (var i = 0; i < JSEvents.eventHandlers.length; ++i) {
+      if (JSEvents.eventHandlers[i].target == target && (!eventTypeString || eventTypeString == JSEvents.eventHandlers[i].eventTypeString)) {
+        JSEvents._removeHandler(i--);
+      }
+    }
+  },
+  _removeHandler(i) {
+    var h = JSEvents.eventHandlers[i];
+    h.target.removeEventListener(h.eventTypeString, h.eventListenerFunc, h.useCapture);
+    JSEvents.eventHandlers.splice(i, 1);
+  },
+  registerOrRemoveHandler(eventHandler) {
+    if (!eventHandler.target) {
+      err("registerOrRemoveHandler: the target element for event handler registration does not exist, when processing the following event handler registration:");
+      console.dir(eventHandler);
+      return -4;
+    }
+    if (eventHandler.callbackfunc) {
+      eventHandler.eventListenerFunc = function(event) {
+        // Increment nesting count for the event handler.
+        ++JSEvents.inEventHandler;
+        JSEvents.currentEventHandler = eventHandler;
+        // Process any old deferred calls the user has placed.
+        JSEvents.runDeferredCalls();
+        // Process the actual event, calls back to user C code handler.
+        eventHandler.handlerFunc(event);
+        // Process any new deferred calls that were placed right now from this event handler.
+        JSEvents.runDeferredCalls();
+        // Out of event handler - restore nesting count.
+        --JSEvents.inEventHandler;
+      };
+      eventHandler.target.addEventListener(eventHandler.eventTypeString, eventHandler.eventListenerFunc, eventHandler.useCapture);
+      JSEvents.eventHandlers.push(eventHandler);
+    } else {
+      for (var i = 0; i < JSEvents.eventHandlers.length; ++i) {
+        if (JSEvents.eventHandlers[i].target == eventHandler.target && JSEvents.eventHandlers[i].eventTypeString == eventHandler.eventTypeString) {
+          JSEvents._removeHandler(i--);
+        }
+      }
+    }
+    return 0;
+  },
+  removeSingleHandler(eventHandler) {
+    let success = false;
+    for (let i = 0; i < JSEvents.eventHandlers.length; ++i) {
+      const handler = JSEvents.eventHandlers[i];
+      if (handler.target === eventHandler.target && handler.eventTypeId === eventHandler.eventTypeId && handler.callbackfunc === eventHandler.callbackfunc && handler.userData === eventHandler.userData) {
+        // in some very rare cases (ex: Safari / fullscreen events), there is more than 1 handler (eventTypeString is different)
+        JSEvents._removeHandler(i--);
+        success = true;
+      }
+    }
+    return success ? 0 : -5;
+  },
+  getTargetThreadForEventCallback(targetThread) {
+    switch (targetThread) {
+     case 1:
+      // The event callback for the current event should be called on the
+      // main browser thread. (0 == don't proxy)
+      return 0;
+
+     case 2:
+      // The event callback for the current event should be backproxied to
+      // the thread that is registering the event.
+      // This can be 0 in the case that the caller uses
+      // EM_CALLBACK_THREAD_CONTEXT_CALLING_THREAD but on the main thread
+      // itself.
+      return PThread.currentProxiedOperationCallerThread;
+
+     default:
+      // The event callback for the current event should be proxied to the
+      // given specific thread.
+      return targetThread;
+    }
+  },
+  getNodeNameForTarget(target) {
+    if (!target) return "";
+    if (target == window) return "#window";
+    if (target == screen) return "#screen";
+    return target?.nodeName || "";
+  },
+  fullscreenEnabled() {
+    return document.fullscreenEnabled || document.webkitFullscreenEnabled;
+  }
 };
-
-_emscripten_console_error.sig = "vp";
-
-var _emscripten_console_log = str => {
-  assert(typeof str == "number");
-  console.log(UTF8ToString(str));
-};
-
-_emscripten_console_log.sig = "vp";
-
-var _emscripten_console_trace = str => {
-  assert(typeof str == "number");
-  console.trace(UTF8ToString(str));
-};
-
-_emscripten_console_trace.sig = "vp";
-
-var _emscripten_console_warn = str => {
-  assert(typeof str == "number");
-  console.warn(UTF8ToString(str));
-};
-
-_emscripten_console_warn.sig = "vp";
-
-var _emscripten_dbg = str => dbg(UTF8ToString(str));
-
-_emscripten_dbg.sig = "vp";
-
-var _emscripten_dbg_backtrace = str => {
-  dbg(UTF8ToString(str) + "\n" + (new Error).stack);
-};
-
-_emscripten_dbg_backtrace.sig = "vp";
-
-var _emscripten_err = str => err(UTF8ToString(str));
-
-_emscripten_err.sig = "vp";
 
 /** @type {Object} */ var specialHTMLTargets = [ 0, globalThis.document ?? 0, globalThis.window ?? 0 ];
 
@@ -8988,7 +7103,7 @@ var getCanvasSizeCallingThread = (target, width, height) => {
 };
 
 function getCanvasSizeMainThread(target, width, height) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(51, 0, 1, target, width, height);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(31, 0, 1, target, width, height);
   return getCanvasSizeCallingThread(target, width, height);
 }
 
@@ -9000,7 +7115,12 @@ var _emscripten_get_canvas_element_size = (target, width, height) => {
   return getCanvasSizeMainThread(target, width, height);
 };
 
-_emscripten_get_canvas_element_size.sig = "ippp";
+var stringToUTF8OnStack = str => {
+  var size = lengthBytesUTF8(str) + 1;
+  var ret = stackAlloc(size);
+  stringToUTF8(str, ret, size);
+  return ret;
+};
 
 var getCanvasElementSize = target => {
   var sp = stackSave();
@@ -9037,7 +7157,7 @@ var setCanvasElementSizeCallingThread = (target, width, height) => {
 };
 
 function setCanvasElementSizeMainThread(target, width, height) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(52, 0, 1, target, width, height);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(32, 0, 1, target, width, height);
   return setCanvasElementSizeCallingThread(target, width, height);
 }
 
@@ -9048,8 +7168,6 @@ var _emscripten_set_canvas_element_size = (target, width, height) => {
   }
   return setCanvasElementSizeMainThread(target, width, height);
 };
-
-_emscripten_set_canvas_element_size.sig = "ipii";
 
 var setCanvasElementSize = (target, width, height) => {
   if (!target.controlTransferredOffscreen) {
@@ -9222,7 +7340,7 @@ var JSEvents_requestFullscreen = (target, strategy) => {
 };
 
 function _emscripten_exit_fullscreen() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(50, 0, 1);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(30, 0, 1);
   if (!JSEvents.fullscreenEnabled()) return -1;
   // Make sure no queued up calls will fire after this.
   JSEvents.removeDeferredCalls(JSEvents_requestFullscreen);
@@ -9236,8 +7354,6 @@ function _emscripten_exit_fullscreen() {
   }
   return 0;
 }
-
-_emscripten_exit_fullscreen.sig = "i";
 
 var requestPointerLock = target => {
   if (target.requestPointerLock) {
@@ -9254,7 +7370,7 @@ var requestPointerLock = target => {
 };
 
 function _emscripten_exit_pointerlock() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(53, 0, 1);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(33, 0, 1);
   // Make sure no queued up calls will fire after this.
   JSEvents.removeDeferredCalls(requestPointerLock);
   if (!document.exitPointerLock) return -1;
@@ -9262,33 +7378,25 @@ function _emscripten_exit_pointerlock() {
   return 0;
 }
 
-_emscripten_exit_pointerlock.sig = "i";
-
 var _emscripten_exit_with_live_runtime = () => {
   runtimeKeepalivePush();
   throw "unwind";
 };
 
-_emscripten_exit_with_live_runtime.sig = "v";
-
 function _emscripten_force_exit(status) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(54, 0, 1, status);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(34, 0, 1, status);
   warnOnce("emscripten_force_exit cannot actually shut down the runtime, as the build does not have EXIT_RUNTIME set");
   __emscripten_runtime_keepalive_clear();
   _exit(status);
 }
 
-_emscripten_force_exit.sig = "vi";
-
 function _emscripten_get_device_pixel_ratio() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(55, 0, 1);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(35, 0, 1);
   return globalThis.devicePixelRatio ?? 1;
 }
 
-_emscripten_get_device_pixel_ratio.sig = "d";
-
 function _emscripten_get_element_css_size(target, width, height) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(56, 0, 1, target, width, height);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(36, 0, 1, target, width, height);
   target = findEventTarget(target);
   if (!target) return -4;
   var rect = getBoundingClientRect(target);
@@ -9296,8 +7404,6 @@ function _emscripten_get_element_css_size(target, width, height) {
   HEAPF64[SAFE_HEAP_INDEX(HEAPF64, ((height) >> 3), "storing")] = rect.height;
   return 0;
 }
-
-_emscripten_get_element_css_size.sig = "ippp";
 
 var fillGamepadEventData = (eventStruct, e) => {
   HEAPF64[SAFE_HEAP_INDEX(HEAPF64, ((eventStruct) >> 3), "storing")] = e.timestamp;
@@ -9334,7 +7440,7 @@ var fillGamepadEventData = (eventStruct, e) => {
 };
 
 function _emscripten_get_gamepad_status(index, gamepadState) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(57, 0, 1, index, gamepadState);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(37, 0, 1, index, gamepadState);
   assert(JSEvents.lastGamepadState, "emscripten_get_gamepad_status() can only be called after having first called emscripten_sample_gamepad_data() and that function has returned EMSCRIPTEN_RESULT_SUCCESS!");
   // INVALID_PARAM is returned on a Gamepad index that never was there.
   if (index < 0 || index >= JSEvents.lastGamepadState.length) return -5;
@@ -9347,113 +7453,69 @@ function _emscripten_get_gamepad_status(index, gamepadState) {
   return 0;
 }
 
-_emscripten_get_gamepad_status.sig = "iip";
-
-var getHeapMax = () => HEAPU8.length;
-
-var _emscripten_get_heap_max = () => getHeapMax();
-
-_emscripten_get_heap_max.sig = "p";
-
 function _emscripten_get_num_gamepads() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(58, 0, 1);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(38, 0, 1);
   assert(JSEvents.lastGamepadState, "emscripten_get_num_gamepads() can only be called after having first called emscripten_sample_gamepad_data() and that function has returned EMSCRIPTEN_RESULT_SUCCESS!");
   // N.B. Do not call emscripten_get_num_gamepads() unless having first called emscripten_sample_gamepad_data(), and that has returned EMSCRIPTEN_RESULT_SUCCESS.
   // Otherwise the following line will throw an exception.
   return JSEvents.lastGamepadState.length;
 }
 
-_emscripten_get_num_gamepads.sig = "i";
-
 function _emscripten_get_screen_size(width, height) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(59, 0, 1, width, height);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(39, 0, 1, width, height);
   HEAP32[SAFE_HEAP_INDEX(HEAP32, ((width) >> 2), "storing")] = screen.width;
   checkInt32(screen.width);
   HEAP32[SAFE_HEAP_INDEX(HEAP32, ((height) >> 2), "storing")] = screen.height;
   checkInt32(screen.height);
 }
 
-_emscripten_get_screen_size.sig = "vpp";
-
 var _emscripten_glActiveTexture = x0 => GLctx.activeTexture(x0);
-
-_emscripten_glActiveTexture.sig = "vi";
 
 var _emscripten_glAttachShader = (program, shader) => {
   GLctx.attachShader(GL.programs[program], GL.shaders[shader]);
 };
 
-_emscripten_glAttachShader.sig = "vii";
-
 var _emscripten_glBeginQueryEXT = (target, id) => {
   GLctx.disjointTimerQueryExt["beginQueryEXT"](target, GL.queries[id]);
 };
-
-_emscripten_glBeginQueryEXT.sig = "vii";
 
 var _emscripten_glBindAttribLocation = (program, index, name) => {
   GLctx.bindAttribLocation(GL.programs[program], index, UTF8ToString(name));
 };
 
-_emscripten_glBindAttribLocation.sig = "viip";
-
 var _emscripten_glBindBuffer = (target, buffer) => {
   GLctx.bindBuffer(target, GL.buffers[buffer]);
 };
-
-_emscripten_glBindBuffer.sig = "vii";
 
 var _emscripten_glBindFramebuffer = (target, framebuffer) => {
   GLctx.bindFramebuffer(target, GL.framebuffers[framebuffer]);
 };
 
-_emscripten_glBindFramebuffer.sig = "vii";
-
 var _emscripten_glBindRenderbuffer = (target, renderbuffer) => {
   GLctx.bindRenderbuffer(target, GL.renderbuffers[renderbuffer]);
 };
-
-_emscripten_glBindRenderbuffer.sig = "vii";
 
 var _emscripten_glBindTexture = (target, texture) => {
   GLctx.bindTexture(target, GL.textures[texture]);
 };
 
-_emscripten_glBindTexture.sig = "vii";
-
 var _emscripten_glBindVertexArray = vao => {
   GLctx.bindVertexArray(GL.vaos[vao]);
 };
 
-_emscripten_glBindVertexArray.sig = "vi";
-
 var _glBindVertexArray = _emscripten_glBindVertexArray;
-
-_glBindVertexArray.sig = "vi";
 
 var _emscripten_glBindVertexArrayOES = _glBindVertexArray;
 
-_emscripten_glBindVertexArrayOES.sig = "vi";
-
 var _emscripten_glBlendColor = (x0, x1, x2, x3) => GLctx.blendColor(x0, x1, x2, x3);
-
-_emscripten_glBlendColor.sig = "vffff";
 
 var _emscripten_glBlendEquation = x0 => GLctx.blendEquation(x0);
 
-_emscripten_glBlendEquation.sig = "vi";
-
 var _emscripten_glBlendEquationSeparate = (x0, x1) => GLctx.blendEquationSeparate(x0, x1);
-
-_emscripten_glBlendEquationSeparate.sig = "vii";
 
 var _emscripten_glBlendFunc = (x0, x1) => GLctx.blendFunc(x0, x1);
 
-_emscripten_glBlendFunc.sig = "vii";
-
 var _emscripten_glBlendFuncSeparate = (x0, x1, x2, x3) => GLctx.blendFuncSeparate(x0, x1, x2, x3);
-
-_emscripten_glBlendFuncSeparate.sig = "viiii";
 
 var _emscripten_glBufferData = (target, size, data, usage) => {
   // N.b. here first form specifies a heap subarray, second form an integer
@@ -9463,51 +7525,31 @@ var _emscripten_glBufferData = (target, size, data, usage) => {
   GLctx.bufferData(target, data ? HEAPU8.subarray(data, data + size) : size, usage);
 };
 
-_emscripten_glBufferData.sig = "vippi";
-
 var _emscripten_glBufferSubData = (target, offset, size, data) => {
   GLctx.bufferSubData(target, offset, HEAPU8.subarray(data, data + size));
 };
 
-_emscripten_glBufferSubData.sig = "vippp";
-
 var _emscripten_glCheckFramebufferStatus = x0 => GLctx.checkFramebufferStatus(x0);
-
-_emscripten_glCheckFramebufferStatus.sig = "ii";
 
 var _emscripten_glClear = x0 => GLctx.clear(x0);
 
-_emscripten_glClear.sig = "vi";
-
 var _emscripten_glClearColor = (x0, x1, x2, x3) => GLctx.clearColor(x0, x1, x2, x3);
-
-_emscripten_glClearColor.sig = "vffff";
 
 var _emscripten_glClearDepthf = x0 => GLctx.clearDepth(x0);
 
-_emscripten_glClearDepthf.sig = "vf";
-
 var _emscripten_glClearStencil = x0 => GLctx.clearStencil(x0);
-
-_emscripten_glClearStencil.sig = "vi";
 
 var _emscripten_glClipControlEXT = (origin, depth) => {
   GLctx.extClipControl["clipControlEXT"](origin, depth);
 };
 
-_emscripten_glClipControlEXT.sig = "vii";
-
 var _emscripten_glColorMask = (red, green, blue, alpha) => {
   GLctx.colorMask(!!red, !!green, !!blue, !!alpha);
 };
 
-_emscripten_glColorMask.sig = "viiii";
-
 var _emscripten_glCompileShader = shader => {
   GLctx.compileShader(GL.shaders[shader]);
 };
-
-_emscripten_glCompileShader.sig = "vi";
 
 var _emscripten_glCompressedTexImage2D = (target, level, internalFormat, width, height, border, imageSize, data) => {
   // `data` may be null here, which means "allocate uninitialized space but
@@ -9518,21 +7560,13 @@ var _emscripten_glCompressedTexImage2D = (target, level, internalFormat, width, 
   GLctx.compressedTexImage2D(target, level, internalFormat, width, height, border, HEAPU8.subarray((data), data + imageSize));
 };
 
-_emscripten_glCompressedTexImage2D.sig = "viiiiiiip";
-
 var _emscripten_glCompressedTexSubImage2D = (target, level, xoffset, yoffset, width, height, format, imageSize, data) => {
   GLctx.compressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, HEAPU8.subarray((data), data + imageSize));
 };
 
-_emscripten_glCompressedTexSubImage2D.sig = "viiiiiiiip";
-
 var _emscripten_glCopyTexImage2D = (x0, x1, x2, x3, x4, x5, x6, x7) => GLctx.copyTexImage2D(x0, x1, x2, x3, x4, x5, x6, x7);
 
-_emscripten_glCopyTexImage2D.sig = "viiiiiiii";
-
 var _emscripten_glCopyTexSubImage2D = (x0, x1, x2, x3, x4, x5, x6, x7) => GLctx.copyTexSubImage2D(x0, x1, x2, x3, x4, x5, x6, x7);
-
-_emscripten_glCopyTexSubImage2D.sig = "viiiiiiii";
 
 var _emscripten_glCreateProgram = () => {
   var id = GL.getNewId(GL.programs);
@@ -9547,19 +7581,13 @@ var _emscripten_glCreateProgram = () => {
   return id;
 };
 
-_emscripten_glCreateProgram.sig = "i";
-
 var _emscripten_glCreateShader = shaderType => {
   var id = GL.getNewId(GL.shaders);
   GL.shaders[id] = GLctx.createShader(shaderType);
   return id;
 };
 
-_emscripten_glCreateShader.sig = "ii";
-
 var _emscripten_glCullFace = x0 => GLctx.cullFace(x0);
-
-_emscripten_glCullFace.sig = "vi";
 
 var _emscripten_glDeleteBuffers = (n, buffers) => {
   for (var i = 0; i < n; i++) {
@@ -9574,8 +7602,6 @@ var _emscripten_glDeleteBuffers = (n, buffers) => {
   }
 };
 
-_emscripten_glDeleteBuffers.sig = "vip";
-
 var _emscripten_glDeleteFramebuffers = (n, framebuffers) => {
   for (var i = 0; i < n; ++i) {
     var id = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((framebuffers) + (i * 4)) >> 2), "loading")];
@@ -9587,8 +7613,6 @@ var _emscripten_glDeleteFramebuffers = (n, framebuffers) => {
     GL.framebuffers[id] = null;
   }
 };
-
-_emscripten_glDeleteFramebuffers.sig = "vip";
 
 var _emscripten_glDeleteProgram = id => {
   if (!id) return;
@@ -9604,8 +7628,6 @@ var _emscripten_glDeleteProgram = id => {
   GL.programs[id] = null;
 };
 
-_emscripten_glDeleteProgram.sig = "vi";
-
 var _emscripten_glDeleteQueriesEXT = (n, ids) => {
   for (var i = 0; i < n; i++) {
     var id = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((ids) + (i * 4)) >> 2), "loading")];
@@ -9616,8 +7638,6 @@ var _emscripten_glDeleteQueriesEXT = (n, ids) => {
     GL.queries[id] = null;
   }
 };
-
-_emscripten_glDeleteQueriesEXT.sig = "vip";
 
 var _emscripten_glDeleteRenderbuffers = (n, renderbuffers) => {
   for (var i = 0; i < n; i++) {
@@ -9630,8 +7650,6 @@ var _emscripten_glDeleteRenderbuffers = (n, renderbuffers) => {
     GL.renderbuffers[id] = null;
   }
 };
-
-_emscripten_glDeleteRenderbuffers.sig = "vip";
 
 var _emscripten_glDeleteShader = id => {
   if (!id) return;
@@ -9646,8 +7664,6 @@ var _emscripten_glDeleteShader = id => {
   GL.shaders[id] = null;
 };
 
-_emscripten_glDeleteShader.sig = "vi";
-
 var _emscripten_glDeleteTextures = (n, textures) => {
   for (var i = 0; i < n; i++) {
     var id = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((textures) + (i * 4)) >> 2), "loading")];
@@ -9661,8 +7677,6 @@ var _emscripten_glDeleteTextures = (n, textures) => {
   }
 };
 
-_emscripten_glDeleteTextures.sig = "vip";
-
 var _emscripten_glDeleteVertexArrays = (n, vaos) => {
   for (var i = 0; i < n; i++) {
     var id = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((vaos) + (i * 4)) >> 2), "loading")];
@@ -9671,61 +7685,37 @@ var _emscripten_glDeleteVertexArrays = (n, vaos) => {
   }
 };
 
-_emscripten_glDeleteVertexArrays.sig = "vip";
-
 var _glDeleteVertexArrays = _emscripten_glDeleteVertexArrays;
-
-_glDeleteVertexArrays.sig = "vip";
 
 var _emscripten_glDeleteVertexArraysOES = _glDeleteVertexArrays;
 
-_emscripten_glDeleteVertexArraysOES.sig = "vip";
-
 var _emscripten_glDepthFunc = x0 => GLctx.depthFunc(x0);
-
-_emscripten_glDepthFunc.sig = "vi";
 
 var _emscripten_glDepthMask = flag => {
   GLctx.depthMask(!!flag);
 };
 
-_emscripten_glDepthMask.sig = "vi";
-
 var _emscripten_glDepthRangef = (x0, x1) => GLctx.depthRange(x0, x1);
-
-_emscripten_glDepthRangef.sig = "vff";
 
 var _emscripten_glDetachShader = (program, shader) => {
   GLctx.detachShader(GL.programs[program], GL.shaders[shader]);
 };
 
-_emscripten_glDetachShader.sig = "vii";
-
 var _emscripten_glDisable = x0 => GLctx.disable(x0);
-
-_emscripten_glDisable.sig = "vi";
 
 var _emscripten_glDisableVertexAttribArray = index => {
   GLctx.disableVertexAttribArray(index);
 };
 
-_emscripten_glDisableVertexAttribArray.sig = "vi";
-
 var _emscripten_glDrawArrays = (mode, first, count) => {
   GLctx.drawArrays(mode, first, count);
 };
-
-_emscripten_glDrawArrays.sig = "viii";
 
 var _emscripten_glDrawArraysInstanced = (mode, first, count, primcount) => {
   GLctx.drawArraysInstanced(mode, first, count, primcount);
 };
 
-_emscripten_glDrawArraysInstanced.sig = "viiii";
-
 var _glDrawArraysInstanced = _emscripten_glDrawArraysInstanced;
-
-_glDrawArraysInstanced.sig = "viiii";
 
 var _emscripten_glDrawArraysInstancedANGLE = _glDrawArraysInstanced;
 
@@ -9739,11 +7729,7 @@ var _emscripten_glDrawBuffers = (n, bufs) => {
   GLctx.drawBuffers(bufArray);
 };
 
-_emscripten_glDrawBuffers.sig = "vip";
-
 var _glDrawBuffers = _emscripten_glDrawBuffers;
-
-_glDrawBuffers.sig = "vip";
 
 var _emscripten_glDrawBuffersWEBGL = _glDrawBuffers;
 
@@ -9751,71 +7737,45 @@ var _emscripten_glDrawElements = (mode, count, type, indices) => {
   GLctx.drawElements(mode, count, type, indices);
 };
 
-_emscripten_glDrawElements.sig = "viiip";
-
 var _emscripten_glDrawElementsInstanced = (mode, count, type, indices, primcount) => {
   GLctx.drawElementsInstanced(mode, count, type, indices, primcount);
 };
 
-_emscripten_glDrawElementsInstanced.sig = "viiipi";
-
 var _glDrawElementsInstanced = _emscripten_glDrawElementsInstanced;
-
-_glDrawElementsInstanced.sig = "viiipi";
 
 var _emscripten_glDrawElementsInstancedANGLE = _glDrawElementsInstanced;
 
 var _emscripten_glEnable = x0 => GLctx.enable(x0);
 
-_emscripten_glEnable.sig = "vi";
-
 var _emscripten_glEnableVertexAttribArray = index => {
   GLctx.enableVertexAttribArray(index);
 };
-
-_emscripten_glEnableVertexAttribArray.sig = "vi";
 
 var _emscripten_glEndQueryEXT = target => {
   GLctx.disjointTimerQueryExt["endQueryEXT"](target);
 };
 
-_emscripten_glEndQueryEXT.sig = "vi";
-
 var _emscripten_glFinish = () => GLctx.finish();
 
-_emscripten_glFinish.sig = "v";
-
 var _emscripten_glFlush = () => GLctx.flush();
-
-_emscripten_glFlush.sig = "v";
 
 var _emscripten_glFramebufferRenderbuffer = (target, attachment, renderbuffertarget, renderbuffer) => {
   GLctx.framebufferRenderbuffer(target, attachment, renderbuffertarget, GL.renderbuffers[renderbuffer]);
 };
 
-_emscripten_glFramebufferRenderbuffer.sig = "viiii";
-
 var _emscripten_glFramebufferTexture2D = (target, attachment, textarget, texture, level) => {
   GLctx.framebufferTexture2D(target, attachment, textarget, GL.textures[texture], level);
 };
 
-_emscripten_glFramebufferTexture2D.sig = "viiiii";
-
 var _emscripten_glFrontFace = x0 => GLctx.frontFace(x0);
-
-_emscripten_glFrontFace.sig = "vi";
 
 var _emscripten_glGenBuffers = (n, buffers) => {
   GL.genObject(n, buffers, "createBuffer", GL.buffers);
 };
 
-_emscripten_glGenBuffers.sig = "vip";
-
 var _emscripten_glGenFramebuffers = (n, ids) => {
   GL.genObject(n, ids, "createFramebuffer", GL.framebuffers);
 };
-
-_emscripten_glGenFramebuffers.sig = "vip";
 
 var _emscripten_glGenQueriesEXT = (n, ids) => {
   for (var i = 0; i < n; i++) {
@@ -9834,37 +7794,23 @@ var _emscripten_glGenQueriesEXT = (n, ids) => {
   }
 };
 
-_emscripten_glGenQueriesEXT.sig = "vip";
-
 var _emscripten_glGenRenderbuffers = (n, renderbuffers) => {
   GL.genObject(n, renderbuffers, "createRenderbuffer", GL.renderbuffers);
 };
-
-_emscripten_glGenRenderbuffers.sig = "vip";
 
 var _emscripten_glGenTextures = (n, textures) => {
   GL.genObject(n, textures, "createTexture", GL.textures);
 };
 
-_emscripten_glGenTextures.sig = "vip";
-
 var _emscripten_glGenVertexArrays = (n, arrays) => {
   GL.genObject(n, arrays, "createVertexArray", GL.vaos);
 };
 
-_emscripten_glGenVertexArrays.sig = "vip";
-
 var _glGenVertexArrays = _emscripten_glGenVertexArrays;
-
-_glGenVertexArrays.sig = "vip";
 
 var _emscripten_glGenVertexArraysOES = _glGenVertexArrays;
 
-_emscripten_glGenVertexArraysOES.sig = "vip";
-
 var _emscripten_glGenerateMipmap = x0 => GLctx.generateMipmap(x0);
-
-_emscripten_glGenerateMipmap.sig = "vi";
 
 var __glGetActiveAttribOrUniform = (funcName, program, index, bufSize, length, size, type, name) => {
   program = GL.programs[program];
@@ -9883,11 +7829,7 @@ var __glGetActiveAttribOrUniform = (funcName, program, index, bufSize, length, s
 
 var _emscripten_glGetActiveAttrib = (program, index, bufSize, length, size, type, name) => __glGetActiveAttribOrUniform("getActiveAttrib", program, index, bufSize, length, size, type, name);
 
-_emscripten_glGetActiveAttrib.sig = "viiipppp";
-
 var _emscripten_glGetActiveUniform = (program, index, bufSize, length, size, type, name) => __glGetActiveAttribOrUniform("getActiveUniform", program, index, bufSize, length, size, type, name);
-
-_emscripten_glGetActiveUniform.sig = "viiipppp";
 
 var _emscripten_glGetAttachedShaders = (program, maxCount, count, shaders) => {
   var result = GLctx.getAttachedShaders(GL.programs[program]);
@@ -9904,11 +7846,9 @@ var _emscripten_glGetAttachedShaders = (program, maxCount, count, shaders) => {
   }
 };
 
-_emscripten_glGetAttachedShaders.sig = "viipp";
-
 var _emscripten_glGetAttribLocation = (program, name) => GLctx.getAttribLocation(GL.programs[program], UTF8ToString(name));
 
-_emscripten_glGetAttribLocation.sig = "iip";
+var readI53FromI64 = ptr => HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((ptr) >> 2), "loading")] + HEAP32[SAFE_HEAP_INDEX(HEAP32, (((ptr) + (4)) >> 2), "loading")] * 4294967296;
 
 var readI53FromU64 = ptr => HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((ptr) >> 2), "loading")] + HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((ptr) + (4)) >> 2), "loading")] * 4294967296;
 
@@ -10076,8 +8016,6 @@ var emscriptenWebGLGet = (name_, p, type) => {
 
 var _emscripten_glGetBooleanv = (name_, p) => emscriptenWebGLGet(name_, p, 4);
 
-_emscripten_glGetBooleanv.sig = "vip";
-
 var _emscripten_glGetBufferParameteriv = (target, value, data) => {
   if (!data) {
     // GLES2 specification does not specify how to behave if data is a null
@@ -10090,19 +8028,13 @@ var _emscripten_glGetBufferParameteriv = (target, value, data) => {
   checkInt32(GLctx.getBufferParameter(target, value));
 };
 
-_emscripten_glGetBufferParameteriv.sig = "viip";
-
 var _emscripten_glGetError = () => {
   var error = GLctx.getError() || GL.lastError;
   GL.lastError = 0;
   return error;
 };
 
-_emscripten_glGetError.sig = "i";
-
 var _emscripten_glGetFloatv = (name_, p) => emscriptenWebGLGet(name_, p, 2);
-
-_emscripten_glGetFloatv.sig = "vip";
 
 var _emscripten_glGetFramebufferAttachmentParameteriv = (target, attachment, pname, params) => {
   var result = GLctx.getFramebufferAttachmentParameter(target, attachment, pname);
@@ -10113,11 +8045,7 @@ var _emscripten_glGetFramebufferAttachmentParameteriv = (target, attachment, pna
   checkInt32(result);
 };
 
-_emscripten_glGetFramebufferAttachmentParameteriv.sig = "viiip";
-
 var _emscripten_glGetIntegerv = (name_, p) => emscriptenWebGLGet(name_, p, 0);
-
-_emscripten_glGetIntegerv.sig = "vip";
 
 var _emscripten_glGetProgramInfoLog = (program, maxLength, length, infoLog) => {
   var log = GLctx.getProgramInfoLog(GL.programs[program]);
@@ -10126,8 +8054,6 @@ var _emscripten_glGetProgramInfoLog = (program, maxLength, length, infoLog) => {
   if (length) HEAP32[SAFE_HEAP_INDEX(HEAP32, ((length) >> 2), "storing")] = numBytesWrittenExclNull;
   checkInt32(numBytesWrittenExclNull);
 };
-
-_emscripten_glGetProgramInfoLog.sig = "viipp";
 
 var _emscripten_glGetProgramiv = (program, pname, p) => {
   if (!p) {
@@ -10181,8 +8107,6 @@ var _emscripten_glGetProgramiv = (program, pname, p) => {
   }
 };
 
-_emscripten_glGetProgramiv.sig = "viip";
-
 var _emscripten_glGetQueryObjecti64vEXT = (id, pname, params) => {
   if (!params) {
     // GLES2 specification does not specify how to behave if params is a null pointer. Since calling this function does not make sense
@@ -10204,8 +8128,6 @@ var _emscripten_glGetQueryObjecti64vEXT = (id, pname, params) => {
   writeI53ToI64(params, ret);
 };
 
-_emscripten_glGetQueryObjecti64vEXT.sig = "viip";
-
 var _emscripten_glGetQueryObjectivEXT = (id, pname, params) => {
   if (!params) {
     // GLES2 specification does not specify how to behave if params is a null pointer. Since calling this function does not make sense
@@ -10224,8 +8146,6 @@ var _emscripten_glGetQueryObjectivEXT = (id, pname, params) => {
   HEAP32[SAFE_HEAP_INDEX(HEAP32, ((params) >> 2), "storing")] = ret;
   checkInt32(ret);
 };
-
-_emscripten_glGetQueryObjectivEXT.sig = "viip";
 
 var _glGetQueryObjecti64vEXT = _emscripten_glGetQueryObjecti64vEXT;
 
@@ -10246,8 +8166,6 @@ var _emscripten_glGetQueryivEXT = (target, pname, params) => {
   checkInt32(GLctx.disjointTimerQueryExt["getQueryEXT"](target, pname));
 };
 
-_emscripten_glGetQueryivEXT.sig = "viip";
-
 var _emscripten_glGetRenderbufferParameteriv = (target, pname, params) => {
   if (!params) {
     // GLES2 specification does not specify how to behave if params is a null pointer. Since calling this function does not make sense
@@ -10259,8 +8177,6 @@ var _emscripten_glGetRenderbufferParameteriv = (target, pname, params) => {
   checkInt32(GLctx.getRenderbufferParameter(target, pname));
 };
 
-_emscripten_glGetRenderbufferParameteriv.sig = "viip";
-
 var _emscripten_glGetShaderInfoLog = (shader, maxLength, length, infoLog) => {
   var log = GLctx.getShaderInfoLog(GL.shaders[shader]);
   if (log === null) log = "(unknown error)";
@@ -10268,8 +8184,6 @@ var _emscripten_glGetShaderInfoLog = (shader, maxLength, length, infoLog) => {
   if (length) HEAP32[SAFE_HEAP_INDEX(HEAP32, ((length) >> 2), "storing")] = numBytesWrittenExclNull;
   checkInt32(numBytesWrittenExclNull);
 };
-
-_emscripten_glGetShaderInfoLog.sig = "viipp";
 
 var _emscripten_glGetShaderPrecisionFormat = (shaderType, precisionType, range, precision) => {
   var result = GLctx.getShaderPrecisionFormat(shaderType, precisionType);
@@ -10281,8 +8195,6 @@ var _emscripten_glGetShaderPrecisionFormat = (shaderType, precisionType, range, 
   checkInt32(result.precision);
 };
 
-_emscripten_glGetShaderPrecisionFormat.sig = "viipp";
-
 var _emscripten_glGetShaderSource = (shader, bufSize, length, source) => {
   var result = GLctx.getShaderSource(GL.shaders[shader]);
   if (!result) return;
@@ -10291,8 +8203,6 @@ var _emscripten_glGetShaderSource = (shader, bufSize, length, source) => {
   if (length) HEAP32[SAFE_HEAP_INDEX(HEAP32, ((length) >> 2), "storing")] = numBytesWrittenExclNull;
   checkInt32(numBytesWrittenExclNull);
 };
-
-_emscripten_glGetShaderSource.sig = "viipp";
 
 var _emscripten_glGetShaderiv = (shader, pname, p) => {
   if (!p) {
@@ -10326,8 +8236,6 @@ var _emscripten_glGetShaderiv = (shader, pname, p) => {
     checkInt32(GLctx.getShaderParameter(GL.shaders[shader], pname));
   }
 };
-
-_emscripten_glGetShaderiv.sig = "viip";
 
 var webglGetExtensions = () => {
   var exts = getEmscriptenSupportedExtensions(GLctx);
@@ -10382,8 +8290,6 @@ var _emscripten_glGetString = name_ => {
   return ret;
 };
 
-_emscripten_glGetString.sig = "pi";
-
 var _emscripten_glGetTexParameterfv = (target, pname, params) => {
   if (!params) {
     // GLES2 specification does not specify how to behave if params is a null
@@ -10394,8 +8300,6 @@ var _emscripten_glGetTexParameterfv = (target, pname, params) => {
   }
   HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((params) >> 2), "storing")] = GLctx.getTexParameter(target, pname);
 };
-
-_emscripten_glGetTexParameterfv.sig = "viip";
 
 var _emscripten_glGetTexParameteriv = (target, pname, params) => {
   if (!params) {
@@ -10408,8 +8312,6 @@ var _emscripten_glGetTexParameteriv = (target, pname, params) => {
   HEAP32[SAFE_HEAP_INDEX(HEAP32, ((params) >> 2), "storing")] = GLctx.getTexParameter(target, pname);
   checkInt32(GLctx.getTexParameter(target, pname));
 };
-
-_emscripten_glGetTexParameteriv.sig = "viip";
 
 /** @suppress {checkTypes} */ var jstoi_q = str => parseInt(str);
 
@@ -10497,8 +8399,6 @@ var _emscripten_glGetUniformLocation = (program, name) => {
   return -1;
 };
 
-_emscripten_glGetUniformLocation.sig = "iip";
-
 var webglGetUniformLocation = location => {
   var p = GLctx.currentProgram;
   if (p) {
@@ -10559,13 +8459,9 @@ var _emscripten_glGetUniformfv = (program, location, params) => {
   emscriptenWebGLGetUniform(program, location, params, 2);
 };
 
-_emscripten_glGetUniformfv.sig = "viip";
-
 var _emscripten_glGetUniformiv = (program, location, params) => {
   emscriptenWebGLGetUniform(program, location, params, 0);
 };
-
-_emscripten_glGetUniformiv.sig = "viip";
 
 var _emscripten_glGetVertexAttribPointerv = (index, pname, pointer) => {
   if (!pointer) {
@@ -10578,8 +8474,6 @@ var _emscripten_glGetVertexAttribPointerv = (index, pname, pointer) => {
   HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pointer) >> 2), "storing")] = GLctx.getVertexAttribOffset(index, pname);
   checkInt32(GLctx.getVertexAttribOffset(index, pname));
 };
-
-_emscripten_glGetVertexAttribPointerv.sig = "viip";
 
 /** @suppress{checkTypes} */ var emscriptenWebGLGetVertexAttrib = (index, pname, params, type) => {
   if (!params) {
@@ -10637,8 +8531,6 @@ var _emscripten_glGetVertexAttribfv = (index, pname, params) => {
   emscriptenWebGLGetVertexAttrib(index, pname, params, 2);
 };
 
-_emscripten_glGetVertexAttribfv.sig = "viip";
-
 var _emscripten_glGetVertexAttribiv = (index, pname, params) => {
   // N.B. This function may only be called if the vertex attribute was
   // specified using the function glVertexAttrib*f(), otherwise the results
@@ -10646,11 +8538,7 @@ var _emscripten_glGetVertexAttribiv = (index, pname, params) => {
   emscriptenWebGLGetVertexAttrib(index, pname, params, 5);
 };
 
-_emscripten_glGetVertexAttribiv.sig = "viip";
-
 var _emscripten_glHint = (x0, x1) => GLctx.hint(x0, x1);
-
-_emscripten_glHint.sig = "vii";
 
 var _emscripten_glIsBuffer = buffer => {
   var b = GL.buffers[buffer];
@@ -10658,11 +8546,7 @@ var _emscripten_glIsBuffer = buffer => {
   return GLctx.isBuffer(b);
 };
 
-_emscripten_glIsBuffer.sig = "ii";
-
 var _emscripten_glIsEnabled = x0 => GLctx.isEnabled(x0);
-
-_emscripten_glIsEnabled.sig = "ii";
 
 var _emscripten_glIsFramebuffer = framebuffer => {
   var fb = GL.framebuffers[framebuffer];
@@ -10670,15 +8554,11 @@ var _emscripten_glIsFramebuffer = framebuffer => {
   return GLctx.isFramebuffer(fb);
 };
 
-_emscripten_glIsFramebuffer.sig = "ii";
-
 var _emscripten_glIsProgram = program => {
   program = GL.programs[program];
   if (!program) return 0;
   return GLctx.isProgram(program);
 };
-
-_emscripten_glIsProgram.sig = "ii";
 
 var _emscripten_glIsQueryEXT = id => {
   var query = GL.queries[id];
@@ -10686,15 +8566,11 @@ var _emscripten_glIsQueryEXT = id => {
   return GLctx.disjointTimerQueryExt["isQueryEXT"](query);
 };
 
-_emscripten_glIsQueryEXT.sig = "ii";
-
 var _emscripten_glIsRenderbuffer = renderbuffer => {
   var rb = GL.renderbuffers[renderbuffer];
   if (!rb) return 0;
   return GLctx.isRenderbuffer(rb);
 };
-
-_emscripten_glIsRenderbuffer.sig = "ii";
 
 var _emscripten_glIsShader = shader => {
   var s = GL.shaders[shader];
@@ -10702,15 +8578,11 @@ var _emscripten_glIsShader = shader => {
   return GLctx.isShader(s);
 };
 
-_emscripten_glIsShader.sig = "ii";
-
 var _emscripten_glIsTexture = id => {
   var texture = GL.textures[id];
   if (!texture) return 0;
   return GLctx.isTexture(texture);
 };
-
-_emscripten_glIsTexture.sig = "ii";
 
 var _emscripten_glIsVertexArray = array => {
   var vao = GL.vaos[array];
@@ -10718,19 +8590,11 @@ var _emscripten_glIsVertexArray = array => {
   return GLctx.isVertexArray(vao);
 };
 
-_emscripten_glIsVertexArray.sig = "ii";
-
 var _glIsVertexArray = _emscripten_glIsVertexArray;
-
-_glIsVertexArray.sig = "ii";
 
 var _emscripten_glIsVertexArrayOES = _glIsVertexArray;
 
-_emscripten_glIsVertexArrayOES.sig = "ii";
-
 var _emscripten_glLineWidth = x0 => GLctx.lineWidth(x0);
-
-_emscripten_glLineWidth.sig = "vf";
 
 var _emscripten_glLinkProgram = program => {
   program = GL.programs[program];
@@ -10741,8 +8605,6 @@ var _emscripten_glLinkProgram = program => {
   program.uniformSizeAndIdsByName = {};
 };
 
-_emscripten_glLinkProgram.sig = "vi";
-
 var _emscripten_glPixelStorei = (pname, param) => {
   if (pname == 3317) {
     GL.unpackAlignment = param;
@@ -10752,29 +8614,19 @@ var _emscripten_glPixelStorei = (pname, param) => {
   GLctx.pixelStorei(pname, param);
 };
 
-_emscripten_glPixelStorei.sig = "vii";
-
 var _emscripten_glPolygonModeWEBGL = (face, mode) => {
   GLctx.webglPolygonMode["polygonModeWEBGL"](face, mode);
 };
 
-_emscripten_glPolygonModeWEBGL.sig = "vii";
-
 var _emscripten_glPolygonOffset = (x0, x1) => GLctx.polygonOffset(x0, x1);
-
-_emscripten_glPolygonOffset.sig = "vff";
 
 var _emscripten_glPolygonOffsetClampEXT = (factor, units, clamp) => {
   GLctx.extPolygonOffsetClamp["polygonOffsetClampEXT"](factor, units, clamp);
 };
 
-_emscripten_glPolygonOffsetClampEXT.sig = "vfff";
-
 var _emscripten_glQueryCounterEXT = (id, target) => {
   GLctx.disjointTimerQueryExt["queryCounterEXT"](GL.queries[id], target);
 };
-
-_emscripten_glQueryCounterEXT.sig = "vii";
 
 var computeUnpackAlignedImageSize = (width, height, sizePerPixel) => {
   function roundedToNextMultipleOf(x, y) {
@@ -10834,104 +8686,64 @@ var _emscripten_glReadPixels = (x, y, width, height, format, type, pixels) => {
   GLctx.readPixels(x, y, width, height, format, type, pixelData);
 };
 
-_emscripten_glReadPixels.sig = "viiiiiip";
-
 var _emscripten_glReleaseShaderCompiler = () => {};
 
-_emscripten_glReleaseShaderCompiler.sig = "v";
-
 var _emscripten_glRenderbufferStorage = (x0, x1, x2, x3) => GLctx.renderbufferStorage(x0, x1, x2, x3);
-
-_emscripten_glRenderbufferStorage.sig = "viiii";
 
 var _emscripten_glSampleCoverage = (value, invert) => {
   GLctx.sampleCoverage(value, !!invert);
 };
 
-_emscripten_glSampleCoverage.sig = "vfi";
-
 var _emscripten_glScissor = (x0, x1, x2, x3) => GLctx.scissor(x0, x1, x2, x3);
-
-_emscripten_glScissor.sig = "viiii";
 
 var _emscripten_glShaderBinary = (count, shaders, binaryformat, binary, length) => {
   GL.recordError(1280);
 };
-
-_emscripten_glShaderBinary.sig = "vipipi";
 
 var _emscripten_glShaderSource = (shader, count, string, length) => {
   var source = GL.getSource(shader, count, string, length);
   GLctx.shaderSource(GL.shaders[shader], source);
 };
 
-_emscripten_glShaderSource.sig = "viipp";
-
 var _emscripten_glStencilFunc = (x0, x1, x2) => GLctx.stencilFunc(x0, x1, x2);
-
-_emscripten_glStencilFunc.sig = "viii";
 
 var _emscripten_glStencilFuncSeparate = (x0, x1, x2, x3) => GLctx.stencilFuncSeparate(x0, x1, x2, x3);
 
-_emscripten_glStencilFuncSeparate.sig = "viiii";
-
 var _emscripten_glStencilMask = x0 => GLctx.stencilMask(x0);
-
-_emscripten_glStencilMask.sig = "vi";
 
 var _emscripten_glStencilMaskSeparate = (x0, x1) => GLctx.stencilMaskSeparate(x0, x1);
 
-_emscripten_glStencilMaskSeparate.sig = "vii";
-
 var _emscripten_glStencilOp = (x0, x1, x2) => GLctx.stencilOp(x0, x1, x2);
 
-_emscripten_glStencilOp.sig = "viii";
-
 var _emscripten_glStencilOpSeparate = (x0, x1, x2, x3) => GLctx.stencilOpSeparate(x0, x1, x2, x3);
-
-_emscripten_glStencilOpSeparate.sig = "viiii";
 
 var _emscripten_glTexImage2D = (target, level, internalFormat, width, height, border, format, type, pixels) => {
   var pixelData = pixels ? emscriptenWebGLGetTexPixelData(type, format, width, height, pixels, internalFormat) : null;
   GLctx.texImage2D(target, level, internalFormat, width, height, border, format, type, pixelData);
 };
 
-_emscripten_glTexImage2D.sig = "viiiiiiiip";
-
 var _emscripten_glTexParameterf = (x0, x1, x2) => GLctx.texParameterf(x0, x1, x2);
-
-_emscripten_glTexParameterf.sig = "viif";
 
 var _emscripten_glTexParameterfv = (target, pname, params) => {
   var param = HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((params) >> 2), "loading")];
   GLctx.texParameterf(target, pname, param);
 };
 
-_emscripten_glTexParameterfv.sig = "viip";
-
 var _emscripten_glTexParameteri = (x0, x1, x2) => GLctx.texParameteri(x0, x1, x2);
-
-_emscripten_glTexParameteri.sig = "viii";
 
 var _emscripten_glTexParameteriv = (target, pname, params) => {
   var param = HEAP32[SAFE_HEAP_INDEX(HEAP32, ((params) >> 2), "loading")];
   GLctx.texParameteri(target, pname, param);
 };
 
-_emscripten_glTexParameteriv.sig = "viip";
-
 var _emscripten_glTexSubImage2D = (target, level, xoffset, yoffset, width, height, format, type, pixels) => {
   var pixelData = pixels ? emscriptenWebGLGetTexPixelData(type, format, width, height, pixels, 0) : null;
   GLctx.texSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixelData);
 };
 
-_emscripten_glTexSubImage2D.sig = "viiiiiiiip";
-
 var _emscripten_glUniform1f = (location, v0) => {
   GLctx.uniform1f(webglGetUniformLocation(location), v0);
 };
-
-_emscripten_glUniform1f.sig = "vif";
 
 var miniTempWebGLFloatBuffers = [];
 
@@ -10948,13 +8760,9 @@ var _emscripten_glUniform1fv = (location, count, value) => {
   GLctx.uniform1fv(webglGetUniformLocation(location), view);
 };
 
-_emscripten_glUniform1fv.sig = "viip";
-
 var _emscripten_glUniform1i = (location, v0) => {
   GLctx.uniform1i(webglGetUniformLocation(location), v0);
 };
-
-_emscripten_glUniform1i.sig = "vii";
 
 var miniTempWebGLIntBuffers = [];
 
@@ -10971,13 +8779,9 @@ var _emscripten_glUniform1iv = (location, count, value) => {
   GLctx.uniform1iv(webglGetUniformLocation(location), view);
 };
 
-_emscripten_glUniform1iv.sig = "viip";
-
 var _emscripten_glUniform2f = (location, v0, v1) => {
   GLctx.uniform2f(webglGetUniformLocation(location), v0, v1);
 };
-
-_emscripten_glUniform2f.sig = "viff";
 
 var _emscripten_glUniform2fv = (location, count, value) => {
   if (count <= 144) {
@@ -10994,13 +8798,9 @@ var _emscripten_glUniform2fv = (location, count, value) => {
   GLctx.uniform2fv(webglGetUniformLocation(location), view);
 };
 
-_emscripten_glUniform2fv.sig = "viip";
-
 var _emscripten_glUniform2i = (location, v0, v1) => {
   GLctx.uniform2i(webglGetUniformLocation(location), v0, v1);
 };
-
-_emscripten_glUniform2i.sig = "viii";
 
 var _emscripten_glUniform2iv = (location, count, value) => {
   if (count <= 144) {
@@ -11017,13 +8817,9 @@ var _emscripten_glUniform2iv = (location, count, value) => {
   GLctx.uniform2iv(webglGetUniformLocation(location), view);
 };
 
-_emscripten_glUniform2iv.sig = "viip";
-
 var _emscripten_glUniform3f = (location, v0, v1, v2) => {
   GLctx.uniform3f(webglGetUniformLocation(location), v0, v1, v2);
 };
-
-_emscripten_glUniform3f.sig = "vifff";
 
 var _emscripten_glUniform3fv = (location, count, value) => {
   if (count <= 96) {
@@ -11041,13 +8837,9 @@ var _emscripten_glUniform3fv = (location, count, value) => {
   GLctx.uniform3fv(webglGetUniformLocation(location), view);
 };
 
-_emscripten_glUniform3fv.sig = "viip";
-
 var _emscripten_glUniform3i = (location, v0, v1, v2) => {
   GLctx.uniform3i(webglGetUniformLocation(location), v0, v1, v2);
 };
-
-_emscripten_glUniform3i.sig = "viiii";
 
 var _emscripten_glUniform3iv = (location, count, value) => {
   if (count <= 96) {
@@ -11065,13 +8857,9 @@ var _emscripten_glUniform3iv = (location, count, value) => {
   GLctx.uniform3iv(webglGetUniformLocation(location), view);
 };
 
-_emscripten_glUniform3iv.sig = "viip";
-
 var _emscripten_glUniform4f = (location, v0, v1, v2, v3) => {
   GLctx.uniform4f(webglGetUniformLocation(location), v0, v1, v2, v3);
 };
-
-_emscripten_glUniform4f.sig = "viffff";
 
 var _emscripten_glUniform4fv = (location, count, value) => {
   if (count <= 72) {
@@ -11094,13 +8882,9 @@ var _emscripten_glUniform4fv = (location, count, value) => {
   GLctx.uniform4fv(webglGetUniformLocation(location), view);
 };
 
-_emscripten_glUniform4fv.sig = "viip";
-
 var _emscripten_glUniform4i = (location, v0, v1, v2, v3) => {
   GLctx.uniform4i(webglGetUniformLocation(location), v0, v1, v2, v3);
 };
-
-_emscripten_glUniform4i.sig = "viiiii";
 
 var _emscripten_glUniform4iv = (location, count, value) => {
   if (count <= 72) {
@@ -11119,8 +8903,6 @@ var _emscripten_glUniform4iv = (location, count, value) => {
   GLctx.uniform4iv(webglGetUniformLocation(location), view);
 };
 
-_emscripten_glUniform4iv.sig = "viip";
-
 var _emscripten_glUniformMatrix2fv = (location, count, transpose, value) => {
   if (count <= 72) {
     // avoid allocation when uploading few enough uniforms
@@ -11137,8 +8919,6 @@ var _emscripten_glUniformMatrix2fv = (location, count, transpose, value) => {
   }
   GLctx.uniformMatrix2fv(webglGetUniformLocation(location), !!transpose, view);
 };
-
-_emscripten_glUniformMatrix2fv.sig = "viiip";
 
 var _emscripten_glUniformMatrix3fv = (location, count, transpose, value) => {
   if (count <= 32) {
@@ -11161,8 +8941,6 @@ var _emscripten_glUniformMatrix3fv = (location, count, transpose, value) => {
   }
   GLctx.uniformMatrix3fv(webglGetUniformLocation(location), !!transpose, view);
 };
-
-_emscripten_glUniformMatrix3fv.sig = "viiip";
 
 var _emscripten_glUniformMatrix4fv = (location, count, transpose, value) => {
   if (count <= 18) {
@@ -11197,8 +8975,6 @@ var _emscripten_glUniformMatrix4fv = (location, count, transpose, value) => {
   GLctx.uniformMatrix4fv(webglGetUniformLocation(location), !!transpose, view);
 };
 
-_emscripten_glUniformMatrix4fv.sig = "viiip";
-
 var _emscripten_glUseProgram = program => {
   program = GL.programs[program];
   GLctx.useProgram(program);
@@ -11207,63 +8983,39 @@ var _emscripten_glUseProgram = program => {
   GLctx.currentProgram = program;
 };
 
-_emscripten_glUseProgram.sig = "vi";
-
 var _emscripten_glValidateProgram = program => {
   GLctx.validateProgram(GL.programs[program]);
 };
 
-_emscripten_glValidateProgram.sig = "vi";
-
 var _emscripten_glVertexAttrib1f = (x0, x1) => GLctx.vertexAttrib1f(x0, x1);
-
-_emscripten_glVertexAttrib1f.sig = "vif";
 
 var _emscripten_glVertexAttrib1fv = (index, v) => {
   GLctx.vertexAttrib1f(index, HEAPF32[SAFE_HEAP_INDEX(HEAPF32, v >> 2, "loading")]);
 };
 
-_emscripten_glVertexAttrib1fv.sig = "vip";
-
 var _emscripten_glVertexAttrib2f = (x0, x1, x2) => GLctx.vertexAttrib2f(x0, x1, x2);
-
-_emscripten_glVertexAttrib2f.sig = "viff";
 
 var _emscripten_glVertexAttrib2fv = (index, v) => {
   GLctx.vertexAttrib2f(index, HEAPF32[SAFE_HEAP_INDEX(HEAPF32, v >> 2, "loading")], HEAPF32[SAFE_HEAP_INDEX(HEAPF32, v + 4 >> 2, "loading")]);
 };
 
-_emscripten_glVertexAttrib2fv.sig = "vip";
-
 var _emscripten_glVertexAttrib3f = (x0, x1, x2, x3) => GLctx.vertexAttrib3f(x0, x1, x2, x3);
-
-_emscripten_glVertexAttrib3f.sig = "vifff";
 
 var _emscripten_glVertexAttrib3fv = (index, v) => {
   GLctx.vertexAttrib3f(index, HEAPF32[SAFE_HEAP_INDEX(HEAPF32, v >> 2, "loading")], HEAPF32[SAFE_HEAP_INDEX(HEAPF32, v + 4 >> 2, "loading")], HEAPF32[SAFE_HEAP_INDEX(HEAPF32, v + 8 >> 2, "loading")]);
 };
 
-_emscripten_glVertexAttrib3fv.sig = "vip";
-
 var _emscripten_glVertexAttrib4f = (x0, x1, x2, x3, x4) => GLctx.vertexAttrib4f(x0, x1, x2, x3, x4);
-
-_emscripten_glVertexAttrib4f.sig = "viffff";
 
 var _emscripten_glVertexAttrib4fv = (index, v) => {
   GLctx.vertexAttrib4f(index, HEAPF32[SAFE_HEAP_INDEX(HEAPF32, v >> 2, "loading")], HEAPF32[SAFE_HEAP_INDEX(HEAPF32, v + 4 >> 2, "loading")], HEAPF32[SAFE_HEAP_INDEX(HEAPF32, v + 8 >> 2, "loading")], HEAPF32[SAFE_HEAP_INDEX(HEAPF32, v + 12 >> 2, "loading")]);
 };
 
-_emscripten_glVertexAttrib4fv.sig = "vip";
-
 var _emscripten_glVertexAttribDivisor = (index, divisor) => {
   GLctx.vertexAttribDivisor(index, divisor);
 };
 
-_emscripten_glVertexAttribDivisor.sig = "vii";
-
 var _glVertexAttribDivisor = _emscripten_glVertexAttribDivisor;
-
-_glVertexAttribDivisor.sig = "vii";
 
 var _emscripten_glVertexAttribDivisorANGLE = _glVertexAttribDivisor;
 
@@ -11271,60 +9023,9 @@ var _emscripten_glVertexAttribPointer = (index, size, type, normalized, stride, 
   GLctx.vertexAttribPointer(index, size, type, !!normalized, stride, ptr);
 };
 
-_emscripten_glVertexAttribPointer.sig = "viiiiip";
-
 var _emscripten_glViewport = (x0, x1, x2, x3) => GLctx.viewport(x0, x1, x2, x3);
 
-_emscripten_glViewport.sig = "viiii";
-
 var _emscripten_has_asyncify = () => 0;
-
-_emscripten_has_asyncify.sig = "i";
-
-var _emscripten_num_logical_cores = () => ENVIRONMENT_IS_NODE ? require("node:os").cpus().length : navigator["hardwareConcurrency"];
-
-_emscripten_num_logical_cores.sig = "i";
-
-var _emscripten_out = str => out(UTF8ToString(str));
-
-_emscripten_out.sig = "vp";
-
-var _emscripten_promise_create = () => makePromise().id;
-
-_emscripten_promise_create.sig = "p";
-
-var _emscripten_promise_destroy = id => {
-  promiseMap.free(id);
-};
-
-_emscripten_promise_destroy.sig = "vp";
-
-var getPromise = id => promiseMap.get(id).promise;
-
-var _emscripten_promise_resolve = (id, result, value) => {
-  var info = promiseMap.get(id);
-  switch (result) {
-   case 0:
-    info.resolve(value);
-    return;
-
-   case 1:
-    info.resolve(getPromise(value));
-    return;
-
-   case 2:
-    info.resolve(getPromise(value));
-    _emscripten_promise_destroy(value);
-    return;
-
-   case 3:
-    info.reject(value);
-    return;
-  }
-  abort("unexpected promise callback result " + result);
-};
-
-_emscripten_promise_resolve.sig = "vpip";
 
 var doRequestFullscreen = (target, strategy) => {
   if (!JSEvents.fullscreenEnabled()) return -1;
@@ -11346,7 +9047,7 @@ var doRequestFullscreen = (target, strategy) => {
 };
 
 function _emscripten_request_fullscreen_strategy(target, deferUntilInEventHandler, fullscreenStrategy) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(60, 0, 1, target, deferUntilInEventHandler, fullscreenStrategy);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(40, 0, 1, target, deferUntilInEventHandler, fullscreenStrategy);
   var strategy = {
     scaleMode: HEAP32[SAFE_HEAP_INDEX(HEAP32, ((fullscreenStrategy) >> 2), "loading")],
     canvasResolutionScaleMode: HEAP32[SAFE_HEAP_INDEX(HEAP32, (((fullscreenStrategy) + (4)) >> 2), "loading")],
@@ -11359,10 +9060,8 @@ function _emscripten_request_fullscreen_strategy(target, deferUntilInEventHandle
   return doRequestFullscreen(target, strategy);
 }
 
-_emscripten_request_fullscreen_strategy.sig = "ipip";
-
 function _emscripten_request_pointerlock(target, deferUntilInEventHandler) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(61, 0, 1, target, deferUntilInEventHandler);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(41, 0, 1, target, deferUntilInEventHandler);
   target = findEventTarget(target);
   if (!target) return -4;
   if (!target.requestPointerLock) {
@@ -11380,8 +9079,6 @@ function _emscripten_request_pointerlock(target, deferUntilInEventHandler) {
   return requestPointerLock(target);
 }
 
-_emscripten_request_pointerlock.sig = "ipi";
-
 var _emscripten_resize_heap = requestedSize => {
   var oldSize = HEAPU8.length;
   // With CAN_ADDRESS_2GB or MEMORY64, pointers are already unsigned.
@@ -11389,10 +9086,8 @@ var _emscripten_resize_heap = requestedSize => {
   return false;
 };
 
-_emscripten_resize_heap.sig = "ip";
-
 /** @suppress {checkTypes} */ function _emscripten_sample_gamepad_data() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(62, 0, 1);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(42, 0, 1);
   try {
     if (navigator.getGamepads) return (JSEvents.lastGamepadState = navigator.getGamepads()) ? 0 : -1;
   } catch (e) {
@@ -11401,8 +9096,6 @@ _emscripten_resize_heap.sig = "ip";
   }
   return -1;
 }
-
-_emscripten_sample_gamepad_data.sig = "i";
 
 var registerBeforeUnloadEventCallback = (target, userData, useCapture, callbackfunc, eventTypeId, eventTypeString) => {
   var beforeUnloadEventHandlerFunc = e => {
@@ -11430,15 +9123,13 @@ var registerBeforeUnloadEventCallback = (target, userData, useCapture, callbackf
 };
 
 function _emscripten_set_beforeunload_callback_on_thread(userData, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(63, 0, 1, userData, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(43, 0, 1, userData, callbackfunc, targetThread);
   if (typeof onbeforeunload == "undefined") return -1;
   // beforeunload callback can only be registered on the main browser thread, because the page will go away immediately after returning from the handler,
   // and there is no time to start proxying it anywhere.
   if (targetThread !== 1) return -5;
   return registerBeforeUnloadEventCallback(2, userData, true, callbackfunc, 28, "beforeunload");
 }
-
-_emscripten_set_beforeunload_callback_on_thread.sig = "ippp";
 
 var registerFocusEventCallback = (target, userData, useCapture, callbackfunc, eventTypeId, eventTypeString, targetThread) => {
   targetThread = JSEvents.getTargetThreadForEventCallback(targetThread);
@@ -11465,14 +9156,12 @@ var registerFocusEventCallback = (target, userData, useCapture, callbackfunc, ev
 };
 
 function _emscripten_set_blur_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(64, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(44, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
   return registerFocusEventCallback(target, userData, useCapture, callbackfunc, 12, "blur", targetThread);
 }
 
-_emscripten_set_blur_callback_on_thread.sig = "ippipp";
-
 function _emscripten_set_element_css_size(target, width, height) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(65, 0, 1, target, width, height);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(45, 0, 1, target, width, height);
   target = findEventTarget(target);
   if (!target) return -4;
   target.style.width = width + "px";
@@ -11480,14 +9169,10 @@ function _emscripten_set_element_css_size(target, width, height) {
   return 0;
 }
 
-_emscripten_set_element_css_size.sig = "ipdd";
-
 function _emscripten_set_focus_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(66, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(46, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
   return registerFocusEventCallback(target, userData, useCapture, callbackfunc, 13, "focus", targetThread);
 }
-
-_emscripten_set_focus_callback_on_thread.sig = "ippipp";
 
 var fillFullscreenChangeEventData = eventStruct => {
   var fullscreenElement = getFullscreenElement();
@@ -11539,7 +9224,7 @@ var registerFullscreenChangeEventCallback = (target, userData, useCapture, callb
 };
 
 function _emscripten_set_fullscreenchange_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(67, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(47, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
   if (!JSEvents.fullscreenEnabled()) return -1;
   target = findEventTarget(target);
   if (!target) return -4;
@@ -11548,8 +9233,6 @@ function _emscripten_set_fullscreenchange_callback_on_thread(target, userData, u
   registerFullscreenChangeEventCallback(target, userData, useCapture, callbackfunc, 19, "webkitfullscreenchange", targetThread);
   return registerFullscreenChangeEventCallback(target, userData, useCapture, callbackfunc, 19, "fullscreenchange", targetThread);
 }
-
-_emscripten_set_fullscreenchange_callback_on_thread.sig = "ippipp";
 
 var registerGamepadEventCallback = (target, userData, useCapture, callbackfunc, eventTypeId, eventTypeString, targetThread) => {
   targetThread = JSEvents.getTargetThreadForEventCallback(targetThread);
@@ -11574,20 +9257,16 @@ var registerGamepadEventCallback = (target, userData, useCapture, callbackfunc, 
 };
 
 function _emscripten_set_gamepadconnected_callback_on_thread(userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(68, 0, 1, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(48, 0, 1, userData, useCapture, callbackfunc, targetThread);
   if (_emscripten_sample_gamepad_data()) return -1;
   return registerGamepadEventCallback(2, userData, useCapture, callbackfunc, 26, "gamepadconnected", targetThread);
 }
 
-_emscripten_set_gamepadconnected_callback_on_thread.sig = "ipipp";
-
 function _emscripten_set_gamepaddisconnected_callback_on_thread(userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(69, 0, 1, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(49, 0, 1, userData, useCapture, callbackfunc, targetThread);
   if (_emscripten_sample_gamepad_data()) return -1;
   return registerGamepadEventCallback(2, userData, useCapture, callbackfunc, 27, "gamepaddisconnected", targetThread);
 }
-
-_emscripten_set_gamepaddisconnected_callback_on_thread.sig = "ipipp";
 
 var registerKeyEventCallback = (target, userData, useCapture, callbackfunc, eventTypeId, eventTypeString, targetThread) => {
   targetThread = JSEvents.getTargetThreadForEventCallback(targetThread);
@@ -11626,32 +9305,24 @@ var registerKeyEventCallback = (target, userData, useCapture, callbackfunc, even
 };
 
 function _emscripten_set_keydown_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(70, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(50, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
   return registerKeyEventCallback(target, userData, useCapture, callbackfunc, 2, "keydown", targetThread);
 }
 
-_emscripten_set_keydown_callback_on_thread.sig = "ippipp";
-
 function _emscripten_set_keypress_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(71, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(51, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
   return registerKeyEventCallback(target, userData, useCapture, callbackfunc, 1, "keypress", targetThread);
 }
 
-_emscripten_set_keypress_callback_on_thread.sig = "ippipp";
-
 function _emscripten_set_keyup_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(72, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(52, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
   return registerKeyEventCallback(target, userData, useCapture, callbackfunc, 3, "keyup", targetThread);
 }
-
-_emscripten_set_keyup_callback_on_thread.sig = "ippipp";
 
 var _emscripten_set_main_loop = (func, fps, simulateInfiniteLoop) => {
   var iterFunc = getWasmTableEntry(func);
   setMainLoop(iterFunc, fps, simulateInfiniteLoop);
 };
-
-_emscripten_set_main_loop.sig = "vpii";
 
 var fillMouseEventData = (eventStruct, e, target) => {
   assert(eventStruct % 4 == 0);
@@ -11702,39 +9373,29 @@ var registerMouseEventCallback = (target, userData, useCapture, callbackfunc, ev
 };
 
 function _emscripten_set_mousedown_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(73, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(53, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
   return registerMouseEventCallback(target, userData, useCapture, callbackfunc, 5, "mousedown", targetThread);
 }
 
-_emscripten_set_mousedown_callback_on_thread.sig = "ippipp";
-
 function _emscripten_set_mouseenter_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(74, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(54, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
   return registerMouseEventCallback(target, userData, useCapture, callbackfunc, 33, "mouseenter", targetThread);
 }
 
-_emscripten_set_mouseenter_callback_on_thread.sig = "ippipp";
-
 function _emscripten_set_mouseleave_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(75, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(55, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
   return registerMouseEventCallback(target, userData, useCapture, callbackfunc, 34, "mouseleave", targetThread);
 }
 
-_emscripten_set_mouseleave_callback_on_thread.sig = "ippipp";
-
 function _emscripten_set_mousemove_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(76, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(56, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
   return registerMouseEventCallback(target, userData, useCapture, callbackfunc, 8, "mousemove", targetThread);
 }
 
-_emscripten_set_mousemove_callback_on_thread.sig = "ippipp";
-
 function _emscripten_set_mouseup_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(77, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(57, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
   return registerMouseEventCallback(target, userData, useCapture, callbackfunc, 6, "mouseup", targetThread);
 }
-
-_emscripten_set_mouseup_callback_on_thread.sig = "ippipp";
 
 var fillPointerlockChangeEventData = eventStruct => {
   var pointerLockElement = document.pointerLockElement;
@@ -11770,7 +9431,7 @@ var registerPointerlockChangeEventCallback = (target, userData, useCapture, call
 };
 
 function _emscripten_set_pointerlockchange_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(78, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(58, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
   if (!document.body?.requestPointerLock) {
     return -1;
   }
@@ -11778,8 +9439,6 @@ function _emscripten_set_pointerlockchange_callback_on_thread(target, userData, 
   if (!target) return -4;
   return registerPointerlockChangeEventCallback(target, userData, useCapture, callbackfunc, 20, "pointerlockchange", targetThread);
 }
-
-_emscripten_set_pointerlockchange_callback_on_thread.sig = "ippipp";
 
 var registerUiEventCallback = (target, userData, useCapture, callbackfunc, eventTypeId, eventTypeString, targetThread) => {
   targetThread = JSEvents.getTargetThreadForEventCallback(targetThread);
@@ -11836,11 +9495,9 @@ var registerUiEventCallback = (target, userData, useCapture, callbackfunc, event
 };
 
 function _emscripten_set_resize_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(79, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(59, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
   return registerUiEventCallback(target, userData, useCapture, callbackfunc, 10, "resize", targetThread);
 }
-
-_emscripten_set_resize_callback_on_thread.sig = "ippipp";
 
 var registerTouchEventCallback = (target, userData, useCapture, callbackfunc, eventTypeId, eventTypeString, targetThread) => {
   targetThread = JSEvents.getTargetThreadForEventCallback(targetThread);
@@ -11914,32 +9571,24 @@ var registerTouchEventCallback = (target, userData, useCapture, callbackfunc, ev
 };
 
 function _emscripten_set_touchcancel_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(80, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(60, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
   return registerTouchEventCallback(target, userData, useCapture, callbackfunc, 25, "touchcancel", targetThread);
 }
 
-_emscripten_set_touchcancel_callback_on_thread.sig = "ippipp";
-
 function _emscripten_set_touchend_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(81, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(61, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
   return registerTouchEventCallback(target, userData, useCapture, callbackfunc, 23, "touchend", targetThread);
 }
 
-_emscripten_set_touchend_callback_on_thread.sig = "ippipp";
-
 function _emscripten_set_touchmove_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(82, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(62, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
   return registerTouchEventCallback(target, userData, useCapture, callbackfunc, 24, "touchmove", targetThread);
 }
 
-_emscripten_set_touchmove_callback_on_thread.sig = "ippipp";
-
 function _emscripten_set_touchstart_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(83, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(63, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
   return registerTouchEventCallback(target, userData, useCapture, callbackfunc, 22, "touchstart", targetThread);
 }
-
-_emscripten_set_touchstart_callback_on_thread.sig = "ippipp";
 
 var fillVisibilityChangeEventData = eventStruct => {
   var visibilityStates = [ "hidden", "visible", "prerender", "unloaded" ];
@@ -11973,14 +9622,12 @@ var registerVisibilityChangeEventCallback = (target, userData, useCapture, callb
 };
 
 function _emscripten_set_visibilitychange_callback_on_thread(userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(84, 0, 1, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(64, 0, 1, userData, useCapture, callbackfunc, targetThread);
   if (!specialHTMLTargets[1]) {
     return -4;
   }
   return registerVisibilityChangeEventCallback(specialHTMLTargets[1], userData, useCapture, callbackfunc, 21, "visibilitychange", targetThread);
 }
-
-_emscripten_set_visibilitychange_callback_on_thread.sig = "ipipp";
 
 var registerWheelEventCallback = (target, userData, useCapture, callbackfunc, eventTypeId, eventTypeString, targetThread) => {
   targetThread = JSEvents.getTargetThreadForEventCallback(targetThread);
@@ -12011,7 +9658,7 @@ var registerWheelEventCallback = (target, userData, useCapture, callbackfunc, ev
 };
 
 function _emscripten_set_wheel_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(85, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(65, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
   target = findEventTarget(target);
   if (!target) return -4;
   if (typeof target.onwheel != "undefined") {
@@ -12021,26 +9668,14 @@ function _emscripten_set_wheel_callback_on_thread(target, userData, useCapture, 
   }
 }
 
-_emscripten_set_wheel_callback_on_thread.sig = "ippipp";
-
 function _emscripten_set_window_title(title) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(86, 0, 1, title);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(66, 0, 1, title);
   return document.title = UTF8ToString(title);
 }
-
-_emscripten_set_window_title.sig = "vp";
 
 var _emscripten_sleep = () => {
   abort("Please compile your program with async support in order to use asynchronous operations like emscripten_sleep");
 };
-
-_emscripten_sleep.sig = "vi";
-
-var _emscripten_unwind_to_js_event_loop = () => {
-  throw "unwind";
-};
-
-_emscripten_unwind_to_js_event_loop.sig = "v";
 
 var ENV = {};
 
@@ -12077,7 +9712,7 @@ var getEnvStrings = () => {
 };
 
 function _environ_get(__environ, environ_buf) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(87, 0, 1, __environ, environ_buf);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(67, 0, 1, __environ, environ_buf);
   var bufSize = 0;
   var envp = 0;
   for (var string of getEnvStrings()) {
@@ -12089,10 +9724,8 @@ function _environ_get(__environ, environ_buf) {
   return 0;
 }
 
-_environ_get.sig = "ipp";
-
 function _environ_sizes_get(penviron_count, penviron_buf_size) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(88, 0, 1, penviron_count, penviron_buf_size);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(68, 0, 1, penviron_count, penviron_buf_size);
   var strings = getEnvStrings();
   HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((penviron_count) >> 2), "storing")] = strings.length;
   checkInt32(strings.length);
@@ -12105,10 +9738,8 @@ function _environ_sizes_get(penviron_count, penviron_buf_size) {
   return 0;
 }
 
-_environ_sizes_get.sig = "ipp";
-
 function _fd_close(fd) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(89, 0, 1, fd);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(69, 0, 1, fd);
   try {
     var stream = SYSCALLS.getStreamFromFD(fd);
     FS.close(stream);
@@ -12118,37 +9749,6 @@ function _fd_close(fd) {
     return e.errno;
   }
 }
-
-_fd_close.sig = "ii";
-
-function _fd_fdstat_get(fd, pbuf) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(90, 0, 1, fd, pbuf);
-  try {
-    var rightsBase = 0;
-    var rightsInheriting = 0;
-    var flags = 0;
-    {
-      var stream = SYSCALLS.getStreamFromFD(fd);
-      // All character devices are terminals (other things a Linux system would
-      // assume is a character device, like the mouse, we have special APIs for).
-      var type = stream.tty ? 2 : FS.isDir(stream.mode) ? 3 : FS.isLink(stream.mode) ? 7 : 4;
-    }
-    HEAP8[SAFE_HEAP_INDEX(HEAP8, pbuf, "storing")] = type;
-    checkInt8(type);
-    HEAP16[SAFE_HEAP_INDEX(HEAP16, (((pbuf) + (2)) >> 1), "storing")] = flags;
-    checkInt16(flags);
-    HEAP64[SAFE_HEAP_INDEX(HEAP64, (((pbuf) + (8)) >> 3), "storing")] = BigInt(rightsBase);
-    checkInt64(rightsBase);
-    HEAP64[SAFE_HEAP_INDEX(HEAP64, (((pbuf) + (16)) >> 3), "storing")] = BigInt(rightsInheriting);
-    checkInt64(rightsInheriting);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return e.errno;
-  }
-}
-
-_fd_fdstat_get.sig = "iip";
 
 /** @param {number=} offset */ var doReadv = (stream, iov, iovcnt, offset) => {
   var ret = 0;
@@ -12169,7 +9769,7 @@ _fd_fdstat_get.sig = "iip";
 };
 
 function _fd_read(fd, iov, iovcnt, pnum) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(91, 0, 1, fd, iov, iovcnt, pnum);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(70, 0, 1, fd, iov, iovcnt, pnum);
   try {
     var stream = SYSCALLS.getStreamFromFD(fd);
     var num = doReadv(stream, iov, iovcnt);
@@ -12182,10 +9782,8 @@ function _fd_read(fd, iov, iovcnt, pnum) {
   }
 }
 
-_fd_read.sig = "iippp";
-
 function _fd_seek(fd, offset, whence, newOffset) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(92, 0, 1, fd, offset, whence, newOffset);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(71, 0, 1, fd, offset, whence, newOffset);
   offset = bigintToI53Checked(offset);
   try {
     if (isNaN(offset)) return 61;
@@ -12201,8 +9799,6 @@ function _fd_seek(fd, offset, whence, newOffset) {
     return e.errno;
   }
 }
-
-_fd_seek.sig = "iijip";
 
 /** @param {number=} offset */ var doWritev = (stream, iov, iovcnt, offset) => {
   var ret = 0;
@@ -12225,7 +9821,7 @@ _fd_seek.sig = "iijip";
 };
 
 function _fd_write(fd, iov, iovcnt, pnum) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(93, 0, 1, fd, iov, iovcnt, pnum);
+  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(72, 0, 1, fd, iov, iovcnt, pnum);
   try {
     var stream = SYSCALLS.getStreamFromFD(fd);
     var num = doWritev(stream, iov, iovcnt);
@@ -12238,135 +9834,69 @@ function _fd_write(fd, iov, iovcnt, pnum) {
   }
 }
 
-_fd_write.sig = "iippp";
-
 var _glActiveTexture = _emscripten_glActiveTexture;
-
-_glActiveTexture.sig = "vi";
 
 var _glAttachShader = _emscripten_glAttachShader;
 
-_glAttachShader.sig = "vii";
-
 var _glBindAttribLocation = _emscripten_glBindAttribLocation;
-
-_glBindAttribLocation.sig = "viip";
 
 var _glBindBuffer = _emscripten_glBindBuffer;
 
-_glBindBuffer.sig = "vii";
-
 var _glBindTexture = _emscripten_glBindTexture;
-
-_glBindTexture.sig = "vii";
 
 var _glBufferData = _emscripten_glBufferData;
 
-_glBufferData.sig = "vippi";
-
 var _glBufferSubData = _emscripten_glBufferSubData;
-
-_glBufferSubData.sig = "vippp";
 
 var _glClear = _emscripten_glClear;
 
-_glClear.sig = "vi";
-
 var _glCompileShader = _emscripten_glCompileShader;
-
-_glCompileShader.sig = "vi";
 
 var _glCreateProgram = _emscripten_glCreateProgram;
 
-_glCreateProgram.sig = "i";
-
 var _glCreateShader = _emscripten_glCreateShader;
-
-_glCreateShader.sig = "ii";
 
 var _glDeleteShader = _emscripten_glDeleteShader;
 
-_glDeleteShader.sig = "vi";
-
 var _glDrawArrays = _emscripten_glDrawArrays;
-
-_glDrawArrays.sig = "viii";
 
 var _glEnableVertexAttribArray = _emscripten_glEnableVertexAttribArray;
 
-_glEnableVertexAttribArray.sig = "vi";
-
 var _glGenBuffers = _emscripten_glGenBuffers;
-
-_glGenBuffers.sig = "vip";
 
 var _glGenTextures = _emscripten_glGenTextures;
 
-_glGenTextures.sig = "vip";
-
 var _glGetProgramInfoLog = _emscripten_glGetProgramInfoLog;
-
-_glGetProgramInfoLog.sig = "viipp";
 
 var _glGetProgramiv = _emscripten_glGetProgramiv;
 
-_glGetProgramiv.sig = "viip";
-
 var _glGetShaderInfoLog = _emscripten_glGetShaderInfoLog;
-
-_glGetShaderInfoLog.sig = "viipp";
 
 var _glGetShaderiv = _emscripten_glGetShaderiv;
 
-_glGetShaderiv.sig = "viip";
-
 var _glGetUniformLocation = _emscripten_glGetUniformLocation;
-
-_glGetUniformLocation.sig = "iip";
 
 var _glLinkProgram = _emscripten_glLinkProgram;
 
-_glLinkProgram.sig = "vi";
-
 var _glPixelStorei = _emscripten_glPixelStorei;
-
-_glPixelStorei.sig = "vii";
 
 var _glShaderSource = _emscripten_glShaderSource;
 
-_glShaderSource.sig = "viipp";
-
 var _glTexImage2D = _emscripten_glTexImage2D;
-
-_glTexImage2D.sig = "viiiiiiiip";
 
 var _glTexParameteri = _emscripten_glTexParameteri;
 
-_glTexParameteri.sig = "viii";
-
 var _glTexSubImage2D = _emscripten_glTexSubImage2D;
-
-_glTexSubImage2D.sig = "viiiiiiiip";
 
 var _glUniform1f = _emscripten_glUniform1f;
 
-_glUniform1f.sig = "vif";
-
 var _glUniform1i = _emscripten_glUniform1i;
-
-_glUniform1i.sig = "vii";
 
 var _glUniform2f = _emscripten_glUniform2f;
 
-_glUniform2f.sig = "viff";
-
 var _glUseProgram = _emscripten_glUseProgram;
 
-_glUseProgram.sig = "vi";
-
 var _glVertexAttribPointer = _emscripten_glVertexAttribPointer;
-
-_glVertexAttribPointer.sig = "viiiiip";
 
 var autoResumeAudioContext = ctx => {
   for (var event of [ "keydown", "mousedown", "touchstart" ]) {
@@ -12378,6 +9908,18 @@ var autoResumeAudioContext = ctx => {
       });
     }
   }
+};
+
+var dynCall = (sig, ptr, args = [], promising = false) => {
+  assert(ptr, `null function pointer in dynCall`);
+  assert(!promising, "async dynCall is not supported in this mode");
+  assert(getWasmTableEntry(ptr), `missing table entry in dynCall: ${ptr}`);
+  var func = getWasmTableEntry(ptr);
+  var rtn = func(...args);
+  function convert(rtn) {
+    return rtn;
+  }
+  return convert(rtn);
 };
 
 var getCFunc = ident => {
@@ -12461,12086 +10003,7 @@ var FS_createDevice = (...args) => FS.createDevice(...args);
 
 var createContext = Browser.createContext;
 
-var writeI53ToI64Clamped = (ptr, num) => {
-  if (num > 0x8000000000000000) {
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((ptr) >> 2), "storing")] = 4294967295;
-    checkInt32(4294967295);
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((ptr) + (4)) >> 2), "storing")] = 2147483647;
-    checkInt32(2147483647);
-  } else if (num < -0x8000000000000000) {
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((ptr) >> 2), "storing")] = 0;
-    checkInt32(0);
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((ptr) + (4)) >> 2), "storing")] = 2147483648;
-    checkInt32(2147483648);
-  } else {
-    writeI53ToI64(ptr, num);
-  }
-};
-
-var writeI53ToI64Signaling = (ptr, num) => {
-  if (num > 0x8000000000000000 || num < -0x8000000000000000) {
-    throw `RangeError in writeI53ToI64Signaling(): input value ${num} is out of range of int64`;
-  }
-  writeI53ToI64(ptr, num);
-};
-
-var writeI53ToU64Clamped = (ptr, num) => {
-  if (num > 0x10000000000000000) {
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((ptr) >> 2), "storing")] = 4294967295;
-    checkInt32(4294967295);
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((ptr) + (4)) >> 2), "storing")] = 4294967295;
-    checkInt32(4294967295);
-  } else if (num < 0) {
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((ptr) >> 2), "storing")] = 0;
-    checkInt32(0);
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((ptr) + (4)) >> 2), "storing")] = 0;
-    checkInt32(0);
-  } else {
-    writeI53ToI64(ptr, num);
-  }
-};
-
-var writeI53ToU64Signaling = (ptr, num) => {
-  if (num < 0 || num > 0x10000000000000000) {
-    throw `RangeError in writeI53ToU64Signaling(): input value ${num} is out of range of uint64`;
-  }
-  writeI53ToI64(ptr, num);
-};
-
-var convertI32PairToI53 = (lo, hi) => {
-  // This function should not be getting called with too large unsigned numbers
-  // in high part (if hi >= 0x7FFFFFFFF, one should have been calling
-  // convertU32PairToI53())
-  assert(hi === (hi | 0));
-  return (lo >>> 0) + hi * 4294967296;
-};
-
-var convertI32PairToI53Checked = (lo, hi) => {
-  assert(lo == (lo >>> 0) || lo == (lo | 0));
-  // lo should either be a i32 or a u32
-  assert(hi === (hi | 0));
-  // hi should be a i32
-  return ((hi + 2097152) >>> 0 < 4194305 - !!lo) ? (lo >>> 0) + hi * 4294967296 : NaN;
-};
-
-var convertU32PairToI53 = (lo, hi) => (lo >>> 0) + (hi >>> 0) * 4294967296;
-
-var getTempRet0 = val => __emscripten_tempret_get();
-
-var setTempRet0 = val => __emscripten_tempret_set(val);
-
-var _stackAlloc = stackAlloc;
-
-var _stackSave = stackSave;
-
-var _stackRestore = stackSave;
-
-var _setTempRet0 = setTempRet0;
-
-var _getTempRet0 = getTempRet0;
-
-var _segfault = segfault;
-
-var _alignfault = alignfault;
-
-var growMemory = size => {
-  var oldHeapSize = wasmMemory.buffer.byteLength;
-  var pages = ((size - oldHeapSize + 65535) / 65536) | 0;
-  try {
-    // round size grow request up to wasm page size (fixed 64KB per spec)
-    wasmMemory.grow(pages);
-    // .grow() takes a delta compared to the previous size
-    updateMemoryViews();
-    return 1;
-  } catch (e) {
-    err(`growMemory: Attempted to grow heap from ${oldHeapSize} bytes to ${size} bytes, but got error: ${e}`);
-  }
-};
-
-var _emscripten_notify_memory_growth = memoryIndex => {
-  assert(memoryIndex == 0);
-  updateMemoryViews();
-};
-
-_emscripten_notify_memory_growth.sig = "vp";
-
-var __emscripten_system = command => {
-  if (ENVIRONMENT_IS_NODE) {
-    if (!command) return 1;
-    // shell is available
-    var cmdstr = UTF8ToString(command);
-    if (!cmdstr.length) return 0;
-    // this is what glibc seems to do (shell works test?)
-    var cp = require("node:child_process");
-    var ret = cp.spawnSync(cmdstr, [], {
-      shell: true,
-      stdio: "inherit"
-    });
-    var _W_EXITCODE = (ret, sig) => ((ret) << 8 | (sig));
-    // this really only can happen if process is killed by signal
-    if (ret.status === null) {
-      // sadly node doesn't expose such function
-      var signalToNumber = sig => {
-        // implement only the most common ones, and fallback to SIGINT
-        switch (sig) {
-         case "SIGHUP":
-          return 1;
-
-         case "SIGQUIT":
-          return 3;
-
-         case "SIGFPE":
-          return 8;
-
-         case "SIGKILL":
-          return 9;
-
-         case "SIGALRM":
-          return 14;
-
-         case "SIGTERM":
-          return 15;
-
-         default:
-          return 2;
-        }
-      };
-      return _W_EXITCODE(0, signalToNumber(ret.signal));
-    }
-    return _W_EXITCODE(ret.status, 0);
-  }
-  // int system(const char *command);
-  // http://pubs.opengroup.org/onlinepubs/000095399/functions/system.html
-  // Can't call external programs.
-  if (!command) return 0;
-  // no shell available
-  return -52;
-};
-
-__emscripten_system.sig = "ip";
-
-var __emscripten_throw_longjmp = () => {
-  throw Infinity;
-};
-
-__emscripten_throw_longjmp.sig = "v";
-
-var inetPton4 = str => {
-  var b = str.split(".");
-  for (var i = 0; i < 4; i++) {
-    var tmp = Number(b[i]);
-    if (isNaN(tmp)) return null;
-    b[i] = tmp;
-  }
-  return (b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)) >>> 0;
-};
-
-var inetNtop4 = addr => (addr & 255) + "." + ((addr >> 8) & 255) + "." + ((addr >> 16) & 255) + "." + ((addr >> 24) & 255);
-
-var inetPton6 = str => {
-  var words;
-  var w, offset, z, i;
-  /* http://home.deds.nl/~aeron/regex/ */ var valid6regx = /^((?=.*::)(?!.*::.+::)(::)?([\dA-F]{1,4}:(:|\b)|){5}|([\dA-F]{1,4}:){6})((([\dA-F]{1,4}((?!\3)::|:\b|$))|(?!\2\3)){2}|(((2[0-4]|1\d|[1-9])?\d|25[0-5])\.?\b){4})$/i;
-  var parts = [];
-  if (!valid6regx.test(str)) {
-    return null;
-  }
-  if (str === "::") {
-    return [ 0, 0, 0, 0, 0, 0, 0, 0 ];
-  }
-  // Z placeholder to keep track of zeros when splitting the string on ":"
-  if (str.startsWith("::")) {
-    str = str.replace("::", "Z:");
-  } else {
-    str = str.replace("::", ":Z:");
-  }
-  if (str.indexOf(".") > 0) {
-    // parse IPv4 embedded address
-    str = str.replace(new RegExp("[.]", "g"), ":");
-    words = str.split(":");
-    words[words.length - 4] = Number(words[words.length - 4]) + Number(words[words.length - 3]) * 256;
-    words[words.length - 3] = Number(words[words.length - 2]) + Number(words[words.length - 1]) * 256;
-    words = words.slice(0, words.length - 2);
-  } else {
-    words = str.split(":");
-  }
-  offset = 0;
-  z = 0;
-  for (w = 0; w < words.length; w++) {
-    if (typeof words[w] == "string") {
-      if (words[w] === "Z") {
-        // compressed zeros - write appropriate number of zero words
-        for (z = 0; z < (8 - words.length + 1); z++) {
-          parts[w + z] = 0;
-        }
-        offset = z - 1;
-      } else {
-        // parse hex field to 16-bit value and write it in network byte-order
-        parts[w + offset] = _htons(parseInt(words[w], 16));
-      }
-    } else {
-      // parsed IPv4 words
-      parts[w + offset] = words[w];
-    }
-  }
-  return [ (parts[1] << 16) | parts[0], (parts[3] << 16) | parts[2], (parts[5] << 16) | parts[4], (parts[7] << 16) | parts[6] ];
-};
-
-var inetNtop6 = ints => {
-  //  ref:  http://www.ietf.org/rfc/rfc2373.txt - section 2.5.4
-  //  Format for IPv4 compatible and mapped  128-bit IPv6 Addresses
-  //  128-bits are split into eight 16-bit words
-  //  stored in network byte order (big-endian)
-  //  |                80 bits               | 16 |      32 bits        |
-  //  +-----------------------------------------------------------------+
-  //  |               10 bytes               |  2 |      4 bytes        |
-  //  +--------------------------------------+--------------------------+
-  //  +               5 words                |  1 |      2 words        |
-  //  +--------------------------------------+--------------------------+
-  //  |0000..............................0000|0000|    IPv4 ADDRESS     | (compatible)
-  //  +--------------------------------------+----+---------------------+
-  //  |0000..............................0000|FFFF|    IPv4 ADDRESS     | (mapped)
-  //  +--------------------------------------+----+---------------------+
-  var str = "";
-  var word = 0;
-  var longest = 0;
-  var lastzero = 0;
-  var zstart = 0;
-  var len = 0;
-  var i = 0;
-  var parts = [ ints[0] & 65535, (ints[0] >> 16), ints[1] & 65535, (ints[1] >> 16), ints[2] & 65535, (ints[2] >> 16), ints[3] & 65535, (ints[3] >> 16) ];
-  // Handle IPv4-compatible, IPv4-mapped, loopback and any/unspecified addresses
-  var hasipv4 = true;
-  var v4part = "";
-  // check if the 10 high-order bytes are all zeros (first 5 words)
-  for (i = 0; i < 5; i++) {
-    if (parts[i] !== 0) {
-      hasipv4 = false;
-      break;
-    }
-  }
-  if (hasipv4) {
-    // low-order 32-bits store an IPv4 address (bytes 13 to 16) (last 2 words)
-    v4part = inetNtop4(parts[6] | (parts[7] << 16));
-    // IPv4-mapped IPv6 address if 16-bit value (bytes 11 and 12) == 0xFFFF (6th word)
-    if (parts[5] === -1) {
-      str = "::ffff:";
-      str += v4part;
-      return str;
-    }
-    // IPv4-compatible IPv6 address if 16-bit value (bytes 11 and 12) == 0x0000 (6th word)
-    if (parts[5] === 0) {
-      str = "::";
-      // special case IPv6 addresses
-      if (v4part === "0.0.0.0") v4part = "";
-      // any/unspecified address
-      if (v4part === "0.0.0.1") v4part = "1";
-      // loopback address
-      str += v4part;
-      return str;
-    }
-  }
-  // Handle all other IPv6 addresses
-  // first run to find the longest contiguous zero words
-  for (word = 0; word < 8; word++) {
-    if (parts[word] === 0) {
-      if (word - lastzero > 1) {
-        len = 0;
-      }
-      lastzero = word;
-      len++;
-    }
-    if (len > longest) {
-      longest = len;
-      zstart = word - longest + 1;
-    }
-  }
-  for (word = 0; word < 8; word++) {
-    if (longest > 1) {
-      // compress contiguous zeros - to produce "::"
-      if (parts[word] === 0 && word >= zstart && word < (zstart + longest)) {
-        if (word === zstart) {
-          str += ":";
-          if (zstart === 0) str += ":";
-        }
-        continue;
-      }
-    }
-    // converts 16-bit words from big-endian to little-endian before converting to hex string
-    str += Number(_ntohs(parts[word] & 65535)).toString(16);
-    str += word < 7 ? ":" : "";
-  }
-  return str;
-};
-
-var readSockaddr = (sa, salen) => {
-  // family / port offsets are common to both sockaddr_in and sockaddr_in6
-  var family = HEAP16[SAFE_HEAP_INDEX(HEAP16, ((sa) >> 1), "loading")];
-  var port = _ntohs(HEAPU16[SAFE_HEAP_INDEX(HEAPU16, (((sa) + (2)) >> 1), "loading")]);
-  var addr;
-  switch (family) {
-   case 2:
-    if (salen !== 16) {
-      return {
-        errno: 28
-      };
-    }
-    addr = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((sa) + (4)) >> 2), "loading")];
-    addr = inetNtop4(addr);
-    break;
-
-   case 10:
-    if (salen !== 28) {
-      return {
-        errno: 28
-      };
-    }
-    addr = [ HEAP32[SAFE_HEAP_INDEX(HEAP32, (((sa) + (8)) >> 2), "loading")], HEAP32[SAFE_HEAP_INDEX(HEAP32, (((sa) + (12)) >> 2), "loading")], HEAP32[SAFE_HEAP_INDEX(HEAP32, (((sa) + (16)) >> 2), "loading")], HEAP32[SAFE_HEAP_INDEX(HEAP32, (((sa) + (20)) >> 2), "loading")] ];
-    addr = inetNtop6(addr);
-    break;
-
-   default:
-    return {
-      errno: 5
-    };
-  }
-  return {
-    family,
-    addr,
-    port
-  };
-};
-
-/** @param {number=} addrlen */ var writeSockaddr = (sa, family, addr, port, addrlen) => {
-  switch (family) {
-   case 2:
-    addr = inetPton4(addr);
-    zeroMemory(sa, 16);
-    if (addrlen) {
-      HEAP32[SAFE_HEAP_INDEX(HEAP32, ((addrlen) >> 2), "storing")] = 16;
-      checkInt32(16);
-    }
-    HEAP16[SAFE_HEAP_INDEX(HEAP16, ((sa) >> 1), "storing")] = family;
-    checkInt16(family);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((sa) + (4)) >> 2), "storing")] = addr;
-    checkInt32(addr);
-    HEAP16[SAFE_HEAP_INDEX(HEAP16, (((sa) + (2)) >> 1), "storing")] = _htons(port);
-    checkInt16(_htons(port));
-    break;
-
-   case 10:
-    addr = inetPton6(addr);
-    zeroMemory(sa, 28);
-    if (addrlen) {
-      HEAP32[SAFE_HEAP_INDEX(HEAP32, ((addrlen) >> 2), "storing")] = 28;
-      checkInt32(28);
-    }
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((sa) >> 2), "storing")] = family;
-    checkInt32(family);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((sa) + (8)) >> 2), "storing")] = addr[0];
-    checkInt32(addr[0]);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((sa) + (12)) >> 2), "storing")] = addr[1];
-    checkInt32(addr[1]);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((sa) + (16)) >> 2), "storing")] = addr[2];
-    checkInt32(addr[2]);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((sa) + (20)) >> 2), "storing")] = addr[3];
-    checkInt32(addr[3]);
-    HEAP16[SAFE_HEAP_INDEX(HEAP16, (((sa) + (2)) >> 1), "storing")] = _htons(port);
-    checkInt16(_htons(port));
-    break;
-
-   default:
-    return 5;
-  }
-  return 0;
-};
-
-var DNS = {
-  address_map: {
-    id: 1,
-    addrs: {},
-    names: {}
-  },
-  lookup_name(name) {
-    // If the name is already a valid ipv4 / ipv6 address, don't generate a fake one.
-    var res = inetPton4(name);
-    if (res !== null) {
-      return name;
-    }
-    res = inetPton6(name);
-    if (res !== null) {
-      return name;
-    }
-    // See if this name is already mapped.
-    var addr;
-    if (DNS.address_map.addrs[name]) {
-      addr = DNS.address_map.addrs[name];
-    } else {
-      var id = DNS.address_map.id++;
-      assert(id < 65535, "exceeded max address mappings of 65535");
-      addr = "172.29." + (id & 255) + "." + (id & 65280);
-      DNS.address_map.names[addr] = name;
-      DNS.address_map.addrs[name] = addr;
-    }
-    return addr;
-  },
-  lookup_addr(addr) {
-    if (DNS.address_map.names[addr]) {
-      return DNS.address_map.names[addr];
-    }
-    return null;
-  }
-};
-
-var __emscripten_lookup_name = name => {
-  // uint32_t _emscripten_lookup_name(const char *name);
-  var nameString = UTF8ToString(name);
-  return inetPton4(DNS.lookup_name(nameString));
-};
-
-__emscripten_lookup_name.sig = "ip";
-
-function _getaddrinfo(node, service, hint, out) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(94, 0, 1, node, service, hint, out);
-  // Note getaddrinfo currently only returns a single addrinfo with ai_next defaulting to NULL. When NULL
-  // hints are specified or ai_family set to AF_UNSPEC or ai_socktype or ai_protocol set to 0 then we
-  // really should provide a linked list of suitable addrinfo values.
-  var addrs = [];
-  var canon = null;
-  var addr = 0;
-  var port = 0;
-  var flags = 0;
-  var family = 0;
-  var type = 0;
-  var proto = 0;
-  var ai, last;
-  function allocaddrinfo(family, type, proto, canon, addr, port) {
-    var sa, salen, ai;
-    var errno;
-    salen = family === 10 ? 28 : 16;
-    addr = family === 10 ? inetNtop6(addr) : inetNtop4(addr);
-    sa = _malloc(salen);
-    errno = writeSockaddr(sa, family, addr, port);
-    assert(!errno);
-    ai = _malloc(32);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((ai) + (4)) >> 2), "storing")] = family;
-    checkInt32(family);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((ai) + (8)) >> 2), "storing")] = type;
-    checkInt32(type);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((ai) + (12)) >> 2), "storing")] = proto;
-    checkInt32(proto);
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((ai) + (24)) >> 2), "storing")] = canon;
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((ai) + (20)) >> 2), "storing")] = sa;
-    if (family === 10) {
-      HEAP32[SAFE_HEAP_INDEX(HEAP32, (((ai) + (16)) >> 2), "storing")] = 28;
-      checkInt32(28);
-    } else {
-      HEAP32[SAFE_HEAP_INDEX(HEAP32, (((ai) + (16)) >> 2), "storing")] = 16;
-      checkInt32(16);
-    }
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((ai) + (28)) >> 2), "storing")] = 0;
-    checkInt32(0);
-    return ai;
-  }
-  if (hint) {
-    flags = HEAP32[SAFE_HEAP_INDEX(HEAP32, ((hint) >> 2), "loading")];
-    family = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((hint) + (4)) >> 2), "loading")];
-    type = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((hint) + (8)) >> 2), "loading")];
-    proto = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((hint) + (12)) >> 2), "loading")];
-  }
-  if (type && !proto) {
-    proto = type === 2 ? 17 : 6;
-  }
-  if (!type && proto) {
-    type = proto === 17 ? 2 : 1;
-  }
-  // If type or proto are set to zero in hints we should really be returning multiple addrinfo values, but for
-  // now default to a TCP STREAM socket so we can at least return a sensible addrinfo given NULL hints.
-  if (proto === 0) {
-    proto = 6;
-  }
-  if (type === 0) {
-    type = 1;
-  }
-  if (!node && !service) {
-    return -2;
-  }
-  if (flags & ~(1 | 2 | 4 | 1024 | 8 | 16 | 32)) {
-    return -1;
-  }
-  if (hint !== 0 && (HEAP32[SAFE_HEAP_INDEX(HEAP32, ((hint) >> 2), "loading")] & 2) && !node) {
-    return -1;
-  }
-  if (flags & 32) {
-    // TODO
-    return -2;
-  }
-  if (type !== 0 && type !== 1 && type !== 2) {
-    return -7;
-  }
-  if (family !== 0 && family !== 2 && family !== 10) {
-    return -6;
-  }
-  if (service) {
-    service = UTF8ToString(service);
-    port = parseInt(service, 10);
-    if (isNaN(port)) {
-      if (flags & 1024) {
-        return -2;
-      }
-      // TODO support resolving well-known service names from:
-      // http://www.iana.org/assignments/service-names-port-numbers/service-names-port-numbers.txt
-      return -8;
-    }
-  }
-  if (!node) {
-    if (family === 0) {
-      family = 2;
-    }
-    if ((flags & 1) === 0) {
-      if (family === 2) {
-        addr = _htonl(2130706433);
-      } else {
-        addr = [ 0, 0, 0, _htonl(1) ];
-      }
-    }
-    ai = allocaddrinfo(family, type, proto, null, addr, port);
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((out) >> 2), "storing")] = ai;
-    return 0;
-  }
-  // try as a numeric address
-  node = UTF8ToString(node);
-  addr = inetPton4(node);
-  if (addr !== null) {
-    // incoming node is a valid ipv4 address
-    if (family === 0 || family === 2) {
-      family = 2;
-    } else if (family === 10 && (flags & 8)) {
-      addr = [ 0, 0, _htonl(65535), addr ];
-      family = 10;
-    } else {
-      return -2;
-    }
-  } else {
-    addr = inetPton6(node);
-    if (addr !== null) {
-      // incoming node is a valid ipv6 address
-      if (family === 0 || family === 10) {
-        family = 10;
-      } else {
-        return -2;
-      }
-    }
-  }
-  if (addr != null) {
-    ai = allocaddrinfo(family, type, proto, node, addr, port);
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((out) >> 2), "storing")] = ai;
-    return 0;
-  }
-  if (flags & 4) {
-    return -2;
-  }
-  // try as a hostname
-  // resolve the hostname to a temporary fake address
-  node = DNS.lookup_name(node);
-  addr = inetPton4(node);
-  if (family === 0) {
-    family = 2;
-  } else if (family === 10) {
-    addr = [ 0, 0, _htonl(65535), addr ];
-  }
-  ai = allocaddrinfo(family, type, proto, null, addr, port);
-  HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((out) >> 2), "storing")] = ai;
-  return 0;
-}
-
-_getaddrinfo.sig = "ipppp";
-
-var _getnameinfo = (sa, salen, node, nodelen, serv, servlen, flags) => {
-  var info = readSockaddr(sa, salen);
-  if (info.errno) {
-    return -6;
-  }
-  var port = info.port;
-  var addr = info.addr;
-  var overflowed = false;
-  if (node && nodelen) {
-    var lookup;
-    if ((flags & 1) || !(lookup = DNS.lookup_addr(addr))) {
-      if (flags & 8) {
-        return -2;
-      }
-    } else {
-      addr = lookup;
-    }
-    var numBytesWrittenExclNull = stringToUTF8(addr, node, nodelen);
-    if (numBytesWrittenExclNull + 1 >= nodelen) {
-      overflowed = true;
-    }
-  }
-  if (serv && servlen) {
-    port = "" + port;
-    var numBytesWrittenExclNull = stringToUTF8(port, serv, servlen);
-    if (numBytesWrittenExclNull + 1 >= servlen) {
-      overflowed = true;
-    }
-  }
-  if (overflowed) {
-    // Note: even when we overflow, getnameinfo() is specced to write out the truncated results.
-    return -12;
-  }
-  return 0;
-};
-
-_getnameinfo.sig = "ipipipii";
-
-var Protocols = {
-  list: [],
-  map: {}
-};
-
-var stringToAscii = (str, buffer) => {
-  for (var i = 0; i < str.length; ++i) {
-    assert(str.charCodeAt(i) === (str.charCodeAt(i) & 255));
-    HEAP8[SAFE_HEAP_INDEX(HEAP8, buffer++, "storing")] = str.charCodeAt(i);
-    checkInt8(str.charCodeAt(i));
-  }
-  // Null-terminate the string
-  HEAP8[SAFE_HEAP_INDEX(HEAP8, buffer, "storing")] = 0;
-  checkInt8(0);
-};
-
-var _setprotoent = stayopen => {
-  // void setprotoent(int stayopen);
-  // Allocate and populate a protoent structure given a name, protocol number and array of aliases
-  function allocprotoent(name, proto, aliases) {
-    // write name into buffer
-    var nameBuf = _malloc(name.length + 1);
-    stringToAscii(name, nameBuf);
-    // write aliases into buffer
-    var j = 0;
-    var length = aliases.length;
-    var aliasListBuf = _malloc((length + 1) * 4);
-    // Use length + 1 so we have space for the terminating NULL ptr.
-    for (var i = 0; i < length; i++, j += 4) {
-      var alias = aliases[i];
-      var aliasBuf = _malloc(alias.length + 1);
-      stringToAscii(alias, aliasBuf);
-      HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((aliasListBuf) + (j)) >> 2), "storing")] = aliasBuf;
-    }
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((aliasListBuf) + (j)) >> 2), "storing")] = 0;
-    // Terminating NULL pointer.
-    // generate protoent
-    var pe = _malloc(12);
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((pe) >> 2), "storing")] = nameBuf;
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((pe) + (4)) >> 2), "storing")] = aliasListBuf;
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pe) + (8)) >> 2), "storing")] = proto;
-    checkInt32(proto);
-    return pe;
-  }
-  // Populate the protocol 'database'. The entries are limited to tcp and udp, though it is fairly trivial
-  // to add extra entries from /etc/protocols if desired - though not sure if that'd actually be useful.
-  var list = Protocols.list;
-  var map = Protocols.map;
-  if (list.length === 0) {
-    var entry = allocprotoent("tcp", 6, [ "TCP" ]);
-    list.push(entry);
-    map["tcp"] = map["6"] = entry;
-    entry = allocprotoent("udp", 17, [ "UDP" ]);
-    list.push(entry);
-    map["udp"] = map["17"] = entry;
-  }
-  _setprotoent.index = 0;
-};
-
-_setprotoent.sig = "vi";
-
-var _endprotoent = () => {};
-
-_endprotoent.sig = "v";
-
-var _getprotoent = number => {
-  // struct protoent *getprotoent(void);
-  // reads the  next  entry  from  the  protocols 'database' or return NULL if 'eof'
-  if (_setprotoent.index === Protocols.list.length) {
-    return 0;
-  }
-  var result = Protocols.list[_setprotoent.index++];
-  return result;
-};
-
-_getprotoent.sig = "p";
-
-var _getprotobyname = name => {
-  // struct protoent *getprotobyname(const char *);
-  name = UTF8ToString(name);
-  _setprotoent(true);
-  var result = Protocols.map[name];
-  return result;
-};
-
-_getprotobyname.sig = "pp";
-
-var _getprotobynumber = number => {
-  // struct protoent *getprotobynumber(int proto);
-  _setprotoent(true);
-  var result = Protocols.map[number];
-  return result;
-};
-
-_getprotobynumber.sig = "pi";
-
-var Sockets = {
-  BUFFER_SIZE: 10240,
-  MAX_BUFFER_SIZE: 10485760,
-  nextFd: 1,
-  fds: {},
-  nextport: 1,
-  maxport: 65535,
-  peer: null,
-  connections: {},
-  portmap: {},
-  localAddr: 4261412874,
-  addrPool: [ 33554442, 50331658, 67108874, 83886090, 100663306, 117440522, 134217738, 150994954, 167772170, 184549386, 201326602, 218103818, 234881034 ]
-};
-
-var _emscripten_run_script = ptr => {
-  eval(UTF8ToString(ptr));
-};
-
-_emscripten_run_script.sig = "vp";
-
-/** @suppress{checkTypes} */ var _emscripten_run_script_int = ptr => eval(UTF8ToString(ptr)) | 0;
-
-_emscripten_run_script_int.sig = "ip";
-
-var _emscripten_run_script_string = ptr => {
-  var s = eval(UTF8ToString(ptr));
-  if (s == null) {
-    return 0;
-  }
-  s += "";
-  var me = _emscripten_run_script_string;
-  me.bufferSize = lengthBytesUTF8(s) + 1;
-  me.buffer = _realloc(me.buffer ?? 0, me.bufferSize);
-  stringToUTF8(s, me.buffer, me.bufferSize);
-  return me.buffer;
-};
-
-_emscripten_run_script_string.sig = "pp";
-
-var _emscripten_random = () => Math.random();
-
-_emscripten_random.sig = "f";
-
-var _emscripten_performance_now = () => performance.now();
-
-_emscripten_performance_now.sig = "d";
-
-var _emscripten_get_now_res = () => {
-  // return resolution of get_now, in nanoseconds
-  if (ENVIRONMENT_IS_NODE) {
-    return 1;
-  }
-  // Modern environment where performance.now() is supported:
-  return 1e3;
-};
-
-_emscripten_get_now_res.sig = "d";
-
-var __emscripten_get_now_is_monotonic = () => nowIsMonotonic;
-
-__emscripten_get_now_is_monotonic.sig = "i";
-
-var _emscripten_get_compiler_setting = name => abort("You must build with -sRETAIN_COMPILER_SETTINGS for getCompilerSetting or emscripten_get_compiler_setting to work");
-
-_emscripten_get_compiler_setting.sig = "pp";
-
-var _emscripten_debugger = () => {
-  debugger;
-};
-
-_emscripten_debugger.sig = "v";
-
-var _emscripten_print_double = (x, to, max) => {
-  var str = x + "";
-  if (to) return stringToUTF8(str, to, max); else return lengthBytesUTF8(str);
-};
-
-_emscripten_print_double.sig = "idpi";
-
-var _emscripten_asm_const_double = (code, sigPtr, argbuf) => runEmAsmFunction(code, sigPtr, argbuf);
-
-_emscripten_asm_const_double.sig = "dppp";
-
-var _emscripten_asm_const_ptr = (code, sigPtr, argbuf) => runEmAsmFunction(code, sigPtr, argbuf);
-
-_emscripten_asm_const_ptr.sig = "pppp";
-
-var _emscripten_asm_const_double_sync_on_main_thread = (a1, a2, a3) => _emscripten_asm_const_int_sync_on_main_thread(a1, a2, a3);
-
-_emscripten_asm_const_double_sync_on_main_thread.sig = "dppp";
-
-var _emscripten_asm_const_async_on_main_thread = (emAsmAddr, sigPtr, argbuf) => runMainThreadEmAsm(emAsmAddr, sigPtr, argbuf, 0);
-
-_emscripten_asm_const_async_on_main_thread.sig = "vppp";
-
-var __Unwind_Backtrace = (func, arg) => {
-  var trace = getCallstack();
-  var parts = trace.split("\n");
-  for (var i = 0; i < parts.length; i++) {
-    var ret = getWasmTableEntry(func)(0, arg);
-    if (ret !== 0) return;
-  }
-};
-
-__Unwind_Backtrace.sig = "ipp";
-
-var __Unwind_GetIPInfo = (context, ipBefore) => abort("Unwind_GetIPInfo");
-
-__Unwind_GetIPInfo.sig = "ppp";
-
-var __Unwind_FindEnclosingFunction = ip => 0;
-
-__Unwind_FindEnclosingFunction.sig = "pp";
-
-var __Unwind_RaiseException = ex => {
-  err("Warning: _Unwind_RaiseException is not correctly implemented");
-  return ___cxa_throw(ex, 0, 0);
-};
-
-__Unwind_RaiseException.sig = "ip";
-
-var __Unwind_DeleteException = ex => err("TODO: Unwind_DeleteException");
-
-__Unwind_DeleteException.sig = "vp";
-
-var getDynCaller = (sig, ptr, promising = false) => {
-  assert(sig.includes("j") || sig.includes("p"), "getDynCaller should only be called with i64 sigs");
-  return (...args) => dynCall(sig, ptr, args, promising);
-};
-
-var _emscripten_outn = (str, len) => out(UTF8ToString(str, len));
-
-_emscripten_outn.sig = "vpp";
-
-var _emscripten_errn = (str, len) => err(UTF8ToString(str, len));
-
-_emscripten_errn.sig = "vpp";
-
-var _emscripten_dbgn = (str, len) => dbg(UTF8ToString(str, len));
-
-_emscripten_dbgn.sig = "vpp";
-
-var __emscripten_get_progname = (str, len) => stringToUTF8(getExecutableName(), str, len);
-
-__emscripten_get_progname.sig = "vpi";
-
-var _emscripten_throw_number = number => {
-  throw number;
-};
-
-_emscripten_throw_number.sig = "vd";
-
-var _emscripten_throw_string = str => {
-  assert(typeof str == "number");
-  throw UTF8ToString(str);
-};
-
-_emscripten_throw_string.sig = "vp";
-
-var _emscripten_runtime_keepalive_push = runtimeKeepalivePush;
-
-_emscripten_runtime_keepalive_push.sig = "v";
-
-var _emscripten_runtime_keepalive_pop = runtimeKeepalivePop;
-
-_emscripten_runtime_keepalive_pop.sig = "v";
-
-var _emscripten_runtime_keepalive_check = keepRuntimeAlive;
-
-_emscripten_runtime_keepalive_check.sig = "i";
-
-var asmjsMangle = x => {
-  if (x == "__main_argc_argv") {
-    x = "main";
-  }
-  return "_" + x;
-};
-
-var __emscripten_fs_load_embedded_files = ptr => {
-  do {
-    var name_addr = HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((ptr) >> 2), "loading")];
-    ptr += 4;
-    var len = HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((ptr) >> 2), "loading")];
-    ptr += 4;
-    var content = HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((ptr) >> 2), "loading")];
-    ptr += 4;
-    var name = UTF8ToString(name_addr);
-    FS.createPath("/", PATH.dirname(name), true, true);
-    // canOwn this data in the filesystem, it is a slice of wasm memory that will never change
-    FS.createDataFile(name, null, HEAP8.subarray(content, content + len), true, true, true);
-  } while (HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((ptr) >> 2), "loading")]);
-};
-
-__emscripten_fs_load_embedded_files.sig = "vp";
-
-var onInits = [];
-
-var addOnInit = cb => onInits.push(cb);
-
-var onMains = [];
-
-var addOnPreMain = cb => onMains.push(cb);
-
-var STACK_SIZE = 1048576;
-
-var STACK_ALIGN = 16;
-
-var POINTER_SIZE = 4;
-
-var ASSERTIONS = 2;
-
-var removeFunction = index => {
-  functionsInTableMap.delete(getWasmTableEntry(index));
-  setWasmTableEntry(index, null);
-  freeTableIndexes.push(index);
-};
-
-var _emscripten_math_cbrt = Math.cbrt;
-
-_emscripten_math_cbrt.sig = "dd";
-
-var _emscripten_math_pow = Math.pow;
-
-_emscripten_math_pow.sig = "ddd";
-
-var _emscripten_math_random = Math.random;
-
-_emscripten_math_random.sig = "d";
-
-var _emscripten_math_sign = Math.sign;
-
-_emscripten_math_sign.sig = "dd";
-
-var _emscripten_math_sqrt = Math.sqrt;
-
-_emscripten_math_sqrt.sig = "dd";
-
-var _emscripten_math_exp = Math.exp;
-
-_emscripten_math_exp.sig = "dd";
-
-var _emscripten_math_expm1 = Math.expm1;
-
-_emscripten_math_expm1.sig = "dd";
-
-var _emscripten_math_fmod = (x, y) => x % y;
-
-_emscripten_math_fmod.sig = "ddd";
-
-var _emscripten_math_log = Math.log;
-
-_emscripten_math_log.sig = "dd";
-
-var _emscripten_math_log1p = Math.log1p;
-
-_emscripten_math_log1p.sig = "dd";
-
-var _emscripten_math_log10 = Math.log10;
-
-_emscripten_math_log10.sig = "dd";
-
-var _emscripten_math_log2 = Math.log2;
-
-_emscripten_math_log2.sig = "dd";
-
-var _emscripten_math_round = Math.round;
-
-_emscripten_math_round.sig = "dd";
-
-var _emscripten_math_acos = Math.acos;
-
-_emscripten_math_acos.sig = "dd";
-
-var _emscripten_math_acosh = Math.acosh;
-
-_emscripten_math_acosh.sig = "dd";
-
-var _emscripten_math_asin = Math.asin;
-
-_emscripten_math_asin.sig = "dd";
-
-var _emscripten_math_asinh = Math.asinh;
-
-_emscripten_math_asinh.sig = "dd";
-
-var _emscripten_math_atan = Math.atan;
-
-_emscripten_math_atan.sig = "dd";
-
-var _emscripten_math_atanh = Math.atanh;
-
-_emscripten_math_atanh.sig = "dd";
-
-var _emscripten_math_atan2 = Math.atan2;
-
-_emscripten_math_atan2.sig = "ddd";
-
-var _emscripten_math_cos = Math.cos;
-
-_emscripten_math_cos.sig = "dd";
-
-var _emscripten_math_cosh = Math.cosh;
-
-_emscripten_math_cosh.sig = "dd";
-
-var _emscripten_math_hypot = (count, varargs) => {
-  var args = [];
-  for (var i = 0; i < count; ++i) {
-    args.push(HEAPF64[SAFE_HEAP_INDEX(HEAPF64, (((varargs) + (i * 8)) >> 3), "loading")]);
-  }
-  return Math.hypot(...args);
-};
-
-_emscripten_math_hypot.sig = "dip";
-
-var _emscripten_math_sin = Math.sin;
-
-_emscripten_math_sin.sig = "dd";
-
-var _emscripten_math_sinh = Math.sinh;
-
-_emscripten_math_sinh.sig = "dd";
-
-var _emscripten_math_tan = Math.tan;
-
-_emscripten_math_tan.sig = "dd";
-
-var _emscripten_math_tanh = Math.tanh;
-
-_emscripten_math_tanh.sig = "dd";
-
-var intArrayToString = array => {
-  var ret = [];
-  for (var i = 0; i < array.length; i++) {
-    var chr = array[i];
-    if (chr > 255) {
-      assert(false, `Character code ${chr} (${String.fromCharCode(chr)}) at offset ${i} not in 0x00-0xFF.`);
-      chr &= 255;
-    }
-    ret.push(String.fromCharCode(chr));
-  }
-  return ret.join("");
-};
-
-var AsciiToString = ptr => {
-  var str = "";
-  while (1) {
-    var ch = HEAPU8[SAFE_HEAP_INDEX(HEAPU8, ptr++, "loading")];
-    if (!ch) return str;
-    str += String.fromCharCode(ch);
-  }
-};
-
-var UTF16Decoder = new TextDecoder("utf-16le");
-
-var UTF16ToString = (ptr, maxBytesToRead, ignoreNul) => {
-  assert(ptr % 2 == 0, "Pointer passed to UTF16ToString must be aligned to two bytes!");
-  var idx = ((ptr) >> 1);
-  var endIdx = findStringEnd(HEAPU16, idx, maxBytesToRead / 2, ignoreNul);
-  return UTF16Decoder.decode(HEAPU16.slice(idx, endIdx));
-};
-
-var stringToUTF16 = (str, outPtr, maxBytesToWrite) => {
-  assert(outPtr % 2 == 0, "Pointer passed to stringToUTF16 must be aligned to two bytes!");
-  assert(typeof maxBytesToWrite == "number", "stringToUTF16(str, outPtr, maxBytesToWrite) is missing the third parameter that specifies the length of the output buffer!");
-  // Backwards compatibility: if max bytes is not specified, assume unsafe unbounded write is allowed.
-  maxBytesToWrite ??= 2147483647;
-  if (maxBytesToWrite < 2) return 0;
-  maxBytesToWrite -= 2;
-  // Null terminator.
-  var startPtr = outPtr;
-  var numCharsToWrite = (maxBytesToWrite < str.length * 2) ? (maxBytesToWrite / 2) : str.length;
-  for (var i = 0; i < numCharsToWrite; ++i) {
-    // charCodeAt returns a UTF-16 encoded code unit, so it can be directly written to the HEAP.
-    var codeUnit = str.charCodeAt(i);
-    // possibly a lead surrogate
-    HEAP16[SAFE_HEAP_INDEX(HEAP16, ((outPtr) >> 1), "storing")] = codeUnit;
-    checkInt16(codeUnit);
-    outPtr += 2;
-  }
-  // Null-terminate the pointer to the HEAP.
-  HEAP16[SAFE_HEAP_INDEX(HEAP16, ((outPtr) >> 1), "storing")] = 0;
-  checkInt16(0);
-  return outPtr - startPtr;
-};
-
-var lengthBytesUTF16 = str => str.length * 2;
-
-var UTF32ToString = (ptr, maxBytesToRead, ignoreNul) => {
-  assert(ptr % 4 == 0, "Pointer passed to UTF32ToString must be aligned to four bytes!");
-  var str = "";
-  var startIdx = ((ptr) >> 2);
-  // If maxBytesToRead is not passed explicitly, it will be undefined, and this
-  // will always evaluate to true. This saves on code size.
-  for (var i = 0; !(i >= maxBytesToRead / 4); i++) {
-    var utf32 = HEAPU32[SAFE_HEAP_INDEX(HEAPU32, startIdx + i, "loading")];
-    if (!utf32 && !ignoreNul) break;
-    str += String.fromCodePoint(utf32);
-  }
-  return str;
-};
-
-var stringToUTF32 = (str, outPtr, maxBytesToWrite) => {
-  assert(outPtr % 4 == 0, "Pointer passed to stringToUTF32 must be aligned to four bytes!");
-  assert(typeof maxBytesToWrite == "number", "stringToUTF32(str, outPtr, maxBytesToWrite) is missing the third parameter that specifies the length of the output buffer!");
-  // Backwards compatibility: if max bytes is not specified, assume unsafe unbounded write is allowed.
-  maxBytesToWrite ??= 2147483647;
-  if (maxBytesToWrite < 4) return 0;
-  var startPtr = outPtr;
-  var endPtr = startPtr + maxBytesToWrite - 4;
-  for (var i = 0; i < str.length; ++i) {
-    var codePoint = str.codePointAt(i);
-    // Gotcha: if codePoint is over 0xFFFF, it is represented as a surrogate pair in UTF-16.
-    // We need to manually skip over the second code unit for correct iteration.
-    if (codePoint > 65535) {
-      i++;
-    }
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((outPtr) >> 2), "storing")] = codePoint;
-    checkInt32(codePoint);
-    outPtr += 4;
-    if (outPtr + 4 > endPtr) break;
-  }
-  // Null-terminate the pointer to the HEAP.
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, ((outPtr) >> 2), "storing")] = 0;
-  checkInt32(0);
-  return outPtr - startPtr;
-};
-
-var lengthBytesUTF32 = str => {
-  var len = 0;
-  for (var i = 0; i < str.length; ++i) {
-    var codePoint = str.codePointAt(i);
-    // Gotcha: if codePoint is over 0xFFFF, it is represented as a surrogate pair in UTF-16.
-    // We need to manually skip over the second code unit for correct iteration.
-    if (codePoint > 65535) {
-      i++;
-    }
-    len += 4;
-  }
-  return len;
-};
-
-function _emscripten_html5_remove_event_listener(target, userData, eventTypeId, callback) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(95, 0, 1, target, userData, eventTypeId, callback);
-  var eventHandler = {
-    target: findEventTarget(target),
-    userData,
-    eventTypeId,
-    callbackfunc: callback
-  };
-  return JSEvents.removeSingleHandler(eventHandler);
-}
-
-_emscripten_html5_remove_event_listener.sig = "ippip";
-
-function _emscripten_set_click_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(96, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
-  return registerMouseEventCallback(target, userData, useCapture, callbackfunc, 4, "click", targetThread);
-}
-
-_emscripten_set_click_callback_on_thread.sig = "ippipp";
-
-function _emscripten_set_dblclick_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(97, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
-  return registerMouseEventCallback(target, userData, useCapture, callbackfunc, 7, "dblclick", targetThread);
-}
-
-_emscripten_set_dblclick_callback_on_thread.sig = "ippipp";
-
-function _emscripten_set_mouseover_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(98, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
-  return registerMouseEventCallback(target, userData, useCapture, callbackfunc, 35, "mouseover", targetThread);
-}
-
-_emscripten_set_mouseover_callback_on_thread.sig = "ippipp";
-
-function _emscripten_set_mouseout_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(99, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
-  return registerMouseEventCallback(target, userData, useCapture, callbackfunc, 36, "mouseout", targetThread);
-}
-
-_emscripten_set_mouseout_callback_on_thread.sig = "ippipp";
-
-function _emscripten_set_scroll_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(100, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
-  return registerUiEventCallback(target, userData, useCapture, callbackfunc, 11, "scroll", targetThread);
-}
-
-_emscripten_set_scroll_callback_on_thread.sig = "ippipp";
-
-function _emscripten_set_focusin_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(101, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
-  return registerFocusEventCallback(target, userData, useCapture, callbackfunc, 14, "focusin", targetThread);
-}
-
-_emscripten_set_focusin_callback_on_thread.sig = "ippipp";
-
-function _emscripten_set_focusout_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(102, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
-  return registerFocusEventCallback(target, userData, useCapture, callbackfunc, 15, "focusout", targetThread);
-}
-
-_emscripten_set_focusout_callback_on_thread.sig = "ippipp";
-
-var fillDeviceOrientationEventData = (eventStruct, e, target) => {
-  HEAPF64[SAFE_HEAP_INDEX(HEAPF64, ((eventStruct) >> 3), "storing")] = e.alpha;
-  HEAPF64[SAFE_HEAP_INDEX(HEAPF64, (((eventStruct) + (8)) >> 3), "storing")] = e.beta;
-  HEAPF64[SAFE_HEAP_INDEX(HEAPF64, (((eventStruct) + (16)) >> 3), "storing")] = e.gamma;
-  HEAP8[SAFE_HEAP_INDEX(HEAP8, (eventStruct) + (24), "storing")] = e.absolute;
-  checkInt8(e.absolute);
-};
-
-var registerDeviceOrientationEventCallback = (target, userData, useCapture, callbackfunc, eventTypeId, eventTypeString, targetThread) => {
-  targetThread = JSEvents.getTargetThreadForEventCallback(targetThread);
-  var eventSize = 32;
-  JSEvents.deviceOrientationEvent ||= _malloc(eventSize);
-  var deviceOrientationEventHandlerFunc = e => {
-    fillDeviceOrientationEventData(JSEvents.deviceOrientationEvent, e, target);
-    // TODO: Thread-safety with respect to emscripten_get_deviceorientation_status()
-    if (targetThread) {
-      __emscripten_run_callback_on_thread(targetThread, callbackfunc, eventTypeId, JSEvents.deviceOrientationEvent, eventSize, userData);
-    } else if (getWasmTableEntry(callbackfunc)(eventTypeId, JSEvents.deviceOrientationEvent, userData)) e.preventDefault();
-  };
-  var eventHandler = {
-    target: findEventTarget(target),
-    eventTypeString,
-    eventTypeId,
-    userData,
-    callbackfunc,
-    handlerFunc: deviceOrientationEventHandlerFunc,
-    useCapture
-  };
-  return JSEvents.registerOrRemoveHandler(eventHandler);
-};
-
-function _emscripten_set_deviceorientation_callback_on_thread(userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(103, 0, 1, userData, useCapture, callbackfunc, targetThread);
-  return registerDeviceOrientationEventCallback(2, userData, useCapture, callbackfunc, 16, "deviceorientation", targetThread);
-}
-
-_emscripten_set_deviceorientation_callback_on_thread.sig = "ipipp";
-
-var fillDeviceMotionEventData = (eventStruct, e, target) => {
-  var supportedFields = 0;
-  var a = e["acceleration"];
-  supportedFields |= a && 1;
-  var ag = e["accelerationIncludingGravity"];
-  supportedFields |= ag && 2;
-  var rr = e["rotationRate"];
-  supportedFields |= rr && 4;
-  a = a || {};
-  ag = ag || {};
-  rr = rr || {};
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, (((eventStruct) + (72)) >> 2), "storing")] = supportedFields;
-  checkInt32(supportedFields);
-  HEAPF64[SAFE_HEAP_INDEX(HEAPF64, ((eventStruct) >> 3), "storing")] = a["x"];
-  HEAPF64[SAFE_HEAP_INDEX(HEAPF64, (((eventStruct) + (8)) >> 3), "storing")] = a["y"];
-  HEAPF64[SAFE_HEAP_INDEX(HEAPF64, (((eventStruct) + (16)) >> 3), "storing")] = a["z"];
-  HEAPF64[SAFE_HEAP_INDEX(HEAPF64, (((eventStruct) + (24)) >> 3), "storing")] = ag["x"];
-  HEAPF64[SAFE_HEAP_INDEX(HEAPF64, (((eventStruct) + (32)) >> 3), "storing")] = ag["y"];
-  HEAPF64[SAFE_HEAP_INDEX(HEAPF64, (((eventStruct) + (40)) >> 3), "storing")] = ag["z"];
-  HEAPF64[SAFE_HEAP_INDEX(HEAPF64, (((eventStruct) + (48)) >> 3), "storing")] = rr["alpha"];
-  HEAPF64[SAFE_HEAP_INDEX(HEAPF64, (((eventStruct) + (56)) >> 3), "storing")] = rr["beta"];
-  HEAPF64[SAFE_HEAP_INDEX(HEAPF64, (((eventStruct) + (64)) >> 3), "storing")] = rr["gamma"];
-};
-
-var registerDeviceMotionEventCallback = (target, userData, useCapture, callbackfunc, eventTypeId, eventTypeString, targetThread) => {
-  targetThread = JSEvents.getTargetThreadForEventCallback(targetThread);
-  var eventSize = 80;
-  JSEvents.deviceMotionEvent ||= _malloc(eventSize);
-  var deviceMotionEventHandlerFunc = e => {
-    fillDeviceMotionEventData(JSEvents.deviceMotionEvent, e, target);
-    // TODO: Thread-safety with respect to emscripten_get_devicemotion_status()
-    if (targetThread) {
-      __emscripten_run_callback_on_thread(targetThread, callbackfunc, eventTypeId, JSEvents.deviceMotionEvent, eventSize, userData);
-    } else if (getWasmTableEntry(callbackfunc)(eventTypeId, JSEvents.deviceMotionEvent, userData)) e.preventDefault();
-  };
-  var eventHandler = {
-    target: findEventTarget(target),
-    eventTypeString,
-    eventTypeId,
-    userData,
-    callbackfunc,
-    handlerFunc: deviceMotionEventHandlerFunc,
-    useCapture
-  };
-  return JSEvents.registerOrRemoveHandler(eventHandler);
-};
-
-function _emscripten_set_devicemotion_callback_on_thread(userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(104, 0, 1, userData, useCapture, callbackfunc, targetThread);
-  return registerDeviceMotionEventCallback(2, userData, useCapture, callbackfunc, 17, "devicemotion", targetThread);
-}
-
-_emscripten_set_devicemotion_callback_on_thread.sig = "ipipp";
-
-var screenOrientation = () => {
-  if (!window.screen) return undefined;
-  return screen.orientation || screen["mozOrientation"] || screen["webkitOrientation"];
-};
-
-var fillOrientationChangeEventData = eventStruct => {
-  // OrientationType enum
-  var orientationsType1 = [ "portrait-primary", "portrait-secondary", "landscape-primary", "landscape-secondary" ];
-  // alternative selection from OrientationLockType enum
-  var orientationsType2 = [ "portrait", "portrait", "landscape", "landscape" ];
-  var orientationIndex = 0;
-  var orientationAngle = 0;
-  var screenOrientObj = screenOrientation();
-  if (typeof screenOrientObj === "object") {
-    orientationIndex = orientationsType1.indexOf(screenOrientObj.type);
-    if (orientationIndex < 0) {
-      orientationIndex = orientationsType2.indexOf(screenOrientObj.type);
-    }
-    if (orientationIndex >= 0) {
-      orientationIndex = 1 << orientationIndex;
-    }
-    orientationAngle = screenOrientObj.angle;
-  } else {
-    // fallback for Safari earlier than 16.4 (March 2023)
-    orientationAngle = window.orientation;
-  }
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, ((eventStruct) >> 2), "storing")] = orientationIndex;
-  checkInt32(orientationIndex);
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, (((eventStruct) + (4)) >> 2), "storing")] = orientationAngle;
-  checkInt32(orientationAngle);
-};
-
-var registerOrientationChangeEventCallback = (target, userData, useCapture, callbackfunc, eventTypeId, eventTypeString, targetThread) => {
-  targetThread = JSEvents.getTargetThreadForEventCallback(targetThread);
-  var eventSize = 8;
-  JSEvents.orientationChangeEvent ||= _malloc(eventSize);
-  var orientationChangeEventHandlerFunc = e => {
-    var orientationChangeEvent = JSEvents.orientationChangeEvent;
-    fillOrientationChangeEventData(orientationChangeEvent);
-    if (targetThread) __emscripten_run_callback_on_thread(targetThread, callbackfunc, eventTypeId, orientationChangeEvent, eventSize, userData); else if (getWasmTableEntry(callbackfunc)(eventTypeId, orientationChangeEvent, userData)) e.preventDefault();
-  };
-  var eventHandler = {
-    target,
-    eventTypeString,
-    eventTypeId,
-    userData,
-    callbackfunc,
-    handlerFunc: orientationChangeEventHandlerFunc,
-    useCapture
-  };
-  return JSEvents.registerOrRemoveHandler(eventHandler);
-};
-
-function _emscripten_set_orientationchange_callback_on_thread(userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(105, 0, 1, userData, useCapture, callbackfunc, targetThread);
-  if (!window.screen || !screen.orientation) return -1;
-  return registerOrientationChangeEventCallback(screen.orientation, userData, useCapture, callbackfunc, 18, "change", targetThread);
-}
-
-_emscripten_set_orientationchange_callback_on_thread.sig = "ipipp";
-
-function _emscripten_get_orientation_status(orientationChangeEvent) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(106, 0, 1, orientationChangeEvent);
-  // screenOrientation() resolving standard, window.orientation being the deprecated mobile-only
-  if (!screenOrientation() && typeof orientation == "undefined") return -1;
-  fillOrientationChangeEventData(orientationChangeEvent);
-  return 0;
-}
-
-_emscripten_get_orientation_status.sig = "ip";
-
-function _emscripten_lock_orientation(allowedOrientations) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(107, 0, 1, allowedOrientations);
-  var orientations = [];
-  if (allowedOrientations & 1) orientations.push("portrait-primary");
-  if (allowedOrientations & 2) orientations.push("portrait-secondary");
-  if (allowedOrientations & 4) orientations.push("landscape-primary");
-  if (allowedOrientations & 8) orientations.push("landscape-secondary");
-  var succeeded;
-  if (screen.lockOrientation) {
-    succeeded = screen.lockOrientation(orientations);
-  } else if (screen.mozLockOrientation) {
-    succeeded = screen.mozLockOrientation(orientations);
-  } else if (screen.webkitLockOrientation) {
-    succeeded = screen.webkitLockOrientation(orientations);
-  } else {
-    return -1;
-  }
-  if (succeeded) {
-    return 0;
-  }
-  return -6;
-}
-
-_emscripten_lock_orientation.sig = "ii";
-
-function _emscripten_unlock_orientation() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(108, 0, 1);
-  if (screen.unlockOrientation) {
-    screen.unlockOrientation();
-  } else if (screen.mozUnlockOrientation) {
-    screen.mozUnlockOrientation();
-  } else if (screen.webkitUnlockOrientation) {
-    screen.webkitUnlockOrientation();
-  } else {
-    return -1;
-  }
-  return 0;
-}
-
-_emscripten_unlock_orientation.sig = "i";
-
-function _emscripten_get_fullscreen_status(fullscreenStatus) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(109, 0, 1, fullscreenStatus);
-  if (!JSEvents.fullscreenEnabled()) return -1;
-  fillFullscreenChangeEventData(fullscreenStatus);
-  return 0;
-}
-
-_emscripten_get_fullscreen_status.sig = "ip";
-
-var hideEverythingExceptGivenElement = onlyVisibleElement => {
-  var child = onlyVisibleElement;
-  var parent = child.parentNode;
-  var hiddenElements = [];
-  while (child != document.body) {
-    var children = parent.children;
-    for (var currChild of children) {
-      if (currChild != child) {
-        hiddenElements.push({
-          node: currChild,
-          displayState: currChild.style.display
-        });
-        currChild.style.display = "none";
-      }
-    }
-    child = parent;
-    parent = parent.parentNode;
-  }
-  return hiddenElements;
-};
-
-var restoreHiddenElements = hiddenElements => {
-  for (var elem of hiddenElements) {
-    elem.node.style.display = elem.displayState;
-  }
-};
-
-var restoreOldWindowedStyle = null;
-
-var softFullscreenResizeWebGLRenderTarget = () => {
-  var dpr = devicePixelRatio;
-  var inHiDPIFullscreenMode = currentFullscreenStrategy.canvasResolutionScaleMode == 2;
-  var inAspectRatioFixedFullscreenMode = currentFullscreenStrategy.scaleMode == 2;
-  var inPixelPerfectFullscreenMode = currentFullscreenStrategy.canvasResolutionScaleMode != 0;
-  var inCenteredWithoutScalingFullscreenMode = currentFullscreenStrategy.scaleMode == 3;
-  var screenWidth = inHiDPIFullscreenMode ? Math.round(innerWidth * dpr) : innerWidth;
-  var screenHeight = inHiDPIFullscreenMode ? Math.round(innerHeight * dpr) : innerHeight;
-  var w = screenWidth;
-  var h = screenHeight;
-  var canvas = currentFullscreenStrategy.target;
-  var canvasSize = getCanvasElementSize(canvas);
-  var x = canvasSize[0];
-  var y = canvasSize[1];
-  var topMargin;
-  if (inAspectRatioFixedFullscreenMode) {
-    if (w * y < x * h) h = (w * y / x) | 0; else if (w * y > x * h) w = (h * x / y) | 0;
-    topMargin = ((screenHeight - h) / 2) | 0;
-  }
-  if (inPixelPerfectFullscreenMode) {
-    setCanvasElementSize(canvas, w, h);
-    if (canvas.GLctxObject) canvas.GLctxObject.GLctx.viewport(0, 0, w, h);
-  }
-  // Back to CSS pixels.
-  if (inHiDPIFullscreenMode) {
-    topMargin /= dpr;
-    w /= dpr;
-    h /= dpr;
-    // Round to nearest 4 digits of precision.
-    w = Math.round(w * 1e4) / 1e4;
-    h = Math.round(h * 1e4) / 1e4;
-    topMargin = Math.round(topMargin * 1e4) / 1e4;
-  }
-  if (inCenteredWithoutScalingFullscreenMode) {
-    var t = (innerHeight - jstoi_q(canvas.style.height)) / 2;
-    var b = (innerWidth - jstoi_q(canvas.style.width)) / 2;
-    setLetterbox(canvas, t, b);
-  } else {
-    canvas.style.width = w + "px";
-    canvas.style.height = h + "px";
-    var b = (innerWidth - w) / 2;
-    setLetterbox(canvas, topMargin, b);
-  }
-  if (!inCenteredWithoutScalingFullscreenMode && currentFullscreenStrategy.canvasResizedCallback) {
-    if (currentFullscreenStrategy.canvasResizedCallbackTargetThread) __emscripten_run_callback_on_thread(currentFullscreenStrategy.canvasResizedCallbackTargetThread, currentFullscreenStrategy.canvasResizedCallback, 37, 0, currentFullscreenStrategy.canvasResizedCallbackUserData); else getWasmTableEntry(currentFullscreenStrategy.canvasResizedCallback)(37, 0, currentFullscreenStrategy.canvasResizedCallbackUserData);
-  }
-};
-
-function _emscripten_request_fullscreen(target, deferUntilInEventHandler) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(110, 0, 1, target, deferUntilInEventHandler);
-  var strategy = {
-    // These options perform no added logic, but just bare request fullscreen.
-    scaleMode: 0,
-    canvasResolutionScaleMode: 0,
-    filteringMode: 0,
-    deferUntilInEventHandler,
-    canvasResizedCallbackTargetThread: 2
-  };
-  return doRequestFullscreen(target, strategy);
-}
-
-_emscripten_request_fullscreen.sig = "ipi";
-
-function _emscripten_enter_soft_fullscreen(target, fullscreenStrategy) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(111, 0, 1, target, fullscreenStrategy);
-  target = findEventTarget(target);
-  if (!target) return -4;
-  var strategy = {
-    scaleMode: HEAP32[SAFE_HEAP_INDEX(HEAP32, ((fullscreenStrategy) >> 2), "loading")],
-    canvasResolutionScaleMode: HEAP32[SAFE_HEAP_INDEX(HEAP32, (((fullscreenStrategy) + (4)) >> 2), "loading")],
-    filteringMode: HEAP32[SAFE_HEAP_INDEX(HEAP32, (((fullscreenStrategy) + (8)) >> 2), "loading")],
-    canvasResizedCallback: HEAP32[SAFE_HEAP_INDEX(HEAP32, (((fullscreenStrategy) + (12)) >> 2), "loading")],
-    canvasResizedCallbackUserData: HEAP32[SAFE_HEAP_INDEX(HEAP32, (((fullscreenStrategy) + (16)) >> 2), "loading")],
-    canvasResizedCallbackTargetThread: JSEvents.getTargetThreadForEventCallback(),
-    target,
-    softFullscreen: true
-  };
-  var restoreOldStyle = JSEvents_resizeCanvasForFullscreen(target, strategy);
-  document.documentElement.style.overflow = "hidden";
-  // Firefox, Chrome
-  document.body.scroll = "no";
-  // IE11
-  document.body.style.margin = "0px";
-  // Override default document margin area on all browsers.
-  var hiddenElements = hideEverythingExceptGivenElement(target);
-  function restoreWindowedState() {
-    restoreOldStyle();
-    restoreHiddenElements(hiddenElements);
-    removeEventListener("resize", softFullscreenResizeWebGLRenderTarget);
-    if (strategy.canvasResizedCallback) {
-      if (strategy.canvasResizedCallbackTargetThread) __emscripten_run_callback_on_thread(strategy.canvasResizedCallbackTargetThread, strategy.canvasResizedCallback, 37, 0, strategy.canvasResizedCallbackUserData); else getWasmTableEntry(strategy.canvasResizedCallback)(37, 0, strategy.canvasResizedCallbackUserData);
-    }
-    currentFullscreenStrategy = 0;
-  }
-  restoreOldWindowedStyle = restoreWindowedState;
-  currentFullscreenStrategy = strategy;
-  addEventListener("resize", softFullscreenResizeWebGLRenderTarget);
-  // Inform the caller that the canvas size has changed.
-  if (strategy.canvasResizedCallback) {
-    if (strategy.canvasResizedCallbackTargetThread) __emscripten_run_callback_on_thread(strategy.canvasResizedCallbackTargetThread, strategy.canvasResizedCallback, 37, 0, strategy.canvasResizedCallbackUserData); else getWasmTableEntry(strategy.canvasResizedCallback)(37, 0, strategy.canvasResizedCallbackUserData);
-  }
-  return 0;
-}
-
-_emscripten_enter_soft_fullscreen.sig = "ipp";
-
-function _emscripten_exit_soft_fullscreen() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(112, 0, 1);
-  restoreOldWindowedStyle?.();
-  restoreOldWindowedStyle = null;
-  return 0;
-}
-
-_emscripten_exit_soft_fullscreen.sig = "i";
-
-var registerPointerlockErrorEventCallback = (target, userData, useCapture, callbackfunc, eventTypeId, eventTypeString, targetThread) => {
-  targetThread = JSEvents.getTargetThreadForEventCallback(targetThread);
-  var pointerlockErrorEventHandlerFunc = e => {
-    if (targetThread) __emscripten_run_callback_on_thread(targetThread, callbackfunc, eventTypeId, 0, userData); else if (getWasmTableEntry(callbackfunc)(eventTypeId, 0, userData)) e.preventDefault();
-  };
-  var eventHandler = {
-    target,
-    eventTypeString,
-    eventTypeId,
-    userData,
-    callbackfunc,
-    handlerFunc: pointerlockErrorEventHandlerFunc,
-    useCapture
-  };
-  return JSEvents.registerOrRemoveHandler(eventHandler);
-};
-
-function _emscripten_set_pointerlockerror_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(113, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
-  if (!document.body?.requestPointerLock) {
-    return -1;
-  }
-  target = findEventTarget(target);
-  if (!target) return -4;
-  return registerPointerlockErrorEventCallback(target, userData, useCapture, callbackfunc, 38, "pointerlockerror", targetThread);
-}
-
-_emscripten_set_pointerlockerror_callback_on_thread.sig = "ippipp";
-
-function _emscripten_get_pointerlock_status(pointerlockStatus) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(114, 0, 1, pointerlockStatus);
-  if (pointerlockStatus) fillPointerlockChangeEventData(pointerlockStatus);
-  if (!document.body?.requestPointerLock) {
-    return -1;
-  }
-  return 0;
-}
-
-_emscripten_get_pointerlock_status.sig = "ip";
-
-function _emscripten_vibrate(msecs) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(115, 0, 1, msecs);
-  if (!navigator.vibrate) return -1;
-  navigator.vibrate(msecs);
-  return 0;
-}
-
-_emscripten_vibrate.sig = "ii";
-
-function _emscripten_vibrate_pattern(msecsArray, numEntries) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(116, 0, 1, msecsArray, numEntries);
-  if (!navigator.vibrate) return -1;
-  var vibrateList = [];
-  for (var i = 0; i < numEntries; ++i) {
-    var msecs = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((msecsArray) + (i * 4)) >> 2), "loading")];
-    vibrateList.push(msecs);
-  }
-  navigator.vibrate(vibrateList);
-  return 0;
-}
-
-_emscripten_vibrate_pattern.sig = "ipi";
-
-function _emscripten_get_visibility_status(visibilityStatus) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(117, 0, 1, visibilityStatus);
-  if (typeof document.visibilityState == "undefined" && typeof document.hidden == "undefined") {
-    return -1;
-  }
-  fillVisibilityChangeEventData(visibilityStatus);
-  return 0;
-}
-
-_emscripten_get_visibility_status.sig = "ip";
-
-var fillBatteryEventData = (eventStruct, battery) => {
-  HEAPF64[SAFE_HEAP_INDEX(HEAPF64, ((eventStruct) >> 3), "storing")] = battery.chargingTime;
-  HEAPF64[SAFE_HEAP_INDEX(HEAPF64, (((eventStruct) + (8)) >> 3), "storing")] = battery.dischargingTime;
-  HEAPF64[SAFE_HEAP_INDEX(HEAPF64, (((eventStruct) + (16)) >> 3), "storing")] = battery.level;
-  HEAP8[SAFE_HEAP_INDEX(HEAP8, (eventStruct) + (24), "storing")] = battery.charging;
-  checkInt8(battery.charging);
-};
-
-var hasBatteryAPI = () => globalThis.navigator?.getBattery;
-
-var registerBatteryEventCallback = (battery, userData, useCapture, callbackfunc, eventTypeId, eventTypeString, targetThread) => {
-  targetThread = JSEvents.getTargetThreadForEventCallback(targetThread);
-  var eventSize = 32;
-  JSEvents.batteryEvent ||= _malloc(eventSize);
-  var batteryEventHandlerFunc = e => {
-    var batteryEvent = JSEvents.batteryEvent;
-    fillBatteryEventData(batteryEvent, battery);
-    if (targetThread) __emscripten_run_callback_on_thread(targetThread, callbackfunc, eventTypeId, batteryEvent, eventSize, userData); else if (getWasmTableEntry(callbackfunc)(eventTypeId, batteryEvent, userData)) e.preventDefault();
-  };
-  var eventHandler = {
-    target: battery,
-    eventTypeString,
-    eventTypeId,
-    userData,
-    callbackfunc,
-    handlerFunc: batteryEventHandlerFunc,
-    useCapture
-  };
-  return JSEvents.registerOrRemoveHandler(eventHandler);
-};
-
-var _emscripten_set_batterychargingchange_callback_on_thread = function(userData, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(118, 0, 1, userData, callbackfunc, targetThread);
-  if (!hasBatteryAPI()) return -1;
-  navigator.getBattery().then(b => {
-    registerBatteryEventCallback(b, userData, true, callbackfunc, 29, "chargingchange", targetThread);
-  });
-};
-
-_emscripten_set_batterychargingchange_callback_on_thread.sig = "ippp";
-
-var _emscripten_set_batterylevelchange_callback_on_thread = function(userData, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(119, 0, 1, userData, callbackfunc, targetThread);
-  if (!hasBatteryAPI()) return -1;
-  navigator.getBattery().then(b => {
-    registerBatteryEventCallback(b, userData, true, callbackfunc, 30, "levelchange", targetThread);
-  });
-};
-
-_emscripten_set_batterylevelchange_callback_on_thread.sig = "ippp";
-
-var batteryManager;
-
-var _emscripten_get_battery_status = function(batteryState) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(120, 0, 1, batteryState);
-  if (!hasBatteryAPI()) return -1;
-  if (!batteryManager) {
-    navigator.getBattery().then(b => {
-      batteryManager = b;
-    });
-    return -7;
-  }
-  fillBatteryEventData(batteryState, batteryManager);
-  return 0;
-};
-
-_emscripten_get_battery_status.sig = "ip";
-
-var _emscripten_html5_remove_all_event_listeners = () => JSEvents.removeAllEventListeners();
-
-_emscripten_html5_remove_all_event_listeners.sig = "v";
-
-var _emscripten_request_animation_frame = (cb, userData) => requestAnimationFrame(timeStamp => getWasmTableEntry(cb)(timeStamp, userData));
-
-_emscripten_request_animation_frame.sig = "ipp";
-
-var _emscripten_cancel_animation_frame = id => cancelAnimationFrame(id);
-
-_emscripten_cancel_animation_frame.sig = "vi";
-
-var _emscripten_request_animation_frame_loop = (cb, userData) => {
-  function tick(timeStamp) {
-    if (getWasmTableEntry(cb)(timeStamp, userData)) {
-      requestAnimationFrame(tick);
-    }
-  }
-  return requestAnimationFrame(tick);
-};
-
-_emscripten_request_animation_frame_loop.sig = "vpp";
-
-var _emscripten_get_callstack = (flags, str, maxbytes) => {
-  var callstack = getCallstack(flags);
-  // User can query the required amount of bytes to hold the callstack.
-  if (!str || maxbytes <= 0) {
-    return lengthBytesUTF8(callstack) + 1;
-  }
-  // Output callstack string as C string to HEAP.
-  var bytesWrittenExcludingNull = stringToUTF8(callstack, str, maxbytes);
-  // Return number of bytes written, including null.
-  return bytesWrittenExcludingNull + 1;
-};
-
-_emscripten_get_callstack.sig = "iipi";
-
-/** @returns {number} */ var convertFrameToPC = frame => {
-  var match;
-  if (match = /\bwasm-function\[\d+\]:(0x[0-9a-f]+)/.exec(frame)) {
-    // Wasm engines give the binary offset directly, so we use that as return address
-    return +match[1];
-  } else if (match = /\bwasm-function\[(\d+)\]:(\d+)/.exec(frame)) {
-    // Older versions of v8 (e.g node v10) give function index and offset in
-    // the function.  That format is not supported since it does not provide
-    // the information we need to map the frame to a global program counter.
-    warnOnce("legacy backtrace format detected, this version of v8 is no longer supported by the emscripten backtrace mechanism");
-  } else if (match = /:(\d+):\d+(?:\)|$)/.exec(frame)) {
-    // If we are in js, we can use the js line number as the "return address".
-    // This should work for wasm2js.  We tag the high bit to distinguish this
-    // from wasm addresses.
-    return 2147483648 | +match[1];
-  }
-  // return 0 if we can't find any
-  return 0;
-};
-
-var _emscripten_return_address = level => {
-  var callstack = jsStackTrace().split("\n");
-  if (callstack[0] == "Error") {
-    callstack.shift();
-  }
-  // skip this function and the caller to get caller's return address
-  var caller = callstack[level + 3];
-  return convertFrameToPC(caller);
-};
-
-_emscripten_return_address.sig = "pi";
-
-var UNWIND_CACHE = {};
-
-var saveInUnwindCache = callstack => {
-  for (var line of callstack) {
-    var pc = convertFrameToPC(line);
-    if (pc) {
-      UNWIND_CACHE[pc] = line;
-    }
-  }
-};
-
-var _emscripten_stack_snapshot = () => {
-  var callstack = jsStackTrace().split("\n");
-  if (callstack[0] == "Error") {
-    callstack.shift();
-  }
-  saveInUnwindCache(callstack);
-  // Caches the stack snapshot so that emscripten_stack_unwind_buffer() can
-  // unwind from this spot.
-  UNWIND_CACHE.last_addr = convertFrameToPC(callstack[3]);
-  UNWIND_CACHE.last_stack = callstack;
-  return UNWIND_CACHE.last_addr;
-};
-
-_emscripten_stack_snapshot.sig = "p";
-
-var _emscripten_stack_unwind_buffer = (addr, buffer, count) => {
-  var stack;
-  if (UNWIND_CACHE.last_addr == addr) {
-    stack = UNWIND_CACHE.last_stack;
-  } else {
-    stack = jsStackTrace().split("\n");
-    if (stack[0] == "Error") {
-      stack.shift();
-    }
-    saveInUnwindCache(stack);
-  }
-  var offset = 3;
-  while (stack[offset] && convertFrameToPC(stack[offset]) != addr) {
-    ++offset;
-  }
-  for (var i = 0; i < count && stack[i + offset]; ++i) {
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((buffer) + (i * 4)) >> 2), "storing")] = convertFrameToPC(stack[i + offset]);
-    checkInt32(convertFrameToPC(stack[i + offset]));
-  }
-  return i;
-};
-
-_emscripten_stack_unwind_buffer.sig = "ippi";
-
-var _emscripten_pc_get_function = pc => {
-  var frame = UNWIND_CACHE[pc];
-  if (!frame) return 0;
-  var name;
-  var match;
-  // First try to match foo.wasm.sym files explcitly. e.g.
-  //   at test_return_address.wasm.main (wasm://wasm/test_return_address.wasm-0012cc2a:wasm-function[26]:0x9f3
-  // Then match JS symbols which don't include that module name:
-  //   at invokeEntryPoint (.../test_return_address.js:1500:42)
-  // Finally match firefox format:
-  //   Object._main@http://server.com:4324:12'
-  if (match = /^\s+at .*\.wasm\.(.*) \(.*\)$/.exec(frame)) {
-    name = match[1];
-  } else if (match = /^\s+at (.*) \(.*\)$/.exec(frame)) {
-    name = match[1];
-  } else if (match = /^(.+?)@/.exec(frame)) {
-    name = match[1];
-  } else {
-    return 0;
-  }
-  _free(_emscripten_pc_get_function.ret ?? 0);
-  _emscripten_pc_get_function.ret = stringToNewUTF8(name);
-  return _emscripten_pc_get_function.ret;
-};
-
-_emscripten_pc_get_function.sig = "pp";
-
-var convertPCtoSourceLocation = pc => {
-  if (UNWIND_CACHE.last_get_source_pc == pc) return UNWIND_CACHE.last_source;
-  var match;
-  var source;
-  if (!source) {
-    var frame = UNWIND_CACHE[pc];
-    if (!frame) return null;
-    // Example: at callMain (a.out.js:6335:22)
-    if (match = /\((.*):(\d+):(\d+)\)$/.exec(frame)) {
-      source = {
-        file: match[1],
-        line: match[2],
-        column: match[3]
-      };
-    } else if (match = /@(.*):(\d+):(\d+)/.exec(frame)) {
-      source = {
-        file: match[1],
-        line: match[2],
-        column: match[3]
-      };
-    }
-  }
-  UNWIND_CACHE.last_get_source_pc = pc;
-  UNWIND_CACHE.last_source = source;
-  return source;
-};
-
-var _emscripten_pc_get_file = pc => {
-  var result = convertPCtoSourceLocation(pc);
-  if (!result) return 0;
-  _free(_emscripten_pc_get_file.ret ?? 0);
-  _emscripten_pc_get_file.ret = stringToNewUTF8(result.file);
-  return _emscripten_pc_get_file.ret;
-};
-
-_emscripten_pc_get_file.sig = "pp";
-
-var _emscripten_pc_get_line = pc => {
-  var result = convertPCtoSourceLocation(pc);
-  return result ? result.line : 0;
-};
-
-_emscripten_pc_get_line.sig = "ip";
-
-var _emscripten_pc_get_column = pc => {
-  var result = convertPCtoSourceLocation(pc);
-  return result ? result.column || 0 : 0;
-};
-
-_emscripten_pc_get_column.sig = "ip";
-
-function _sched_yield() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(121, 0, 1);
-  return 0;
-}
-
-_sched_yield.sig = "i";
-
-var _clock_res_get = (clk_id, pres) => {
-  if (!checkWasiClock(clk_id)) {
-    return 28;
-  }
-  var nsec;
-  // all wasi clocks but realtime are monotonic
-  if (clk_id === 0) {
-    nsec = 1e3 * 1e3;
-  } else if (nowIsMonotonic) {
-    nsec = _emscripten_get_now_res();
-  } else {
-    return 52;
-  }
-  HEAP64[SAFE_HEAP_INDEX(HEAP64, ((pres) >> 3), "storing")] = BigInt(nsec);
-  checkInt64(nsec);
-  return 0;
-};
-
-_clock_res_get.sig = "iip";
-
-function _fd_pwrite(fd, iov, iovcnt, offset, pnum) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(122, 0, 1, fd, iov, iovcnt, offset, pnum);
-  offset = bigintToI53Checked(offset);
-  try {
-    if (isNaN(offset)) return 61;
-    var stream = SYSCALLS.getStreamFromFD(fd);
-    var num = doWritev(stream, iov, iovcnt, offset);
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((pnum) >> 2), "storing")] = num;
-    checkInt32(num);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return e.errno;
-  }
-}
-
-_fd_pwrite.sig = "iippjp";
-
-function _fd_pread(fd, iov, iovcnt, offset, pnum) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(123, 0, 1, fd, iov, iovcnt, offset, pnum);
-  offset = bigintToI53Checked(offset);
-  try {
-    if (isNaN(offset)) return 61;
-    var stream = SYSCALLS.getStreamFromFD(fd);
-    var num = doReadv(stream, iov, iovcnt, offset);
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((pnum) >> 2), "storing")] = num;
-    checkInt32(num);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return e.errno;
-  }
-}
-
-_fd_pread.sig = "iippjp";
-
-var wasiRightsToMuslOFlags = rights => {
-  if ((rights & 2) && (rights & 64)) {
-    return 2;
-  }
-  if (rights & 2) {
-    return 0;
-  }
-  if (rights & 64) {
-    return 1;
-  }
-  throw new FS.ErrnoError(28);
-};
-
-var wasiOFlagsToMuslOFlags = oflags => {
-  var musl_oflags = 0;
-  if (oflags & 1) {
-    musl_oflags |= 64;
-  }
-  if (oflags & 8) {
-    musl_oflags |= 512;
-  }
-  if (oflags & 2) {
-    musl_oflags |= 65536;
-  }
-  if (oflags & 4) {
-    musl_oflags |= 128;
-  }
-  return musl_oflags;
-};
-
-var _fd_sync = function(fd) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(124, 0, 2, fd);
-  try {
-    var stream = SYSCALLS.getStreamFromFD(fd);
-    var rtn = stream.stream_ops?.fsync?.(stream);
-    return new Promise(resolve => {
-      var mount = stream.node.mount;
-      if (mount?.type.syncfs) {
-        mount.type.syncfs(mount, false, err => resolve(err ? 29 : 0));
-      } else {
-        resolve(rtn);
-      }
-    });
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return e.errno;
-  }
-};
-
-_fd_sync.sig = "ii";
-
-function _random_get(buffer, size) {
-  try {
-    randomFill(HEAPU8.subarray(buffer, buffer + size));
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return e.errno;
-  }
-}
-
-_random_get.sig = "ipp";
-
-var setImmediateWrapped = func => {
-  setImmediateWrapped.mapping ||= [];
-  var id = setImmediateWrapped.mapping.length;
-  setImmediateWrapped.mapping[id] = setImmediate(() => {
-    setImmediateWrapped.mapping[id] = undefined;
-    func();
-  });
-  return id;
-};
-
-var safeRequestAnimationFrame = func => {
-  runtimeKeepalivePush();
-  return MainLoop.requestAnimationFrame(() => {
-    runtimeKeepalivePop();
-    callUserCallback(func);
-  });
-};
-
-var clearImmediateWrapped = id => {
-  assert(id);
-  assert(setImmediateWrapped.mapping[id]);
-  clearImmediate(setImmediateWrapped.mapping[id]);
-  setImmediateWrapped.mapping[id] = undefined;
-};
-
-var emClearImmediate;
-
-var emSetImmediate;
-
-var emClearImmediate_deps = [ "$emSetImmediate" ];
-
-var _emscripten_set_immediate = (cb, userData) => {
-  runtimeKeepalivePush();
-  return emSetImmediate(() => {
-    runtimeKeepalivePop();
-    callUserCallback(() => getWasmTableEntry(cb)(userData));
-  });
-};
-
-_emscripten_set_immediate.sig = "ipp";
-
-var _emscripten_clear_immediate = id => {
-  runtimeKeepalivePop();
-  emClearImmediate(id);
-};
-
-_emscripten_clear_immediate.sig = "vi";
-
-var _emscripten_set_immediate_loop = (cb, userData) => {
-  function tick() {
-    callUserCallback(() => {
-      if (getWasmTableEntry(cb)(userData)) {
-        emSetImmediate(tick);
-      } else {
-        runtimeKeepalivePop();
-      }
-    });
-  }
-  runtimeKeepalivePush();
-  emSetImmediate(tick);
-};
-
-_emscripten_set_immediate_loop.sig = "vpp";
-
-var _emscripten_set_timeout = (cb, msecs, userData) => safeSetTimeout(() => getWasmTableEntry(cb)(userData), msecs);
-
-_emscripten_set_timeout.sig = "ipdp";
-
-var _emscripten_clear_timeout = clearTimeout;
-
-_emscripten_clear_timeout.sig = "vi";
-
-var _emscripten_set_timeout_loop = (cb, msecs, userData) => {
-  function tick() {
-    var t = _emscripten_get_now();
-    var n = t + msecs;
-    runtimeKeepalivePop();
-    callUserCallback(() => {
-      if (getWasmTableEntry(cb)(t, userData)) {
-        runtimeKeepalivePush();
-        // Save a little bit of code space: modern browsers should treat
-        // negative setTimeout as timeout of 0
-        // (https://stackoverflow.com/questions/8430966/is-calling-settimeout-with-a-negative-delay-ok)
-        var remaining = n - _emscripten_get_now();
-        // Recent revisions of node, however, give TimeoutNegativeWarning
-        remaining = Math.max(0, remaining);
-        setTimeout(tick, remaining);
-      }
-    });
-  }
-  runtimeKeepalivePush();
-  return setTimeout(tick, 0);
-};
-
-_emscripten_set_timeout_loop.sig = "vpdp";
-
-var _emscripten_set_interval = (cb, msecs, userData) => {
-  runtimeKeepalivePush();
-  return setInterval(() => {
-    callUserCallback(() => getWasmTableEntry(cb)(userData));
-  }, msecs);
-};
-
-_emscripten_set_interval.sig = "ipdp";
-
-var _emscripten_clear_interval = id => {
-  runtimeKeepalivePop();
-  clearInterval(id);
-};
-
-_emscripten_clear_interval.sig = "vi";
-
-var _emscripten_async_call = (func, arg, millis) => {
-  var wrapper = () => getWasmTableEntry(func)(arg);
-  if (millis >= 0 || ENVIRONMENT_IS_NODE) {
-    safeSetTimeout(wrapper, millis);
-  } else {
-    safeRequestAnimationFrame(wrapper);
-  }
-};
-
-_emscripten_async_call.sig = "vppi";
-
-var registerPostMainLoop = f => {
-  // Does nothing unless $MainLoop is included/used.
-  typeof MainLoop != "undefined" && MainLoop.postMainLoop.push(f);
-};
-
-var registerPreMainLoop = f => {
-  // Does nothing unless $MainLoop is included/used.
-  typeof MainLoop != "undefined" && MainLoop.preMainLoop.push(f);
-};
-
-var _emscripten_get_main_loop_timing = (mode, value) => {
-  if (mode) HEAP32[SAFE_HEAP_INDEX(HEAP32, ((mode) >> 2), "storing")] = MainLoop.timingMode;
-  checkInt32(MainLoop.timingMode);
-  if (value) HEAP32[SAFE_HEAP_INDEX(HEAP32, ((value) >> 2), "storing")] = MainLoop.timingValue;
-  checkInt32(MainLoop.timingValue);
-};
-
-_emscripten_get_main_loop_timing.sig = "vpp";
-
-var _emscripten_set_main_loop_arg = (func, arg, fps, simulateInfiniteLoop) => {
-  var iterFunc = () => getWasmTableEntry(func)(arg);
-  setMainLoop(iterFunc, fps, simulateInfiniteLoop, arg);
-};
-
-_emscripten_set_main_loop_arg.sig = "vppii";
-
-var _emscripten_pause_main_loop = () => MainLoop.pause();
-
-_emscripten_pause_main_loop.sig = "v";
-
-var _emscripten_resume_main_loop = () => MainLoop.resume();
-
-_emscripten_resume_main_loop.sig = "v";
-
-var __emscripten_push_main_loop_blocker = (func, arg, name) => {
-  MainLoop.queue.push({
-    func: () => {
-      getWasmTableEntry(func)(arg);
-    },
-    name: UTF8ToString(name),
-    counted: true
-  });
-  MainLoop.updateStatus();
-};
-
-__emscripten_push_main_loop_blocker.sig = "vppp";
-
-var __emscripten_push_uncounted_main_loop_blocker = (func, arg, name) => {
-  MainLoop.queue.push({
-    func: () => {
-      getWasmTableEntry(func)(arg);
-    },
-    name: UTF8ToString(name),
-    counted: false
-  });
-  MainLoop.updateStatus();
-};
-
-__emscripten_push_uncounted_main_loop_blocker.sig = "vppp";
-
-var _emscripten_set_main_loop_expected_blockers = num => {
-  MainLoop.expectedBlockers = num;
-  MainLoop.remainingBlockers = num;
-  MainLoop.updateStatus();
-};
-
-_emscripten_set_main_loop_expected_blockers.sig = "vi";
-
-var idsToPromises = (idBuf, size) => {
-  var promises = [];
-  for (var i = 0; i < size; i++) {
-    var id = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((idBuf) + (i * 4)) >> 2), "loading")];
-    promises[i] = getPromise(id);
-  }
-  return promises;
-};
-
-var makePromiseCallback = (callback, userData) => value => {
-  runtimeKeepalivePop();
-  var stack = stackSave();
-  // Allocate space for the result value and initialize it to NULL.
-  var resultPtr = stackAlloc(POINTER_SIZE);
-  HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((resultPtr) >> 2), "storing")] = 0;
-  try {
-    var result = getWasmTableEntry(callback)(resultPtr, userData, value);
-    var resultVal = HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((resultPtr) >> 2), "loading")];
-  } catch (e) {
-    // If the thrown value is potentially a valid pointer, use it as the
-    // rejection reason. Otherwise use a null pointer as the reason. If we
-    // allow arbitrary objects to be thrown here, we will get a TypeError in
-    // MEMORY64 mode when they are later converted to void* rejection
-    // values.
-    if (typeof e != "number") {
-      throw 0;
-    }
-    throw e;
-  } finally {
-    // Thrown errors will reject the promise, but at least we will restore
-    // the stack first.
-    stackRestore(stack);
-  }
-  switch (result) {
-   case 0:
-    return resultVal;
-
-   case 1:
-    return getPromise(resultVal);
-
-   case 2:
-    var ret = getPromise(resultVal);
-    _emscripten_promise_destroy(resultVal);
-    return ret;
-
-   case 3:
-    throw resultVal;
-  }
-  abort("unexpected promise callback result " + result);
-};
-
-var _emscripten_promise_then = (id, onFulfilled, onRejected, userData) => {
-  runtimeKeepalivePush();
-  var promise = getPromise(id);
-  var newId = promiseMap.allocate({
-    promise: promise.then(makePromiseCallback(onFulfilled, userData), makePromiseCallback(onRejected, userData))
-  });
-  return newId;
-};
-
-_emscripten_promise_then.sig = "ppppp";
-
-var _emscripten_promise_all = (idBuf, resultBuf, size) => {
-  var promises = idsToPromises(idBuf, size);
-  var id = promiseMap.allocate({
-    promise: Promise.all(promises).then(results => {
-      if (resultBuf) {
-        for (var i = 0; i < size; i++) {
-          var result = results[i];
-          HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((resultBuf) + (i * 4)) >> 2), "storing")] = result;
-        }
-      }
-      return resultBuf;
-    })
-  });
-  return id;
-};
-
-_emscripten_promise_all.sig = "pppp";
-
-var setPromiseResult = (ptr, fulfill, value) => {
-  assert(typeof value == "undefined" || typeof value === "number", `native promises can only handle numeric results (${value} ${typeof value})`);
-  var result = fulfill ? 0 : 3;
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, ((ptr) >> 2), "storing")] = result;
-  checkInt32(result);
-  HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((ptr) + (4)) >> 2), "storing")] = value;
-};
-
-var _emscripten_promise_all_settled = (idBuf, resultBuf, size) => {
-  var promises = idsToPromises(idBuf, size);
-  var id = promiseMap.allocate({
-    promise: Promise.allSettled(promises).then(results => {
-      if (resultBuf) {
-        var offset = resultBuf;
-        for (var i = 0; i < size; i++, offset += 8) {
-          if (results[i].status === "fulfilled") {
-            setPromiseResult(offset, true, results[i].value);
-          } else {
-            setPromiseResult(offset, false, results[i].reason);
-          }
-        }
-      }
-      return resultBuf;
-    })
-  });
-  return id;
-};
-
-_emscripten_promise_all_settled.sig = "pppp";
-
-var _emscripten_promise_any = (idBuf, errorBuf, size) => {
-  var promises = idsToPromises(idBuf, size);
-  assert(typeof Promise.any != "undefined", "Promise.any does not exist");
-  var id = promiseMap.allocate({
-    promise: Promise.any(promises).catch(err => {
-      if (errorBuf) {
-        for (var i = 0; i < size; i++) {
-          HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((errorBuf) + (i * 4)) >> 2), "storing")] = err.errors[i];
-        }
-      }
-      throw errorBuf;
-    })
-  });
-  return id;
-};
-
-_emscripten_promise_any.sig = "pppp";
-
-var _emscripten_promise_race = (idBuf, size) => {
-  var promises = idsToPromises(idBuf, size);
-  var id = promiseMap.allocate({
-    promise: Promise.race(promises)
-  });
-  return id;
-};
-
-_emscripten_promise_race.sig = "ppp";
-
-var _emscripten_promise_await = (returnValuePtr, id) => {
-  abort("emscripten_promise_await is only available with ASYNCIFY");
-};
-
-_emscripten_promise_await.sig = "vpp";
-
-var findMatchingCatch = args => {
-  var thrown = exceptionLast;
-  if (!thrown) {
-    // just pass through the null ptr
-    setTempRet0(0);
-    return 0;
-  }
-  var info = new ExceptionInfo(thrown);
-  info.set_adjusted_ptr(thrown);
-  var thrownType = info.get_type();
-  if (!thrownType) {
-    // just pass through the thrown ptr
-    setTempRet0(0);
-    return thrown;
-  }
-  // can_catch receives a **, add indirection
-  // The different catch blocks are denoted by different types.
-  // Due to inheritance, those types may not precisely match the
-  // type of the thrown object. Find one which matches, and
-  // return the type of the catch block which should be called.
-  for (var caughtType of args) {
-    if (caughtType === 0 || caughtType === thrownType) {
-      // Catch all clause matched or exactly the same type is caught
-      break;
-    }
-    var adjusted_ptr_addr = info.ptr + 16;
-    if (___cxa_can_catch(caughtType, thrownType, adjusted_ptr_addr)) {
-      setTempRet0(caughtType);
-      return thrown;
-    }
-  }
-  setTempRet0(thrownType);
-  return thrown;
-};
-
-var ___cxa_find_matching_catch_2 = () => findMatchingCatch([]);
-
-___cxa_find_matching_catch_2.sig = "p";
-
-var ___cxa_find_matching_catch_3 = arg0 => findMatchingCatch([ arg0 ]);
-
-___cxa_find_matching_catch_3.sig = "pp";
-
-var ___cxa_find_matching_catch_4 = (arg0, arg1) => findMatchingCatch([ arg0, arg1 ]);
-
-___cxa_find_matching_catch_4.sig = "ppp";
-
-var exceptionCaught = [];
-
-var ___cxa_rethrow = () => {
-  var info = exceptionCaught.pop();
-  if (!info) {
-    abort("no exception to throw");
-  }
-  var ptr = info.excPtr;
-  if (!info.get_rethrown()) {
-    // Only pop if the corresponding push was through rethrow_primary_exception
-    exceptionCaught.push(info);
-    info.set_rethrown(true);
-    info.set_caught(false);
-    uncaughtExceptionCount++;
-  }
-  exceptionLast = ptr;
-  assert(false, "Exception thrown, but exception catching is not enabled. Compile with -sNO_DISABLE_EXCEPTION_CATCHING or -sEXCEPTION_CATCHING_ALLOWED=[..] to catch. (note: in dynamic linking, if a side module wants exceptions, the main module must be built with that support)");
-};
-
-___cxa_rethrow.sig = "v";
-
-var _llvm_eh_typeid_for = type => type;
-
-_llvm_eh_typeid_for.sig = "vp";
-
-var ___cxa_begin_catch = ptr => {
-  var info = new ExceptionInfo(ptr);
-  if (!info.get_caught()) {
-    info.set_caught(true);
-    uncaughtExceptionCount--;
-  }
-  info.set_rethrown(false);
-  exceptionCaught.push(info);
-  return ___cxa_get_exception_ptr(ptr);
-};
-
-___cxa_begin_catch.sig = "pp";
-
-var ___cxa_end_catch = () => {
-  // Clear state flag.
-  _setThrew(0, 0);
-  assert(exceptionCaught.length > 0);
-  // Call destructor if one is registered then clear it.
-  var info = exceptionCaught.pop();
-  ___cxa_decrement_exception_refcount(info.excPtr);
-  exceptionLast = 0;
-};
-
-___cxa_end_catch.sig = "v";
-
-var ___cxa_uncaught_exceptions = () => uncaughtExceptionCount;
-
-___cxa_uncaught_exceptions.sig = "i";
-
-var ___cxa_call_unexpected = exception => abort("Unexpected exception thrown, this is not properly supported - aborting");
-
-___cxa_call_unexpected.sig = "vp";
-
-var ___cxa_current_primary_exception = () => {
-  if (!exceptionCaught.length) {
-    return 0;
-  }
-  var info = exceptionCaught[exceptionCaught.length - 1];
-  ___cxa_increment_exception_refcount(info.excPtr);
-  return info.excPtr;
-};
-
-___cxa_current_primary_exception.sig = "p";
-
-function ___cxa_current_exception_type() {
-  if (!exceptionCaught.length) {
-    return 0;
-  }
-  var info = exceptionCaught[exceptionCaught.length - 1];
-  return info.get_type();
-}
-
-___cxa_current_exception_type.sig = "p";
-
-var ___cxa_rethrow_primary_exception = ptr => {
-  if (!ptr) return;
-  var info = new ExceptionInfo(ptr);
-  exceptionCaught.push(info);
-  info.set_rethrown(true);
-  ___cxa_rethrow();
-};
-
-___cxa_rethrow_primary_exception.sig = "vp";
-
-var ___resumeException = ptr => {
-  if (!exceptionLast) {
-    exceptionLast = ptr;
-  }
-  assert(false, "Exception thrown, but exception catching is not enabled. Compile with -sNO_DISABLE_EXCEPTION_CATCHING or -sEXCEPTION_CATCHING_ALLOWED=[..] to catch. (note: in dynamic linking, if a side module wants exceptions, the main module must be built with that support)");
-};
-
-___resumeException.sig = "vp";
-
-var requestFullscreen = Browser.requestFullscreen;
-
-var requestFullScreen = Browser.requestFullScreen;
-
-var setCanvasSize = Browser.setCanvasSize;
-
-var getUserMedia = Browser.getUserMedia;
-
-var _emscripten_run_preload_plugins = function(file, onload, onerror) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(125, 0, 1, file, onload, onerror);
-  runtimeKeepalivePush();
-  var _file = UTF8ToString(file);
-  var data = FS.analyzePath(_file);
-  if (!data.exists) return -1;
-  FS.createPreloadedFile(PATH.dirname(_file), PATH.basename(_file), // TODO: This copy is not needed if the contents are already a Uint8Array,
-  //       which they often are (and always are in WasmFS).
-  new Uint8Array(data.object.contents), true, true, () => {
-    runtimeKeepalivePop();
-    if (onload) getWasmTableEntry(onload)(file);
-  }, () => {
-    runtimeKeepalivePop();
-    if (onerror) getWasmTableEntry(onerror)(file);
-  }, true);
-  return 0;
-};
-
-_emscripten_run_preload_plugins.sig = "ippp";
-
-var Browser_asyncPrepareDataCounter = 0;
-
-var _emscripten_run_preload_plugins_data = function(data, size, suffix, arg, onload, onerror) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(126, 0, 1, data, size, suffix, arg, onload, onerror);
-  runtimeKeepalivePush();
-  var _suffix = UTF8ToString(suffix);
-  var name = "prepare_data_" + (Browser_asyncPrepareDataCounter++) + "." + _suffix;
-  var cname = stringToNewUTF8(name);
-  FS.createPreloadedFile("/", name, HEAPU8.subarray((data), data + size), true, true, () => {
-    runtimeKeepalivePop();
-    if (onload) getWasmTableEntry(onload)(arg, cname);
-  }, () => {
-    runtimeKeepalivePop();
-    if (onerror) getWasmTableEntry(onerror)(arg);
-  }, true);
-};
-
-_emscripten_run_preload_plugins_data.sig = "vpipppp";
-
-var _emscripten_async_run_script = (script, millis) => {
-  // TODO: cache these to avoid generating garbage
-  safeSetTimeout(() => _emscripten_run_script(script), millis);
-};
-
-_emscripten_async_run_script.sig = "vpi";
-
-var _emscripten_async_load_script = async (url, onload, onerror) => {
-  url = UTF8ToString(url);
-  if (ENVIRONMENT_IS_PTHREAD) {
-    err(`emscripten_async_load_script("${url}") failed, emscripten_async_load_script is currently not available in pthreads!`);
-    onerror && getWasmTableEntry(onerror)();
-    return;
-  }
-  assert(runDependencies === 0, "async_load_script must be run when no other dependencies are active");
-  runtimeKeepalivePush();
-  var loadDone = () => {
-    runtimeKeepalivePop();
-    if (onload) {
-      var onloadCallback = () => callUserCallback(getWasmTableEntry(onload));
-      if (runDependencies > 0) {
-        dependenciesFulfilled = onloadCallback;
-      } else {
-        onloadCallback();
-      }
-    }
-  };
-  var loadError = () => {
-    runtimeKeepalivePop();
-    if (onerror) {
-      callUserCallback(getWasmTableEntry(onerror));
-    }
-  };
-  if (ENVIRONMENT_IS_NODE) {
-    try {
-      var data = await readAsync(url, false);
-      eval(data);
-      loadDone();
-    } catch (e) {
-      err(e);
-      loadError();
-    }
-    return;
-  }
-  var script = document.createElement("script");
-  script.onload = loadDone;
-  script.onerror = loadError;
-  script.src = url;
-  document.body.appendChild(script);
-};
-
-_emscripten_async_load_script.sig = "vppp";
-
-function _emscripten_get_window_title() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(127, 0, 1);
-  var buflen = 256;
-  if (!_emscripten_get_window_title.buffer) {
-    _emscripten_get_window_title.buffer = _malloc(buflen);
-  }
-  stringToUTF8(document.title, _emscripten_get_window_title.buffer, buflen);
-  return _emscripten_get_window_title.buffer;
-}
-
-_emscripten_get_window_title.sig = "p";
-
-function _emscripten_hide_mouse() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(128, 0, 1);
-  var styleSheet = document.styleSheets[0];
-  var rules = styleSheet.cssRules;
-  for (var i = 0; i < rules.length; i++) {
-    if (rules[i].cssText.startsWith("canvas")) {
-      styleSheet.deleteRule(i);
-      i--;
-    }
-  }
-  styleSheet.insertRule("canvas.emscripten { border: 1px solid black; cursor: none; }", 0);
-}
-
-_emscripten_hide_mouse.sig = "v";
-
-function _emscripten_set_canvas_size(width, height) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(129, 0, 1, width, height);
-  return Browser.setCanvasSize(width, height);
-}
-
-_emscripten_set_canvas_size.sig = "vii";
-
-function _emscripten_get_canvas_size(width, height, isFullscreen) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(130, 0, 1, width, height, isFullscreen);
-  var canvas = Browser.getCanvas();
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, ((width) >> 2), "storing")] = canvas.width;
-  checkInt32(canvas.width);
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, ((height) >> 2), "storing")] = canvas.height;
-  checkInt32(canvas.height);
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, ((isFullscreen) >> 2), "storing")] = Browser.isFullscreen ? 1 : 0;
-  checkInt32(Browser.isFullscreen ? 1 : 0);
-}
-
-_emscripten_get_canvas_size.sig = "vppp";
-
-function _emscripten_create_worker(url) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(131, 0, 1, url);
-  url = UTF8ToString(url);
-  var id = Browser.workers.length;
-  var info = {
-    worker: new Worker(url),
-    callbacks: [],
-    awaited: 0,
-    buffer: 0
-  };
-  info.worker.onmessage = msg => {
-    if (ABORT) return;
-    var info = Browser.workers[id];
-    if (!info) return;
-    // worker was destroyed meanwhile
-    var callbackId = msg.data["callbackId"];
-    var callbackInfo = info.callbacks[callbackId];
-    if (!callbackInfo) return;
-    // no callback or callback removed meanwhile
-    // Don't trash our callback state if we expect additional calls.
-    if (msg.data["finalResponse"]) {
-      info.awaited--;
-      info.callbacks[callbackId] = null;
-      // TODO: reuse callbackIds, compress this
-      runtimeKeepalivePop();
-    }
-    var data = msg.data["data"];
-    if (data) {
-      if (!data.byteLength) data = new Uint8Array(data);
-      info.buffer = _realloc(info.buffer, data.length);
-      HEAPU8.set(data, info.buffer);
-      callbackInfo.func(info.buffer, data.length, callbackInfo.arg);
-    } else {
-      callbackInfo.func(0, 0, callbackInfo.arg);
-    }
-  };
-  Browser.workers.push(info);
-  return id;
-}
-
-_emscripten_create_worker.sig = "ip";
-
-function _emscripten_destroy_worker(id) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(132, 0, 1, id);
-  var info = Browser.workers[id];
-  info.worker.terminate();
-  _free(info.buffer);
-  Browser.workers[id] = null;
-}
-
-_emscripten_destroy_worker.sig = "vi";
-
-function _emscripten_call_worker(id, funcName, data, size, callback, arg) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(133, 0, 1, id, funcName, data, size, callback, arg);
-  funcName = UTF8ToString(funcName);
-  var info = Browser.workers[id];
-  var callbackId = -1;
-  if (callback) {
-    // If we are waiting for a response from the worker we need to keep
-    // the runtime alive at least long enough to receive it.
-    // The corresponding runtimeKeepalivePop is in the `finalResponse`
-    // handler above.
-    runtimeKeepalivePush();
-    callbackId = info.callbacks.length;
-    info.callbacks.push({
-      func: getWasmTableEntry(callback),
-      arg
-    });
-    info.awaited++;
-  }
-  var transferObject = {
-    "funcName": funcName,
-    "callbackId": callbackId,
-    "data": data ? new Uint8Array(HEAPU8.subarray((data), data + size)) : 0
-  };
-  if (data) {
-    info.worker.postMessage(transferObject, [ transferObject.data.buffer ]);
-  } else {
-    info.worker.postMessage(transferObject);
-  }
-}
-
-_emscripten_call_worker.sig = "vippipp";
-
-function _emscripten_get_worker_queue_size(id) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(134, 0, 1, id);
-  var info = Browser.workers[id];
-  if (!info) return -1;
-  return info.awaited;
-}
-
-_emscripten_get_worker_queue_size.sig = "ii";
-
-var getPreloadedImageData = (path, w, h) => {
-  path = PATH_FS.resolve(path);
-  var canvas = /** @type {HTMLCanvasElement} */ (Browser.preloadedImages[path]);
-  if (!canvas) return 0;
-  var ctx = canvas.getContext("2d");
-  var image = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  var buf = _malloc(canvas.width * canvas.height * 4);
-  HEAPU8.set(image.data, buf);
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, ((w) >> 2), "storing")] = canvas.width;
-  checkInt32(canvas.width);
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, ((h) >> 2), "storing")] = canvas.height;
-  checkInt32(canvas.height);
-  return buf;
-};
-
-function _emscripten_get_preloaded_image_data(path, w, h) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(135, 0, 1, path, w, h);
-  return getPreloadedImageData(UTF8ToString(path), w, h);
-}
-
-_emscripten_get_preloaded_image_data.sig = "pppp";
-
-var getPreloadedImageData__data = [ "$PATH_FS", "malloc" ];
-
-function _emscripten_get_preloaded_image_data_from_FILE(file, w, h) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(136, 0, 1, file, w, h);
-  var fd = _fileno(file);
-  var stream = FS.getStream(fd);
-  if (stream) {
-    return getPreloadedImageData(stream.path, w, h);
-  }
-  return 0;
-}
-
-_emscripten_get_preloaded_image_data_from_FILE.sig = "pppp";
-
-var wget = {
-  wgetRequests: {},
-  nextWgetRequestHandle: 0,
-  getNextWgetRequestHandle() {
-    var handle = wget.nextWgetRequestHandle;
-    wget.nextWgetRequestHandle++;
-    return handle;
-  }
-};
-
-/**
-   * @param {number=} mode Optionally, the mode to create in. Uses mkdir's
-   *                       default if not set.
-   */ var FS_mkdirTree = (path, mode) => FS.mkdirTree(path, mode);
-
-var _emscripten_async_wget = function(url, file, onload, onerror) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(137, 0, 1, url, file, onload, onerror);
-  runtimeKeepalivePush();
-  var _url = UTF8ToString(url);
-  var _file = UTF8ToString(file);
-  _file = PATH_FS.resolve(_file);
-  function doCallback(callback) {
-    if (callback) {
-      runtimeKeepalivePop();
-      callUserCallback(() => withStackSave(() => getWasmTableEntry(callback)(stringToUTF8OnStack(_file))));
-    }
-  }
-  var destinationDirectory = PATH.dirname(_file);
-  FS_preloadFile(destinationDirectory, PATH.basename(_file), _url, true, true, false, // dontCreateFile
-  false, // canOwn
-  () => {
-    // preFinish
-    // if a file exists there, we overwrite it
-    try {
-      FS_unlink(_file);
-    } catch (e) {}
-    // if the destination directory does not yet exist, create it
-    FS_mkdirTree(destinationDirectory);
-  }).then(() => doCallback(onload)).catch(() => doCallback(onerror));
-};
-
-_emscripten_async_wget.sig = "vpppp";
-
-var _emscripten_async_wget_data = async function(url, userdata, onload, onerror) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(138, 0, 1, url, userdata, onload, onerror);
-  runtimeKeepalivePush();
-  /* no need for run dependency, this is async but will not do any prepare etc. step */ try {
-    var byteArray = await asyncLoad(UTF8ToString(url));
-    runtimeKeepalivePop();
-    callUserCallback(() => {
-      var buffer = _malloc(byteArray.length);
-      HEAPU8.set(byteArray, buffer);
-      getWasmTableEntry(onload)(userdata, buffer, byteArray.length);
-      _free(buffer);
-    });
-  } catch (e) {
-    if (onerror) {
-      runtimeKeepalivePop();
-      callUserCallback(() => {
-        getWasmTableEntry(onerror)(userdata);
-      });
-    }
-  }
-};
-
-_emscripten_async_wget_data.sig = "vpppp";
-
-var _emscripten_async_wget2 = function(url, file, request, param, userdata, onload, onerror, onprogress) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(139, 0, 1, url, file, request, param, userdata, onload, onerror, onprogress);
-  runtimeKeepalivePush();
-  var _url = UTF8ToString(url);
-  var _file = UTF8ToString(file);
-  _file = PATH_FS.resolve(_file);
-  var _request = UTF8ToString(request);
-  var _param = UTF8ToString(param);
-  var index = _file.lastIndexOf("/");
-  var http = new XMLHttpRequest;
-  http.open(_request, _url, true);
-  http.responseType = "arraybuffer";
-  var handle = wget.getNextWgetRequestHandle();
-  var destinationDirectory = PATH.dirname(_file);
-  // LOAD
-  http.onload = e => {
-    runtimeKeepalivePop();
-    if (http.status >= 200 && http.status < 300) {
-      // if a file exists there, we overwrite it
-      try {
-        FS.unlink(_file);
-      } catch (e) {}
-      // if the destination directory does not yet exist, create it
-      FS.mkdirTree(destinationDirectory);
-      FS.createDataFile(_file.slice(0, index), _file.slice(index + 1), new Uint8Array(/** @type{ArrayBuffer}*/ (http.response)), true, true, false);
-      if (onload) {
-        var sp = stackSave();
-        getWasmTableEntry(onload)(handle, userdata, stringToUTF8OnStack(_file));
-        stackRestore(sp);
-      }
-    } else {
-      if (onerror) getWasmTableEntry(onerror)(handle, userdata, http.status);
-    }
-    delete wget.wgetRequests[handle];
-  };
-  // ERROR
-  http.onerror = e => {
-    runtimeKeepalivePop();
-    if (onerror) getWasmTableEntry(onerror)(handle, userdata, http.status);
-    delete wget.wgetRequests[handle];
-  };
-  // PROGRESS
-  http.onprogress = e => {
-    if (e.lengthComputable || (e.lengthComputable === undefined && e.total != 0)) {
-      var percentComplete = (e.loaded / e.total) * 100;
-      if (onprogress) getWasmTableEntry(onprogress)(handle, userdata, percentComplete);
-    }
-  };
-  // ABORT
-  http.onabort = e => {
-    runtimeKeepalivePop();
-    delete wget.wgetRequests[handle];
-  };
-  if (_request == "POST") {
-    // Send the proper header information along with the request
-    http.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
-    http.send(_param);
-  } else {
-    http.send(null);
-  }
-  wget.wgetRequests[handle] = http;
-  return handle;
-};
-
-_emscripten_async_wget2.sig = "ipppppppp";
-
-function _emscripten_async_wget2_data(url, request, param, userdata, free, onload, onerror, onprogress) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(140, 0, 1, url, request, param, userdata, free, onload, onerror, onprogress);
-  var _url = UTF8ToString(url);
-  var _request = UTF8ToString(request);
-  var _param = UTF8ToString(param);
-  var http = new XMLHttpRequest;
-  http.open(_request, _url, true);
-  http.responseType = "arraybuffer";
-  var handle = wget.getNextWgetRequestHandle();
-  function onerrorjs() {
-    if (onerror) {
-      var sp = stackSave();
-      var statusText = 0;
-      if (http.statusText) {
-        statusText = stringToUTF8OnStack(http.statusText);
-      }
-      getWasmTableEntry(onerror)(handle, userdata, http.status, statusText);
-      stackRestore(sp);
-    }
-  }
-  // LOAD
-  http.onload = e => {
-    if (http.status >= 200 && http.status < 300 || (http.status === 0 && _url.slice(0, 4).toLowerCase() != "http")) {
-      var byteArray = new Uint8Array(/** @type{ArrayBuffer} */ (http.response));
-      var buffer = _malloc(byteArray.length);
-      HEAPU8.set(byteArray, buffer);
-      if (onload) getWasmTableEntry(onload)(handle, userdata, buffer, byteArray.length);
-      if (free) _free(buffer);
-    } else {
-      onerrorjs();
-    }
-    delete wget.wgetRequests[handle];
-  };
-  // ERROR
-  http.onerror = e => {
-    onerrorjs();
-    delete wget.wgetRequests[handle];
-  };
-  // PROGRESS
-  http.onprogress = e => {
-    if (onprogress) getWasmTableEntry(onprogress)(handle, userdata, e.loaded, e.lengthComputable || e.lengthComputable === undefined ? e.total : 0);
-  };
-  // ABORT
-  http.onabort = e => {
-    delete wget.wgetRequests[handle];
-  };
-  if (_request == "POST") {
-    // Send the proper header information along with the request
-    http.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
-    http.send(_param);
-  } else {
-    http.send(null);
-  }
-  wget.wgetRequests[handle] = http;
-  return handle;
-}
-
-_emscripten_async_wget2_data.sig = "ippppippp";
-
-function _emscripten_async_wget2_abort(handle) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(141, 0, 1, handle);
-  var http = wget.wgetRequests[handle];
-  http?.abort();
-}
-
-_emscripten_async_wget2_abort.sig = "vi";
-
-var ___asctime_r = (tmPtr, buf) => {
-  var date = {
-    tm_sec: HEAP32[SAFE_HEAP_INDEX(HEAP32, ((tmPtr) >> 2), "loading")],
-    tm_min: HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (4)) >> 2), "loading")],
-    tm_hour: HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (8)) >> 2), "loading")],
-    tm_mday: HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (12)) >> 2), "loading")],
-    tm_mon: HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (16)) >> 2), "loading")],
-    tm_year: HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (20)) >> 2), "loading")],
-    tm_wday: HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tmPtr) + (24)) >> 2), "loading")]
-  };
-  var days = [ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" ];
-  var months = [ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" ];
-  var s = days[date.tm_wday] + " " + months[date.tm_mon] + (date.tm_mday < 10 ? "  " : " ") + date.tm_mday + (date.tm_hour < 10 ? " 0" : " ") + date.tm_hour + (date.tm_min < 10 ? ":0" : ":") + date.tm_min + (date.tm_sec < 10 ? ":0" : ":") + date.tm_sec + " " + (1900 + date.tm_year) + "\n";
-  // asctime_r is specced to behave in an undefined manner if the algorithm would attempt
-  // to write out more than 26 bytes (including the null terminator).
-  // See http://pubs.opengroup.org/onlinepubs/9699919799/functions/asctime.html
-  // Our undefined behavior is to truncate the write to at most 26 bytes, including null terminator.
-  stringToUTF8(s, buf, 26);
-  return buf;
-};
-
-___asctime_r.sig = "ppp";
-
-var MONTH_DAYS_REGULAR = [ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 ];
-
-var MONTH_DAYS_LEAP = [ 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 ];
-
-var arraySum = (array, index) => {
-  var sum = 0;
-  for (var i = 0; i <= index; sum += array[i++]) {}
-  return sum;
-};
-
-var addDays = (date, days) => {
-  var newDate = new Date(date.getTime());
-  while (days > 0) {
-    var leap = isLeapYear(newDate.getFullYear());
-    var currentMonth = newDate.getMonth();
-    var daysInCurrentMonth = (leap ? MONTH_DAYS_LEAP : MONTH_DAYS_REGULAR)[currentMonth];
-    if (days > daysInCurrentMonth - newDate.getDate()) {
-      // we spill over to next month
-      days -= (daysInCurrentMonth - newDate.getDate() + 1);
-      newDate.setDate(1);
-      if (currentMonth < 11) {
-        newDate.setMonth(currentMonth + 1);
-      } else {
-        newDate.setMonth(0);
-        newDate.setFullYear(newDate.getFullYear() + 1);
-      }
-    } else {
-      // we stay in current month
-      newDate.setDate(newDate.getDate() + days);
-      return newDate;
-    }
-  }
-  return newDate;
-};
-
-var _strptime = (buf, format, tm) => {
-  // char *strptime(const char *restrict buf, const char *restrict format, struct tm *restrict tm);
-  // http://pubs.opengroup.org/onlinepubs/009695399/functions/strptime.html
-  var pattern = UTF8ToString(format);
-  // escape special characters
-  // TODO: not sure we really need to escape all of these in JS regexps
-  var SPECIAL_CHARS = "\\!@#$^&*()+=-[]/{}|:<>?,.";
-  for (var i = 0, ii = SPECIAL_CHARS.length; i < ii; ++i) {
-    pattern = pattern.replace(new RegExp("\\" + SPECIAL_CHARS[i], "g"), "\\" + SPECIAL_CHARS[i]);
-  }
-  // reduce number of matchers
-  var EQUIVALENT_MATCHERS = {
-    "A": "%a",
-    "B": "%b",
-    "c": "%a %b %d %H:%M:%S %Y",
-    "D": "%m\\/%d\\/%y",
-    "e": "%d",
-    "F": "%Y-%m-%d",
-    "h": "%b",
-    "R": "%H\\:%M",
-    "r": "%I\\:%M\\:%S\\s%p",
-    "T": "%H\\:%M\\:%S",
-    "x": "%m\\/%d\\/(?:%y|%Y)",
-    "X": "%H\\:%M\\:%S"
-  };
-  // TODO: take care of locale
-  var DATE_PATTERNS = {
-    /* weekday name */ "a": "(?:Sun(?:day)?)|(?:Mon(?:day)?)|(?:Tue(?:sday)?)|(?:Wed(?:nesday)?)|(?:Thu(?:rsday)?)|(?:Fri(?:day)?)|(?:Sat(?:urday)?)",
-    /* month name */ "b": "(?:Jan(?:uary)?)|(?:Feb(?:ruary)?)|(?:Mar(?:ch)?)|(?:Apr(?:il)?)|May|(?:Jun(?:e)?)|(?:Jul(?:y)?)|(?:Aug(?:ust)?)|(?:Sep(?:tember)?)|(?:Oct(?:ober)?)|(?:Nov(?:ember)?)|(?:Dec(?:ember)?)",
-    /* century */ "C": "\\d\\d",
-    /* day of month */ "d": "0[1-9]|[1-9](?!\\d)|1\\d|2\\d|30|31",
-    /* hour (24hr) */ "H": "\\d(?!\\d)|[0,1]\\d|20|21|22|23",
-    /* hour (12hr) */ "I": "\\d(?!\\d)|0\\d|10|11|12",
-    /* day of year */ "j": "00[1-9]|0?[1-9](?!\\d)|0?[1-9]\\d(?!\\d)|[1,2]\\d\\d|3[0-6]\\d",
-    /* month */ "m": "0[1-9]|[1-9](?!\\d)|10|11|12",
-    /* minutes */ "M": "0\\d|\\d(?!\\d)|[1-5]\\d",
-    /* whitespace */ "n": " ",
-    /* AM/PM */ "p": "AM|am|PM|pm|A\\.M\\.|a\\.m\\.|P\\.M\\.|p\\.m\\.",
-    /* seconds */ "S": "0\\d|\\d(?!\\d)|[1-5]\\d|60",
-    /* week number */ "U": "0\\d|\\d(?!\\d)|[1-4]\\d|50|51|52|53",
-    /* week number */ "W": "0\\d|\\d(?!\\d)|[1-4]\\d|50|51|52|53",
-    /* weekday number */ "w": "[0-6]",
-    /* 2-digit year */ "y": "\\d\\d",
-    /* 4-digit year */ "Y": "\\d\\d\\d\\d",
-    /* whitespace */ "t": " ",
-    /* time zone */ "z": "Z|(?:[\\+\\-]\\d\\d:?(?:\\d\\d)?)"
-  };
-  var MONTH_NUMBERS = {
-    JAN: 0,
-    FEB: 1,
-    MAR: 2,
-    APR: 3,
-    MAY: 4,
-    JUN: 5,
-    JUL: 6,
-    AUG: 7,
-    SEP: 8,
-    OCT: 9,
-    NOV: 10,
-    DEC: 11
-  };
-  var DAY_NUMBERS_SUN_FIRST = {
-    SUN: 0,
-    MON: 1,
-    TUE: 2,
-    WED: 3,
-    THU: 4,
-    FRI: 5,
-    SAT: 6
-  };
-  var DAY_NUMBERS_MON_FIRST = {
-    MON: 0,
-    TUE: 1,
-    WED: 2,
-    THU: 3,
-    FRI: 4,
-    SAT: 5,
-    SUN: 6
-  };
-  var capture = [];
-  var pattern_out = pattern.replace(/%(.)/g, (m, c) => EQUIVALENT_MATCHERS[c] || m).replace(/%(.)/g, (_, c) => {
-    let pat = DATE_PATTERNS[c];
-    if (pat) {
-      capture.push(c);
-      return `(${pat})`;
-    } else {
-      return c;
-    }
-  }).replace(// any number of space or tab characters match zero or more spaces
-  /\s+/g, "\\s*");
-  var matches = new RegExp("^" + pattern_out, "i").exec(UTF8ToString(buf));
-  function initDate() {
-    function fixup(value, min, max) {
-      return (typeof value != "number" || isNaN(value)) ? min : (value >= min ? (value <= max ? value : max) : min);
-    }
-    return {
-      year: fixup(HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tm) + (20)) >> 2), "loading")] + 1900, 1970, 9999),
-      month: fixup(HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tm) + (16)) >> 2), "loading")], 0, 11),
-      day: fixup(HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tm) + (12)) >> 2), "loading")], 1, 31),
-      hour: fixup(HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tm) + (8)) >> 2), "loading")], 0, 23),
-      min: fixup(HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tm) + (4)) >> 2), "loading")], 0, 59),
-      sec: fixup(HEAP32[SAFE_HEAP_INDEX(HEAP32, ((tm) >> 2), "loading")], 0, 59),
-      gmtoff: 0
-    };
-  }
-  if (matches) {
-    var date = initDate();
-    var value;
-    var getMatch = symbol => {
-      var pos = capture.indexOf(symbol);
-      // check if symbol appears in regexp
-      if (pos >= 0) {
-        // return matched value or null (falsy!) for non-matches
-        return matches[pos + 1];
-      }
-      return;
-    };
-    // seconds
-    if ((value = getMatch("S"))) {
-      date.sec = Number(value);
-    }
-    // minutes
-    if ((value = getMatch("M"))) {
-      date.min = Number(value);
-    }
-    // hours
-    if ((value = getMatch("H"))) {
-      // 24h clock
-      date.hour = Number(value);
-    } else if ((value = getMatch("I"))) {
-      // AM/PM clock
-      var hour = Number(value);
-      if ((value = getMatch("p"))) {
-        hour += value.toUpperCase()[0] === "P" ? 12 : 0;
-      }
-      date.hour = hour;
-    }
-    // year
-    if ((value = getMatch("Y"))) {
-      // parse from four-digit year
-      date.year = Number(value);
-    } else if ((value = getMatch("y"))) {
-      // parse from two-digit year...
-      var year = Number(value);
-      if ((value = getMatch("C"))) {
-        // ...and century
-        year += Number(value) * 100;
-      } else {
-        // ...and rule-of-thumb
-        year += year < 69 ? 2e3 : 1900;
-      }
-      date.year = year;
-    }
-    // month
-    if ((value = getMatch("m"))) {
-      // parse from month number
-      date.month = Number(value) - 1;
-    } else if ((value = getMatch("b"))) {
-      // parse from month name
-      date.month = MONTH_NUMBERS[value.substring(0, 3).toUpperCase()] || 0;
-    }
-    // day
-    if ((value = getMatch("d"))) {
-      // get day of month directly
-      date.day = Number(value);
-    } else if ((value = getMatch("j"))) {
-      // get day of month from day of year ...
-      var day = Number(value);
-      var leapYear = isLeapYear(date.year);
-      for (var month = 0; month < 12; ++month) {
-        var daysUntilMonth = arraySum(leapYear ? MONTH_DAYS_LEAP : MONTH_DAYS_REGULAR, month - 1);
-        if (day <= daysUntilMonth + (leapYear ? MONTH_DAYS_LEAP : MONTH_DAYS_REGULAR)[month]) {
-          date.day = day - daysUntilMonth;
-        }
-      }
-    } else if ((value = getMatch("a"))) {
-      // get day of month from weekday ...
-      var weekDay = value.substring(0, 3).toUpperCase();
-      if ((value = getMatch("U"))) {
-        // ... and week number (Sunday being first day of week)
-        // Week number of the year (Sunday as the first day of the week) as a decimal number [00,53].
-        // All days in a new year preceding the first Sunday are considered to be in week 0.
-        var weekDayNumber = DAY_NUMBERS_SUN_FIRST[weekDay];
-        var weekNumber = Number(value);
-        // January 1st
-        var janFirst = new Date(date.year, 0, 1);
-        var endDate;
-        if (janFirst.getDay() === 0) {
-          // Jan 1st is a Sunday, and, hence in the 1st CW
-          endDate = addDays(janFirst, weekDayNumber + 7 * (weekNumber - 1));
-        } else {
-          // Jan 1st is not a Sunday, and, hence still in the 0th CW
-          endDate = addDays(janFirst, 7 - janFirst.getDay() + weekDayNumber + 7 * (weekNumber - 1));
-        }
-        date.day = endDate.getDate();
-        date.month = endDate.getMonth();
-      } else if ((value = getMatch("W"))) {
-        // ... and week number (Monday being first day of week)
-        // Week number of the year (Monday as the first day of the week) as a decimal number [00,53].
-        // All days in a new year preceding the first Monday are considered to be in week 0.
-        var weekDayNumber = DAY_NUMBERS_MON_FIRST[weekDay];
-        var weekNumber = Number(value);
-        // January 1st
-        var janFirst = new Date(date.year, 0, 1);
-        var endDate;
-        if (janFirst.getDay() === 1) {
-          // Jan 1st is a Monday, and, hence in the 1st CW
-          endDate = addDays(janFirst, weekDayNumber + 7 * (weekNumber - 1));
-        } else {
-          // Jan 1st is not a Monday, and, hence still in the 0th CW
-          endDate = addDays(janFirst, 7 - janFirst.getDay() + 1 + weekDayNumber + 7 * (weekNumber - 1));
-        }
-        date.day = endDate.getDate();
-        date.month = endDate.getMonth();
-      }
-    }
-    // time zone
-    if ((value = getMatch("z"))) {
-      // GMT offset as either 'Z' or +-HH:MM or +-HH or +-HHMM
-      if (value.toLowerCase() === "z") {
-        date.gmtoff = 0;
-      } else {
-        var match = value.match(/^((?:\-|\+)\d\d):?(\d\d)?/);
-        date.gmtoff = match[1] * 3600;
-        if (match[2]) {
-          date.gmtoff += date.gmtoff > 0 ? match[2] * 60 : -match[2] * 60;
-        }
-      }
-    }
-    /*
-      tm_sec  int seconds after the minute  0-61*
-      tm_min  int minutes after the hour  0-59
-      tm_hour int hours since midnight  0-23
-      tm_mday int day of the month  1-31
-      tm_mon  int months since January  0-11
-      tm_year int years since 1900
-      tm_wday int days since Sunday 0-6
-      tm_yday int days since January 1  0-365
-      tm_isdst  int Daylight Saving Time flag
-      tm_gmtoff long offset from GMT (seconds)
-      */ var fullDate = new Date(date.year, date.month, date.day, date.hour, date.min, date.sec, 0);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((tm) >> 2), "storing")] = fullDate.getSeconds();
-    checkInt32(fullDate.getSeconds());
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tm) + (4)) >> 2), "storing")] = fullDate.getMinutes();
-    checkInt32(fullDate.getMinutes());
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tm) + (8)) >> 2), "storing")] = fullDate.getHours();
-    checkInt32(fullDate.getHours());
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tm) + (12)) >> 2), "storing")] = fullDate.getDate();
-    checkInt32(fullDate.getDate());
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tm) + (16)) >> 2), "storing")] = fullDate.getMonth();
-    checkInt32(fullDate.getMonth());
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tm) + (20)) >> 2), "storing")] = fullDate.getFullYear() - 1900;
-    checkInt32(fullDate.getFullYear() - 1900);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tm) + (24)) >> 2), "storing")] = fullDate.getDay();
-    checkInt32(fullDate.getDay());
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tm) + (28)) >> 2), "storing")] = arraySum(isLeapYear(fullDate.getFullYear()) ? MONTH_DAYS_LEAP : MONTH_DAYS_REGULAR, fullDate.getMonth() - 1) + fullDate.getDate() - 1;
-    checkInt32(arraySum(isLeapYear(fullDate.getFullYear()) ? MONTH_DAYS_LEAP : MONTH_DAYS_REGULAR, fullDate.getMonth() - 1) + fullDate.getDate() - 1);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tm) + (32)) >> 2), "storing")] = 0;
-    checkInt32(0);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((tm) + (36)) >> 2), "storing")] = date.gmtoff;
-    checkInt32(date.gmtoff);
-    // we need to convert the matched sequence into an integer array to take care of UTF-8 characters > 0x7F
-    // TODO: not sure that intArrayFromString handles all unicode characters correctly
-    return buf + lengthBytesUTF8(matches[0]);
-  }
-  return 0;
-};
-
-_strptime.sig = "pppp";
-
-var _strptime_l = (buf, format, tm, locale) => _strptime(buf, format, tm);
-
-_strptime_l.sig = "ppppp";
-
-function __mmap_js(len, prot, flags, fd, offset, allocated, addr) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(142, 0, 1, len, prot, flags, fd, offset, allocated, addr);
-  offset = bigintToI53Checked(offset);
-  try {
-    // musl's mmap doesn't allow values over a certain limit
-    // see OFF_MASK in mmap.c.
-    assert(!isNaN(offset));
-    var stream = SYSCALLS.getStreamFromFD(fd);
-    var res = FS.mmap(stream, len, offset, prot, flags);
-    var ptr = res.ptr;
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((allocated) >> 2), "storing")] = res.allocated;
-    checkInt32(res.allocated);
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((addr) >> 2), "storing")] = ptr;
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-__mmap_js.sig = "ipiiijpp";
-
-function __munmap_js(addr, len, prot, flags, fd, offset) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(143, 0, 1, addr, len, prot, flags, fd, offset);
-  offset = bigintToI53Checked(offset);
-  try {
-    var stream = SYSCALLS.getStreamFromFD(fd);
-    if (prot & 2) {
-      SYSCALLS.doMsync(addr, stream, len, flags, offset);
-    }
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-__munmap_js.sig = "ippiiij";
-
-function ___syscall_dup(fd) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(144, 0, 1, fd);
-  try {
-    var old = SYSCALLS.getStreamFromFD(fd);
-    return FS.dupStream(old).fd;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_dup.sig = "ii";
-
-var PIPEFS = {
-  BUCKET_BUFFER_SIZE: 8192,
-  mount(mount) {
-    // Do not pollute the real root directory or its child nodes with pipes
-    // Looks like it is OK to create another pseudo-root node not linked to the FS.root hierarchy this way
-    return FS.createNode(null, "/", 16384 | 511, 0);
-  },
-  createPipe() {
-    var pipe = {
-      buckets: [],
-      // refcnt 2 because pipe has a read end and a write end. We need to be
-      // able to read from the read end after write end is closed.
-      refcnt: 2,
-      timestamp: new Date,
-      readableHandlers: [],
-      registerReadableHandler: callback => {
-        callback.registerCleanupFunc(() => {
-          const i = pipe.readableHandlers.indexOf(callback);
-          if (i !== -1) pipe.readableHandlers.splice(i, 1);
-        });
-        pipe.readableHandlers.push(callback);
-      },
-      notifyReadableHandlers: () => {
-        while (pipe.readableHandlers.length > 0) {
-          const cb = pipe.readableHandlers.shift();
-          if (cb) cb(64 | 1);
-        }
-        pipe.readableHandlers = [];
-      }
-    };
-    pipe.buckets.push({
-      buffer: new Uint8Array(PIPEFS.BUCKET_BUFFER_SIZE),
-      offset: 0,
-      roffset: 0
-    });
-    var rName = PIPEFS.nextname();
-    var wName = PIPEFS.nextname();
-    var rNode = FS.createNode(PIPEFS.root, rName, 4096, 0);
-    var wNode = FS.createNode(PIPEFS.root, wName, 4096, 0);
-    rNode.pipe = pipe;
-    wNode.pipe = pipe;
-    var readableStream = FS.createStream({
-      path: rName,
-      node: rNode,
-      flags: 0,
-      seekable: false,
-      stream_ops: PIPEFS.stream_ops
-    });
-    rNode.stream = readableStream;
-    var writableStream = FS.createStream({
-      path: wName,
-      node: wNode,
-      flags: 1,
-      seekable: false,
-      stream_ops: PIPEFS.stream_ops
-    });
-    wNode.stream = writableStream;
-    return {
-      readable_fd: readableStream.fd,
-      writable_fd: writableStream.fd
-    };
-  },
-  stream_ops: {
-    getattr(stream) {
-      var node = stream.node;
-      var timestamp = node.pipe.timestamp;
-      return {
-        dev: 14,
-        ino: node.id,
-        mode: 4480,
-        nlink: 1,
-        uid: 0,
-        gid: 0,
-        rdev: 0,
-        size: 0,
-        atime: timestamp,
-        mtime: timestamp,
-        ctime: timestamp,
-        blksize: 4096,
-        blocks: 0
-      };
-    },
-    poll(stream, timeout, notifyCallback) {
-      var pipe = stream.node.pipe;
-      if ((stream.flags & 2097155) === 1) {
-        return (256 | 4);
-      }
-      for (var bucket of pipe.buckets) {
-        if (bucket.offset - bucket.roffset > 0) {
-          return (64 | 1);
-        }
-      }
-      if (notifyCallback) pipe.registerReadableHandler(notifyCallback);
-      return 0;
-    },
-    dup(stream) {
-      stream.node.pipe.refcnt++;
-    },
-    ioctl(stream, request, varargs) {
-      return 28;
-    },
-    fsync(stream) {
-      return 28;
-    },
-    read(stream, buffer, offset, length, position) {
-      var pipe = stream.node.pipe;
-      var currentLength = 0;
-      for (var bucket of pipe.buckets) {
-        currentLength += bucket.offset - bucket.roffset;
-      }
-      assert(buffer instanceof ArrayBuffer || buffer instanceof SharedArrayBuffer || ArrayBuffer.isView(buffer));
-      var data = buffer.subarray(offset, offset + length);
-      if (length <= 0) {
-        return 0;
-      }
-      if (currentLength == 0) {
-        // Behave as if the read end is always non-blocking
-        throw new FS.ErrnoError(6);
-      }
-      var toRead = Math.min(currentLength, length);
-      var totalRead = toRead;
-      var toRemove = 0;
-      for (var bucket of pipe.buckets) {
-        var bucketSize = bucket.offset - bucket.roffset;
-        if (toRead <= bucketSize) {
-          var tmpSlice = bucket.buffer.subarray(bucket.roffset, bucket.offset);
-          if (toRead < bucketSize) {
-            tmpSlice = tmpSlice.subarray(0, toRead);
-            bucket.roffset += toRead;
-          } else {
-            toRemove++;
-          }
-          data.set(tmpSlice);
-          break;
-        } else {
-          var tmpSlice = bucket.buffer.subarray(bucket.roffset, bucket.offset);
-          data.set(tmpSlice);
-          data = data.subarray(tmpSlice.byteLength);
-          toRead -= tmpSlice.byteLength;
-          toRemove++;
-        }
-      }
-      if (toRemove && toRemove == pipe.buckets.length) {
-        // Do not generate excessive garbage in use cases such as
-        // write several bytes, read everything, write several bytes, read everything...
-        toRemove--;
-        pipe.buckets[toRemove].offset = 0;
-        pipe.buckets[toRemove].roffset = 0;
-      }
-      pipe.buckets.splice(0, toRemove);
-      return totalRead;
-    },
-    write(stream, buffer, offset, length, position) {
-      var pipe = stream.node.pipe;
-      assert(buffer instanceof ArrayBuffer || buffer instanceof SharedArrayBuffer || ArrayBuffer.isView(buffer));
-      var data = buffer.subarray(offset, offset + length);
-      var dataLen = data.byteLength;
-      if (dataLen <= 0) {
-        return 0;
-      }
-      var currBucket = null;
-      if (pipe.buckets.length == 0) {
-        currBucket = {
-          buffer: new Uint8Array(PIPEFS.BUCKET_BUFFER_SIZE),
-          offset: 0,
-          roffset: 0
-        };
-        pipe.buckets.push(currBucket);
-      } else {
-        currBucket = pipe.buckets[pipe.buckets.length - 1];
-      }
-      assert(currBucket.offset <= PIPEFS.BUCKET_BUFFER_SIZE);
-      var freeBytesInCurrBuffer = PIPEFS.BUCKET_BUFFER_SIZE - currBucket.offset;
-      if (freeBytesInCurrBuffer >= dataLen) {
-        currBucket.buffer.set(data, currBucket.offset);
-        currBucket.offset += dataLen;
-        pipe.notifyReadableHandlers();
-        return dataLen;
-      } else if (freeBytesInCurrBuffer > 0) {
-        currBucket.buffer.set(data.subarray(0, freeBytesInCurrBuffer), currBucket.offset);
-        currBucket.offset += freeBytesInCurrBuffer;
-        data = data.subarray(freeBytesInCurrBuffer, data.byteLength);
-      }
-      var numBuckets = (data.byteLength / PIPEFS.BUCKET_BUFFER_SIZE) | 0;
-      var remElements = data.byteLength % PIPEFS.BUCKET_BUFFER_SIZE;
-      for (var i = 0; i < numBuckets; i++) {
-        var newBucket = {
-          buffer: new Uint8Array(PIPEFS.BUCKET_BUFFER_SIZE),
-          offset: PIPEFS.BUCKET_BUFFER_SIZE,
-          roffset: 0
-        };
-        pipe.buckets.push(newBucket);
-        newBucket.buffer.set(data.subarray(0, PIPEFS.BUCKET_BUFFER_SIZE));
-        data = data.subarray(PIPEFS.BUCKET_BUFFER_SIZE, data.byteLength);
-      }
-      if (remElements > 0) {
-        var newBucket = {
-          buffer: new Uint8Array(PIPEFS.BUCKET_BUFFER_SIZE),
-          offset: data.byteLength,
-          roffset: 0
-        };
-        pipe.buckets.push(newBucket);
-        newBucket.buffer.set(data);
-      }
-      pipe.notifyReadableHandlers();
-      return dataLen;
-    },
-    close(stream) {
-      var pipe = stream.node.pipe;
-      pipe.refcnt--;
-      if (pipe.refcnt === 0) {
-        pipe.buckets = null;
-      }
-    }
-  },
-  nextname() {
-    if (!PIPEFS.nextname.current) {
-      PIPEFS.nextname.current = 0;
-    }
-    return "pipe[" + (PIPEFS.nextname.current++) + "]";
-  }
-};
-
-function ___syscall_pipe(fdPtr) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(145, 0, 1, fdPtr);
-  try {
-    if (fdPtr == 0) {
-      throw new FS.ErrnoError(21);
-    }
-    var res = PIPEFS.createPipe();
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((fdPtr) >> 2), "storing")] = res.readable_fd;
-    checkInt32(res.readable_fd);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((fdPtr) + (4)) >> 2), "storing")] = res.writable_fd;
-    checkInt32(res.writable_fd);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_pipe.sig = "ip";
-
-var SOCKFS = {
-  websocketArgs: {},
-  callbacks: {},
-  on(event, callback) {
-    SOCKFS.callbacks[event] = callback;
-  },
-  emit(event, param) {
-    SOCKFS.callbacks[event]?.(param);
-  },
-  mount(mount) {
-    // The incoming Module['websocket'] can be used for configuring 
-    // subprotocol/url, etc
-    SOCKFS.websocketArgs = Module["websocket"] || {};
-    // Add the Event registration mechanism to the exported websocket configuration
-    // object so we can register network callbacks from native JavaScript too.
-    // For more documentation see system/include/emscripten/emscripten.h
-    (Module["websocket"] ??= {})["on"] = SOCKFS.on;
-    return FS.createNode(null, "/", 16895, 0);
-  },
-  createSocket(family, type, protocol) {
-    // Emscripten only supports AF_INET
-    if (family != 2) {
-      throw new FS.ErrnoError(5);
-    }
-    type &= ~526336;
-    // Some applications may pass it; it makes no sense for a single process.
-    // Emscripten only supports SOCK_STREAM and SOCK_DGRAM
-    if (type != 1 && type != 2) {
-      throw new FS.ErrnoError(28);
-    }
-    var streaming = type == 1;
-    if (streaming && protocol && protocol != 6) {
-      throw new FS.ErrnoError(66);
-    }
-    // create our internal socket structure
-    var sock = {
-      family,
-      type,
-      protocol,
-      server: null,
-      error: null,
-      // Used in getsockopt for SOL_SOCKET/SO_ERROR test
-      peers: {},
-      pending: [],
-      recv_queue: [],
-      sock_ops: SOCKFS.websocket_sock_ops
-    };
-    // create the filesystem node to store the socket structure
-    var name = SOCKFS.nextname();
-    var node = FS.createNode(SOCKFS.root, name, 49152, 0);
-    node.sock = sock;
-    // and the wrapping stream that enables library functions such
-    // as read and write to indirectly interact with the socket
-    var stream = FS.createStream({
-      path: name,
-      node,
-      flags: 2,
-      seekable: false,
-      stream_ops: SOCKFS.stream_ops
-    });
-    // map the new stream to the socket structure (sockets have a 1:1
-    // relationship with a stream)
-    sock.stream = stream;
-    return sock;
-  },
-  getSocket(fd) {
-    var stream = FS.getStream(fd);
-    if (!stream || !FS.isSocket(stream.node.mode)) {
-      return null;
-    }
-    return stream.node.sock;
-  },
-  stream_ops: {
-    poll(stream) {
-      var sock = stream.node.sock;
-      return sock.sock_ops.poll(sock);
-    },
-    ioctl(stream, request, varargs) {
-      var sock = stream.node.sock;
-      return sock.sock_ops.ioctl(sock, request, varargs);
-    },
-    read(stream, buffer, offset, length, position) {
-      var sock = stream.node.sock;
-      var msg = sock.sock_ops.recvmsg(sock, length);
-      if (!msg) {
-        // socket is closed
-        return 0;
-      }
-      buffer.set(msg.buffer, offset);
-      return msg.buffer.length;
-    },
-    write(stream, buffer, offset, length, position) {
-      var sock = stream.node.sock;
-      return sock.sock_ops.sendmsg(sock, buffer, offset, length);
-    },
-    close(stream) {
-      var sock = stream.node.sock;
-      sock.sock_ops.close(sock);
-    }
-  },
-  nextname() {
-    if (!SOCKFS.nextname.current) {
-      SOCKFS.nextname.current = 0;
-    }
-    return `socket[${SOCKFS.nextname.current++}]`;
-  },
-  websocket_sock_ops: {
-    createPeer(sock, addr, port) {
-      var ws;
-      if (typeof addr == "object") {
-        ws = addr;
-        addr = null;
-        port = null;
-      }
-      if (ws) {
-        // for sockets that've already connected (e.g. we're the server)
-        // we can inspect the _socket property for the address
-        if (ws._socket) {
-          addr = ws._socket.remoteAddress;
-          port = ws._socket.remotePort;
-        } else {
-          var result = /ws[s]?:\/\/([^:]+):(\d+)/.exec(ws.url);
-          if (!result) {
-            throw new Error("WebSocket URL must be in the format ws(s)://address:port");
-          }
-          addr = result[1];
-          port = parseInt(result[2], 10);
-        }
-      } else {
-        // create the actual websocket object and connect
-        try {
-          // The default value is 'ws://' the replace is needed because the compiler replaces '//' comments with '#'
-          // comments without checking context, so we'd end up with ws:#, the replace swaps the '#' for '//' again.
-          var url = "ws://".replace("#", "//");
-          // Make the WebSocket subprotocol (Sec-WebSocket-Protocol) default to binary if no configuration is set.
-          var subProtocols = "binary";
-          // The default value is 'binary'
-          // The default WebSocket options
-          var opts = undefined;
-          // Fetch runtime WebSocket URL config.
-          if (SOCKFS.websocketArgs["url"]) {
-            url = SOCKFS.websocketArgs["url"];
-          }
-          // Fetch runtime WebSocket subprotocol config.
-          if (SOCKFS.websocketArgs["subprotocol"]) {
-            subProtocols = SOCKFS.websocketArgs["subprotocol"];
-          } else if (SOCKFS.websocketArgs["subprotocol"] === null) {
-            subProtocols = "null";
-          }
-          if (url === "ws://" || url === "wss://") {
-            // Is the supplied URL config just a prefix, if so complete it.
-            var parts = addr.split("/");
-            url = url + parts[0] + ":" + port + "/" + parts.slice(1).join("/");
-          }
-          if (subProtocols !== "null") {
-            // The regex trims the string (removes spaces at the beginning and end), then splits the string by
-            // <any space>,<any space> into an Array. Whitespace removal is important for Websockify and ws.
-            subProtocols = subProtocols.replace(/^ +| +$/g, "").split(/ *, */);
-            opts = subProtocols;
-          }
-          // If node we use the ws library.
-          var WebSocketConstructor;
-          if (ENVIRONMENT_IS_NODE) {
-            WebSocketConstructor = /** @type{(typeof WebSocket)} */ (require("ws"));
-          } else {
-            WebSocketConstructor = WebSocket;
-          }
-          ws = new WebSocketConstructor(url, opts);
-          ws.binaryType = "arraybuffer";
-        } catch (e) {
-          throw new FS.ErrnoError(23);
-        }
-      }
-      var peer = {
-        addr,
-        port,
-        socket: ws,
-        msg_send_queue: []
-      };
-      SOCKFS.websocket_sock_ops.addPeer(sock, peer);
-      SOCKFS.websocket_sock_ops.handlePeerEvents(sock, peer);
-      // if this is a bound dgram socket, send the port number first to allow
-      // us to override the ephemeral port reported to us by remotePort on the
-      // remote end.
-      if (sock.type === 2 && typeof sock.sport != "undefined") {
-        peer.msg_send_queue.push(new Uint8Array([ 255, 255, 255, 255, "p".charCodeAt(0), "o".charCodeAt(0), "r".charCodeAt(0), "t".charCodeAt(0), ((sock.sport & 65280) >> 8), (sock.sport & 255) ]));
-      }
-      return peer;
-    },
-    getPeer(sock, addr, port) {
-      return sock.peers[addr + ":" + port];
-    },
-    addPeer(sock, peer) {
-      sock.peers[peer.addr + ":" + peer.port] = peer;
-    },
-    removePeer(sock, peer) {
-      delete sock.peers[peer.addr + ":" + peer.port];
-    },
-    handlePeerEvents(sock, peer) {
-      var first = true;
-      var handleOpen = function() {
-        sock.connecting = false;
-        SOCKFS.emit("open", sock.stream.fd);
-        try {
-          var queued = peer.msg_send_queue.shift();
-          while (queued) {
-            peer.socket.send(queued);
-            queued = peer.msg_send_queue.shift();
-          }
-        } catch (e) {
-          // not much we can do here in the way of proper error handling as we've already
-          // lied and said this data was sent. shut it down.
-          peer.socket.close();
-        }
-      };
-      function handleMessage(data) {
-        if (typeof data == "string") {
-          var encoder = new TextEncoder;
-          // should be utf-8
-          data = encoder.encode(data);
-        } else {
-          assert(data.byteLength !== undefined);
-          // must receive an ArrayBuffer
-          if (data.byteLength == 0) {
-            // An empty ArrayBuffer will emit a pseudo disconnect event
-            // as recv/recvmsg will return zero which indicates that a socket
-            // has performed a shutdown although the connection has not been disconnected yet.
-            return;
-          }
-          data = new Uint8Array(data);
-        }
-        // if this is the port message, override the peer's port with it
-        var wasfirst = first;
-        first = false;
-        if (wasfirst && data.length === 10 && data[0] === 255 && data[1] === 255 && data[2] === 255 && data[3] === 255 && data[4] === "p".charCodeAt(0) && data[5] === "o".charCodeAt(0) && data[6] === "r".charCodeAt(0) && data[7] === "t".charCodeAt(0)) {
-          // update the peer's port and its key in the peer map
-          var newport = ((data[8] << 8) | data[9]);
-          SOCKFS.websocket_sock_ops.removePeer(sock, peer);
-          peer.port = newport;
-          SOCKFS.websocket_sock_ops.addPeer(sock, peer);
-          return;
-        }
-        sock.recv_queue.push({
-          addr: peer.addr,
-          port: peer.port,
-          data
-        });
-        SOCKFS.emit("message", sock.stream.fd);
-      }
-      if (ENVIRONMENT_IS_NODE) {
-        peer.socket.on("open", handleOpen);
-        peer.socket.on("message", function(data, isBinary) {
-          if (!isBinary) {
-            return;
-          }
-          handleMessage((new Uint8Array(data)).buffer);
-        });
-        peer.socket.on("close", function() {
-          SOCKFS.emit("close", sock.stream.fd);
-        });
-        peer.socket.on("error", function(error) {
-          // Although the ws library may pass errors that may be more descriptive than
-          // ECONNREFUSED they are not necessarily the expected error code e.g.
-          // ENOTFOUND on getaddrinfo seems to be node.js specific, so using ECONNREFUSED
-          // is still probably the most useful thing to do.
-          sock.error = 14;
-          // Used in getsockopt for SOL_SOCKET/SO_ERROR test.
-          SOCKFS.emit("error", [ sock.stream.fd, sock.error, "ECONNREFUSED: Connection refused" ]);
-        });
-      } else {
-        peer.socket.onopen = handleOpen;
-        peer.socket.onclose = function() {
-          SOCKFS.emit("close", sock.stream.fd);
-        };
-        peer.socket.onmessage = function peer_socket_onmessage(event) {
-          handleMessage(event.data);
-        };
-        peer.socket.onerror = function(error) {
-          // The WebSocket spec only allows a 'simple event' to be thrown on error,
-          // so we only really know as much as ECONNREFUSED.
-          sock.error = 14;
-          // Used in getsockopt for SOL_SOCKET/SO_ERROR test.
-          SOCKFS.emit("error", [ sock.stream.fd, sock.error, "ECONNREFUSED: Connection refused" ]);
-        };
-      }
-    },
-    poll(sock) {
-      if (sock.type === 1 && sock.server) {
-        // listen sockets should only say they're available for reading
-        // if there are pending clients.
-        return sock.pending.length ? (64 | 1) : 0;
-      }
-      var mask = 0;
-      var dest = sock.type === 1 ? // we only care about the socket state for connection-based sockets
-      SOCKFS.websocket_sock_ops.getPeer(sock, sock.daddr, sock.dport) : null;
-      if (sock.recv_queue.length || !dest || // connection-less sockets are always ready to read
-      (dest && dest.socket.readyState === dest.socket.CLOSING) || (dest && dest.socket.readyState === dest.socket.CLOSED)) {
-        // let recv return 0 once closed
-        mask |= (64 | 1);
-      }
-      if (!dest || // connection-less sockets are always ready to write
-      (dest && dest.socket.readyState === dest.socket.OPEN)) {
-        mask |= 4;
-      }
-      if ((dest && dest.socket.readyState === dest.socket.CLOSING) || (dest && dest.socket.readyState === dest.socket.CLOSED)) {
-        // When an non-blocking connect fails mark the socket as writable.
-        // Its up to the calling code to then use getsockopt with SO_ERROR to
-        // retrieve the error.
-        // See https://man7.org/linux/man-pages/man2/connect.2.html
-        if (sock.connecting) {
-          mask |= 4;
-        } else {
-          mask |= 16;
-        }
-      }
-      return mask;
-    },
-    ioctl(sock, request, arg) {
-      switch (request) {
-       case 21531:
-        var bytes = 0;
-        if (sock.recv_queue.length) {
-          bytes = sock.recv_queue[0].data.length;
-        }
-        HEAP32[SAFE_HEAP_INDEX(HEAP32, ((arg) >> 2), "storing")] = bytes;
-        checkInt32(bytes);
-        return 0;
-
-       case 21537:
-        var on = HEAP32[SAFE_HEAP_INDEX(HEAP32, ((arg) >> 2), "loading")];
-        if (on) {
-          sock.stream.flags |= 2048;
-        } else {
-          sock.stream.flags &= ~2048;
-        }
-        return 0;
-
-       default:
-        return 28;
-      }
-    },
-    close(sock) {
-      // if we've spawned a listen server, close it
-      if (sock.server) {
-        try {
-          sock.server.close();
-        } catch (e) {}
-        sock.server = null;
-      }
-      // close any peer connections
-      for (var peer of Object.values(sock.peers)) {
-        try {
-          peer.socket.close();
-        } catch (e) {}
-        SOCKFS.websocket_sock_ops.removePeer(sock, peer);
-      }
-      return 0;
-    },
-    bind(sock, addr, port) {
-      if (typeof sock.saddr != "undefined" || typeof sock.sport != "undefined") {
-        throw new FS.ErrnoError(28);
-      }
-      sock.saddr = addr;
-      sock.sport = port;
-      // in order to emulate dgram sockets, we need to launch a listen server when
-      // binding on a connection-less socket
-      // note: this is only required on the server side
-      if (sock.type === 2) {
-        // close the existing server if it exists
-        if (sock.server) {
-          sock.server.close();
-          sock.server = null;
-        }
-        // swallow error operation not supported error that occurs when binding in the
-        // browser where this isn't supported
-        try {
-          sock.sock_ops.listen(sock, 0);
-        } catch (e) {
-          if (!(e.name === "ErrnoError")) throw e;
-          if (e.errno !== 138) throw e;
-        }
-      }
-    },
-    connect(sock, addr, port) {
-      if (sock.server) {
-        throw new FS.ErrnoError(138);
-      }
-      // TODO autobind
-      // if (!sock.addr && sock.type == 2) {
-      // }
-      // early out if we're already connected / in the middle of connecting
-      if (typeof sock.daddr != "undefined" && typeof sock.dport != "undefined") {
-        var dest = SOCKFS.websocket_sock_ops.getPeer(sock, sock.daddr, sock.dport);
-        if (dest) {
-          if (dest.socket.readyState === dest.socket.CONNECTING) {
-            throw new FS.ErrnoError(7);
-          } else {
-            throw new FS.ErrnoError(30);
-          }
-        }
-      }
-      // add the socket to our peer list and set our
-      // destination address / port to match
-      var peer = SOCKFS.websocket_sock_ops.createPeer(sock, addr, port);
-      sock.daddr = peer.addr;
-      sock.dport = peer.port;
-      // because we cannot synchronously block to wait for the WebSocket
-      // connection to complete, we return here pretending that the connection
-      // was a success.
-      sock.connecting = true;
-    },
-    listen(sock, backlog) {
-      if (!ENVIRONMENT_IS_NODE) {
-        throw new FS.ErrnoError(138);
-      }
-      if (sock.server) {
-        throw new FS.ErrnoError(28);
-      }
-      var WebSocketServer = require("ws").Server;
-      var host = sock.saddr;
-      sock.server = new WebSocketServer({
-        host,
-        port: sock.sport
-      });
-      SOCKFS.emit("listen", sock.stream.fd);
-      // Send Event with listen fd.
-      sock.server.on("connection", function(ws) {
-        if (sock.type === 1) {
-          var newsock = SOCKFS.createSocket(sock.family, sock.type, sock.protocol);
-          // create a peer on the new socket
-          var peer = SOCKFS.websocket_sock_ops.createPeer(newsock, ws);
-          newsock.daddr = peer.addr;
-          newsock.dport = peer.port;
-          // push to queue for accept to pick up
-          sock.pending.push(newsock);
-          SOCKFS.emit("connection", newsock.stream.fd);
-        } else {
-          // create a peer on the listen socket so calling sendto
-          // with the listen socket and an address will resolve
-          // to the correct client
-          SOCKFS.websocket_sock_ops.createPeer(sock, ws);
-          SOCKFS.emit("connection", sock.stream.fd);
-        }
-      });
-      sock.server.on("close", function() {
-        SOCKFS.emit("close", sock.stream.fd);
-        sock.server = null;
-      });
-      sock.server.on("error", function(error) {
-        // Although the ws library may pass errors that may be more descriptive than
-        // ECONNREFUSED they are not necessarily the expected error code e.g.
-        // ENOTFOUND on getaddrinfo seems to be node.js specific, so using EHOSTUNREACH
-        // is still probably the most useful thing to do. This error shouldn't
-        // occur in a well written app as errors should get trapped in the compiled
-        // app's own getaddrinfo call.
-        sock.error = 23;
-        // Used in getsockopt for SOL_SOCKET/SO_ERROR test.
-        SOCKFS.emit("error", [ sock.stream.fd, sock.error, "EHOSTUNREACH: Host is unreachable" ]);
-      });
-    },
-    accept(listensock) {
-      if (!listensock.server || !listensock.pending.length) {
-        throw new FS.ErrnoError(28);
-      }
-      var newsock = listensock.pending.shift();
-      newsock.stream.flags = listensock.stream.flags;
-      return newsock;
-    },
-    getname(sock, peer) {
-      var addr, port;
-      if (peer) {
-        if (sock.daddr === undefined || sock.dport === undefined) {
-          throw new FS.ErrnoError(53);
-        }
-        addr = sock.daddr;
-        port = sock.dport;
-      } else {
-        // TODO saddr and sport will be set for bind()'d UDP sockets, but what
-        // should we be returning for TCP sockets that've been connect()'d?
-        addr = sock.saddr || 0;
-        port = sock.sport || 0;
-      }
-      return {
-        addr,
-        port
-      };
-    },
-    sendmsg(sock, buffer, offset, length, addr, port) {
-      if (sock.type === 2) {
-        // connection-less sockets will honor the message address,
-        // and otherwise fall back to the bound destination address
-        if (addr === undefined || port === undefined) {
-          addr = sock.daddr;
-          port = sock.dport;
-        }
-        // if there was no address to fall back to, error out
-        if (addr === undefined || port === undefined) {
-          throw new FS.ErrnoError(17);
-        }
-      } else {
-        // connection-based sockets will only use the bound
-        addr = sock.daddr;
-        port = sock.dport;
-      }
-      // find the peer for the destination address
-      var dest = SOCKFS.websocket_sock_ops.getPeer(sock, addr, port);
-      // early out if not connected with a connection-based socket
-      if (sock.type === 1) {
-        if (!dest || dest.socket.readyState === dest.socket.CLOSING || dest.socket.readyState === dest.socket.CLOSED) {
-          throw new FS.ErrnoError(53);
-        }
-      }
-      // create a copy of the incoming data to send, as the WebSocket API
-      // doesn't work entirely with an ArrayBufferView, it'll just send
-      // the entire underlying buffer
-      if (ArrayBuffer.isView(buffer)) {
-        offset += buffer.byteOffset;
-        buffer = buffer.buffer;
-      }
-      var data = buffer.slice(offset, offset + length);
-      // WebSockets .send() does not allow passing a SharedArrayBuffer, so
-      // clone the SharedArrayBuffer as regular ArrayBuffer before
-      // sending.
-      if (data instanceof SharedArrayBuffer) {
-        data = new Uint8Array(new Uint8Array(data)).buffer;
-      }
-      // if we don't have a cached connectionless UDP datagram connection, or
-      // the TCP socket is still connecting, queue the message to be sent upon
-      // connect, and lie, saying the data was sent now.
-      if (!dest || dest.socket.readyState !== dest.socket.OPEN) {
-        // if we're not connected, open a new connection
-        if (sock.type === 2) {
-          if (!dest || dest.socket.readyState === dest.socket.CLOSING || dest.socket.readyState === dest.socket.CLOSED) {
-            dest = SOCKFS.websocket_sock_ops.createPeer(sock, addr, port);
-          }
-        }
-        dest.msg_send_queue.push(data);
-        return length;
-      }
-      try {
-        // send the actual data
-        dest.socket.send(data);
-        return length;
-      } catch (e) {
-        throw new FS.ErrnoError(28);
-      }
-    },
-    recvmsg(sock, length) {
-      // http://pubs.opengroup.org/onlinepubs/7908799/xns/recvmsg.html
-      if (sock.type === 1 && sock.server) {
-        // tcp servers should not be recv()'ing on the listen socket
-        throw new FS.ErrnoError(53);
-      }
-      var queued = sock.recv_queue.shift();
-      if (!queued) {
-        if (sock.type === 1) {
-          var dest = SOCKFS.websocket_sock_ops.getPeer(sock, sock.daddr, sock.dport);
-          if (!dest) {
-            // if we have a destination address but are not connected, error out
-            throw new FS.ErrnoError(53);
-          }
-          if (dest.socket.readyState === dest.socket.CLOSING || dest.socket.readyState === dest.socket.CLOSED) {
-            // return null if the socket has closed
-            return null;
-          }
-          // else, our socket is in a valid state but truly has nothing available
-          throw new FS.ErrnoError(6);
-        }
-        throw new FS.ErrnoError(6);
-      }
-      // queued.data will be an ArrayBuffer if it's unadulterated, but if it's
-      // requeued TCP data it'll be an ArrayBufferView
-      var queuedLength = queued.data.byteLength || queued.data.length;
-      var queuedOffset = queued.data.byteOffset || 0;
-      var queuedBuffer = queued.data.buffer || queued.data;
-      var bytesRead = Math.min(length, queuedLength);
-      var res = {
-        buffer: new Uint8Array(queuedBuffer, queuedOffset, bytesRead),
-        addr: queued.addr,
-        port: queued.port
-      };
-      // push back any unread data for TCP connections
-      if (sock.type === 1 && bytesRead < queuedLength) {
-        var bytesRemaining = queuedLength - bytesRead;
-        queued.data = new Uint8Array(queuedBuffer, queuedOffset + bytesRead, bytesRemaining);
-        sock.recv_queue.unshift(queued);
-      }
-      return res;
-    }
-  }
-};
-
-var getSocketFromFD = fd => {
-  var socket = SOCKFS.getSocket(fd);
-  if (!socket) throw new FS.ErrnoError(8);
-  return socket;
-};
-
-var getSocketAddress = (addrp, addrlen) => {
-  var info = readSockaddr(addrp, addrlen);
-  if (info.errno) throw new FS.ErrnoError(info.errno);
-  info.addr = DNS.lookup_addr(info.addr) || info.addr;
-  return info;
-};
-
-function ___syscall_socket(domain, type, protocol) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(146, 0, 1, domain, type, protocol);
-  try {
-    var sock = SOCKFS.createSocket(domain, type, protocol);
-    assert(sock.stream.fd < 64);
-    // XXX ? select() assumes socket fd values are in 0..63
-    return sock.stream.fd;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_socket.sig = "iiiiiii";
-
-function ___syscall_getsockname(fd, addr, addrlen, d1, d2, d3) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(147, 0, 1, fd, addr, addrlen, d1, d2, d3);
-  try {
-    var sock = getSocketFromFD(fd);
-    // TODO: sock.saddr should never be undefined, see TODO in websocket_sock_ops.getname
-    var errno = writeSockaddr(addr, sock.family, DNS.lookup_name(sock.saddr || "0.0.0.0"), sock.sport, addrlen);
-    assert(!errno);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_getsockname.sig = "iippiii";
-
-function ___syscall_getpeername(fd, addr, addrlen, d1, d2, d3) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(148, 0, 1, fd, addr, addrlen, d1, d2, d3);
-  try {
-    var sock = getSocketFromFD(fd);
-    if (!sock.daddr) {
-      return -53;
-    }
-    var errno = writeSockaddr(addr, sock.family, DNS.lookup_name(sock.daddr), sock.dport, addrlen);
-    assert(!errno);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_getpeername.sig = "iippiii";
-
-function ___syscall_connect(fd, addr, addrlen, d1, d2, d3) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(149, 0, 1, fd, addr, addrlen, d1, d2, d3);
-  try {
-    var sock = getSocketFromFD(fd);
-    var info = getSocketAddress(addr, addrlen);
-    sock.sock_ops.connect(sock, info.addr, info.port);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_connect.sig = "iippiii";
-
-function ___syscall_shutdown(fd, how) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(150, 0, 1, fd, how);
-  try {
-    getSocketFromFD(fd);
-    return -52;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_shutdown.sig = "iiiiiii";
-
-function ___syscall_accept4(fd, addr, addrlen, flags, d1, d2) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(151, 0, 1, fd, addr, addrlen, flags, d1, d2);
-  try {
-    var sock = getSocketFromFD(fd);
-    var newsock = sock.sock_ops.accept(sock);
-    if (addr) {
-      var errno = writeSockaddr(addr, newsock.family, DNS.lookup_name(newsock.daddr), newsock.dport, addrlen);
-      assert(!errno);
-    }
-    return newsock.stream.fd;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_accept4.sig = "iippiii";
-
-function ___syscall_bind(fd, addr, addrlen, d1, d2, d3) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(152, 0, 1, fd, addr, addrlen, d1, d2, d3);
-  try {
-    var sock = getSocketFromFD(fd);
-    var info = getSocketAddress(addr, addrlen);
-    sock.sock_ops.bind(sock, info.addr, info.port);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_bind.sig = "iippiii";
-
-function ___syscall_listen(fd, backlog) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(153, 0, 1, fd, backlog);
-  try {
-    var sock = getSocketFromFD(fd);
-    sock.sock_ops.listen(sock, backlog);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_listen.sig = "iiiiiii";
-
-function ___syscall_recvfrom(fd, buf, len, flags, addr, addrlen) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(154, 0, 1, fd, buf, len, flags, addr, addrlen);
-  try {
-    var sock = getSocketFromFD(fd);
-    var msg = sock.sock_ops.recvmsg(sock, len);
-    if (!msg) return 0;
-    // socket is closed
-    if (addr) {
-      var errno = writeSockaddr(addr, sock.family, DNS.lookup_name(msg.addr), msg.port, addrlen);
-      assert(!errno);
-    }
-    HEAPU8.set(msg.buffer, buf);
-    return msg.buffer.byteLength;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_recvfrom.sig = "iippipp";
-
-function ___syscall_sendto(fd, message, length, flags, addr, addr_len) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(155, 0, 1, fd, message, length, flags, addr, addr_len);
-  try {
-    var sock = getSocketFromFD(fd);
-    if (!addr) {
-      // send, no address provided
-      return FS.write(sock.stream, HEAP8, message, length);
-    }
-    var dest = getSocketAddress(addr, addr_len);
-    // sendto an address
-    return sock.sock_ops.sendmsg(sock, HEAP8, message, length, dest.addr, dest.port);
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_sendto.sig = "iippipp";
-
-function ___syscall_getsockopt(fd, level, optname, optval, optlen, d1) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(156, 0, 1, fd, level, optname, optval, optlen, d1);
-  try {
-    var sock = getSocketFromFD(fd);
-    // Minimal getsockopt aimed at resolving https://github.com/emscripten-core/emscripten/issues/2211
-    // so only supports SOL_SOCKET with SO_ERROR.
-    if (level === 1) {
-      if (optname === 4) {
-        HEAP32[SAFE_HEAP_INDEX(HEAP32, ((optval) >> 2), "storing")] = sock.error;
-        checkInt32(sock.error);
-        HEAP32[SAFE_HEAP_INDEX(HEAP32, ((optlen) >> 2), "storing")] = 4;
-        checkInt32(4);
-        sock.error = null;
-        // Clear the error (The SO_ERROR option obtains and then clears this field).
-        return 0;
-      }
-    }
-    return -50;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_getsockopt.sig = "iiiippi";
-
-function ___syscall_sendmsg(fd, message, flags, d1, d2, d3) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(157, 0, 1, fd, message, flags, d1, d2, d3);
-  try {
-    var sock = getSocketFromFD(fd);
-    var iov = HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((message) + (8)) >> 2), "loading")];
-    var num = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((message) + (12)) >> 2), "loading")];
-    // read the address and port to send to
-    var addr, port;
-    var name = HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((message) >> 2), "loading")];
-    var namelen = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((message) + (4)) >> 2), "loading")];
-    if (name) {
-      var info = getSocketAddress(name, namelen);
-      port = info.port;
-      addr = info.addr;
-    }
-    // concatenate scatter-gather arrays into one message buffer
-    var total = 0;
-    for (var i = 0; i < num; i++) {
-      total += HEAP32[SAFE_HEAP_INDEX(HEAP32, (((iov) + ((8 * i) + 4)) >> 2), "loading")];
-    }
-    var view = new Uint8Array(total);
-    var offset = 0;
-    for (var i = 0; i < num; i++) {
-      var iovbase = HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((iov) + ((8 * i) + 0)) >> 2), "loading")];
-      var iovlen = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((iov) + ((8 * i) + 4)) >> 2), "loading")];
-      for (var j = 0; j < iovlen; j++) {
-        view[offset++] = HEAP8[SAFE_HEAP_INDEX(HEAP8, (iovbase) + (j), "loading")];
-      }
-    }
-    // write the buffer
-    return sock.sock_ops.sendmsg(sock, view, 0, total, addr, port);
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_sendmsg.sig = "iipippi";
-
-function ___syscall_recvmsg(fd, message, flags, d1, d2, d3) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(158, 0, 1, fd, message, flags, d1, d2, d3);
-  try {
-    var sock = getSocketFromFD(fd);
-    var iov = HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((message) + (8)) >> 2), "loading")];
-    var num = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((message) + (12)) >> 2), "loading")];
-    // get the total amount of data we can read across all arrays
-    var total = 0;
-    for (var i = 0; i < num; i++) {
-      total += HEAP32[SAFE_HEAP_INDEX(HEAP32, (((iov) + ((8 * i) + 4)) >> 2), "loading")];
-    }
-    // try to read total data
-    var msg = sock.sock_ops.recvmsg(sock, total);
-    if (!msg) return 0;
-    // socket is closed
-    // TODO honor flags:
-    // MSG_OOB
-    // Requests out-of-band data. The significance and semantics of out-of-band data are protocol-specific.
-    // MSG_PEEK
-    // Peeks at the incoming message.
-    // MSG_WAITALL
-    // Requests that the function block until the full amount of data requested can be returned. The function may return a smaller amount of data if a signal is caught, if the connection is terminated, if MSG_PEEK was specified, or if an error is pending for the socket.
-    // write the source address out
-    var name = HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((message) >> 2), "loading")];
-    if (name) {
-      var errno = writeSockaddr(name, sock.family, DNS.lookup_name(msg.addr), msg.port);
-      assert(!errno);
-    }
-    // write the buffer out to the scatter-gather arrays
-    var bytesRead = 0;
-    var bytesRemaining = msg.buffer.byteLength;
-    for (var i = 0; bytesRemaining > 0 && i < num; i++) {
-      var iovbase = HEAPU32[SAFE_HEAP_INDEX(HEAPU32, (((iov) + ((8 * i) + 0)) >> 2), "loading")];
-      var iovlen = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((iov) + ((8 * i) + 4)) >> 2), "loading")];
-      if (!iovlen) {
-        continue;
-      }
-      var length = Math.min(iovlen, bytesRemaining);
-      var buf = msg.buffer.subarray(bytesRead, bytesRead + length);
-      HEAPU8.set(buf, iovbase + bytesRead);
-      bytesRead += length;
-      bytesRemaining -= length;
-    }
-    // TODO set msghdr.msg_flags
-    // MSG_EOR
-    // End of record was received (if supported by the protocol).
-    // MSG_OOB
-    // Out-of-band data was received.
-    // MSG_TRUNC
-    // Normal data was truncated.
-    // MSG_CTRUNC
-    return bytesRead;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_recvmsg.sig = "iipiiii";
-
-function ___syscall_fchdir(fd) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(159, 0, 1, fd);
-  try {
-    var stream = SYSCALLS.getStreamFromFD(fd);
-    FS.chdir(stream.path);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_fchdir.sig = "ii";
-
-function __msync_js(addr, len, prot, flags, fd, offset) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(160, 0, 1, addr, len, prot, flags, fd, offset);
-  offset = bigintToI53Checked(offset);
-  try {
-    if (isNaN(offset)) return -61;
-    SYSCALLS.doMsync(addr, SYSCALLS.getStreamFromFD(fd), len, flags, offset);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-__msync_js.sig = "ippiiij";
-
-function ___syscall_fdatasync(fd) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(161, 0, 1, fd);
-  try {
-    var stream = SYSCALLS.getStreamFromFD(fd);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_fdatasync.sig = "ii";
-
-var ___syscall_poll = function(fds, nfds, timeout) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(162, 0, 2, fds, nfds, timeout);
-  try {
-    const isAsyncContext = PThread.currentProxiedOperationCallerThread;
-    // Enable event handlers only when the poll call is proxied from a worker.
-    // TODO: Could use `Promise.withResolvers` here if we know its available.
-    var resolve;
-    var promise = new Promise(resolve_ => {
-      resolve = resolve_;
-    });
-    var cleanupFuncs = [];
-    var notifyDone = false;
-    function asyncPollComplete(count) {
-      if (notifyDone) {
-        return;
-      }
-      notifyDone = true;
-      cleanupFuncs.forEach(cb => cb());
-      resolve(count);
-    }
-    function makeNotifyCallback(stream, pollfd) {
-      var cb = flags => {
-        if (notifyDone) {
-          return;
-        }
-        var events = HEAP16[SAFE_HEAP_INDEX(HEAP16, (((pollfd) + (4)) >> 1), "loading")];
-        flags &= events | 8 | 16;
-        assert(flags);
-        HEAP16[SAFE_HEAP_INDEX(HEAP16, (((pollfd) + (6)) >> 1), "storing")] = flags;
-        checkInt16(flags);
-        asyncPollComplete(1);
-      };
-      cb.registerCleanupFunc = f => {
-        if (f) cleanupFuncs.push(f);
-      };
-      return cb;
-    }
-    if (isAsyncContext) {
-      if (timeout > 0) {
-        var t = setTimeout(() => {
-          asyncPollComplete(0);
-        }, timeout);
-        cleanupFuncs.push(() => clearTimeout(t));
-      }
-    }
-    var count = 0;
-    for (var i = 0; i < nfds; i++) {
-      var pollfd = fds + 8 * i;
-      var fd = HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pollfd) >> 2), "loading")];
-      var events = HEAP16[SAFE_HEAP_INDEX(HEAP16, (((pollfd) + (4)) >> 1), "loading")];
-      var flags = 32;
-      var stream = FS.getStream(fd);
-      if (stream) {
-        if (stream.stream_ops.poll) {
-          if (isAsyncContext && timeout) {
-            flags = stream.stream_ops.poll(stream, timeout, makeNotifyCallback(stream, pollfd));
-          } else flags = stream.stream_ops.poll(stream, -1);
-        } else {
-          flags = 5;
-        }
-      }
-      flags &= events | 8 | 16;
-      if (flags) count++;
-      HEAP16[SAFE_HEAP_INDEX(HEAP16, (((pollfd) + (6)) >> 1), "storing")] = flags;
-      checkInt16(flags);
-    }
-    if (isAsyncContext) {
-      if (count || !timeout) {
-        asyncPollComplete(count);
-      }
-      return promise;
-    }
-    if (!count && timeout != 0) warnOnce("non-zero poll() timeout not supported: " + timeout);
-    return count;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-};
-
-___syscall_poll.sig = "ipii";
-
-function ___syscall_fchown32(fd, owner, group) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(163, 0, 1, fd, owner, group);
-  try {
-    FS.fchown(fd, owner, group);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_fchown32.sig = "iiii";
-
-var ___syscall_fadvise64 = (fd, offset, len, advice) => 0;
-
-___syscall_fadvise64.sig = "iijji";
-
-function ___syscall_mknodat(dirfd, path, mode, dev) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(164, 0, 1, dirfd, path, mode, dev);
-  try {
-    path = SYSCALLS.getStr(path);
-    path = SYSCALLS.calculateAt(dirfd, path);
-    // we don't want this in the JS API as it uses mknod to create all nodes.
-    switch (mode & 61440) {
-     case 32768:
-     case 8192:
-     case 24576:
-     case 4096:
-     case 49152:
-      break;
-
-     default:
-      return -28;
-    }
-    FS.mknod(path, mode, dev);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_mknodat.sig = "iipii";
-
-function ___syscall_fchownat(dirfd, path, owner, group, flags) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(165, 0, 1, dirfd, path, owner, group, flags);
-  try {
-    path = SYSCALLS.getStr(path);
-    var nofollow = flags & 256;
-    flags = flags & (~256);
-    assert(!flags);
-    path = SYSCALLS.calculateAt(dirfd, path);
-    (nofollow ? FS.lchown : FS.chown)(path, owner, group);
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_fchownat.sig = "iipiii";
-
-function ___syscall_faccessat(dirfd, path, amode, flags) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(166, 0, 1, dirfd, path, amode, flags);
-  try {
-    path = SYSCALLS.getStr(path);
-    assert(!flags || flags == 512);
-    path = SYSCALLS.calculateAt(dirfd, path);
-    if (amode & ~7) {
-      // need a valid mode
-      return -28;
-    }
-    var lookup = FS.lookupPath(path, {
-      follow: true
-    });
-    var node = lookup.node;
-    if (!node) {
-      return -44;
-    }
-    var perms = "";
-    if (amode & 4) perms += "r";
-    if (amode & 2) perms += "w";
-    if (amode & 1) perms += "x";
-    if (perms && FS.nodePermissions(node, perms)) {
-      return -2;
-    }
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_faccessat.sig = "iipii";
-
-function ___syscall_fallocate(fd, mode, offset, len) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(167, 0, 1, fd, mode, offset, len);
-  offset = bigintToI53Checked(offset);
-  len = bigintToI53Checked(len);
-  try {
-    if (isNaN(offset) || isNaN(len)) return -61;
-    if (mode != 0) {
-      return -138;
-    }
-    if (offset < 0 || len < 0) {
-      return -28;
-    }
-    // We only support mode == 0, which means we can implement fallocate
-    // in terms of ftruncate.
-    var oldSize = FS.fstat(fd).size;
-    var newSize = offset + len;
-    if (newSize > oldSize) {
-      FS.ftruncate(fd, newSize);
-    }
-    return 0;
-  } catch (e) {
-    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-    return -e.errno;
-  }
-}
-
-___syscall_fallocate.sig = "iiijj";
-
-var FS_readFile = (...args) => FS.readFile(...args);
-
-var FS_root = (...args) => FS.root(...args);
-
-var FS_mounts = (...args) => FS.mounts(...args);
-
-var FS_devices = (...args) => FS.devices(...args);
-
-var FS_streams = (...args) => FS.streams(...args);
-
-var FS_nextInode = (...args) => FS.nextInode(...args);
-
-var FS_nameTable = (...args) => FS.nameTable(...args);
-
-var FS_currentPath = (...args) => FS.currentPath(...args);
-
-var FS_initialized = (...args) => FS.initialized(...args);
-
-var FS_ignorePermissions = (...args) => FS.ignorePermissions(...args);
-
-var FS_filesystems = (...args) => FS.filesystems(...args);
-
-var FS_syncFSRequests = (...args) => FS.syncFSRequests(...args);
-
-var FS_lookupPath = (...args) => FS.lookupPath(...args);
-
-var FS_getPath = (...args) => FS.getPath(...args);
-
-var FS_hashName = (...args) => FS.hashName(...args);
-
-var FS_hashAddNode = (...args) => FS.hashAddNode(...args);
-
-var FS_hashRemoveNode = (...args) => FS.hashRemoveNode(...args);
-
-var FS_lookupNode = (...args) => FS.lookupNode(...args);
-
-var FS_createNode = (...args) => FS.createNode(...args);
-
-var FS_destroyNode = (...args) => FS.destroyNode(...args);
-
-var FS_isRoot = (...args) => FS.isRoot(...args);
-
-var FS_isMountpoint = (...args) => FS.isMountpoint(...args);
-
-var FS_isFile = (...args) => FS.isFile(...args);
-
-var FS_isDir = (...args) => FS.isDir(...args);
-
-var FS_isLink = (...args) => FS.isLink(...args);
-
-var FS_isChrdev = (...args) => FS.isChrdev(...args);
-
-var FS_isBlkdev = (...args) => FS.isBlkdev(...args);
-
-var FS_isFIFO = (...args) => FS.isFIFO(...args);
-
-var FS_isSocket = (...args) => FS.isSocket(...args);
-
-var FS_flagsToPermissionString = (...args) => FS.flagsToPermissionString(...args);
-
-var FS_nodePermissions = (...args) => FS.nodePermissions(...args);
-
-var FS_mayLookup = (...args) => FS.mayLookup(...args);
-
-var FS_mayCreate = (...args) => FS.mayCreate(...args);
-
-var FS_mayDelete = (...args) => FS.mayDelete(...args);
-
-var FS_mayOpen = (...args) => FS.mayOpen(...args);
-
-var FS_checkOpExists = (...args) => FS.checkOpExists(...args);
-
-var FS_nextfd = (...args) => FS.nextfd(...args);
-
-var FS_getStreamChecked = (...args) => FS.getStreamChecked(...args);
-
-var FS_getStream = (...args) => FS.getStream(...args);
-
-var FS_createStream = (...args) => FS.createStream(...args);
-
-var FS_closeStream = (...args) => FS.closeStream(...args);
-
-var FS_dupStream = (...args) => FS.dupStream(...args);
-
-var FS_doSetAttr = (...args) => FS.doSetAttr(...args);
-
-var FS_chrdev_stream_ops = (...args) => FS.chrdev_stream_ops(...args);
-
-var FS_major = (...args) => FS.major(...args);
-
-var FS_minor = (...args) => FS.minor(...args);
-
-var FS_makedev = (...args) => FS.makedev(...args);
-
-var FS_registerDevice = (...args) => FS.registerDevice(...args);
-
-var FS_getDevice = (...args) => FS.getDevice(...args);
-
-var FS_getMounts = (...args) => FS.getMounts(...args);
-
-var FS_syncfs = (...args) => FS.syncfs(...args);
-
-var FS_mount = (...args) => FS.mount(...args);
-
-var FS_unmount = (...args) => FS.unmount(...args);
-
-var FS_lookup = (...args) => FS.lookup(...args);
-
-var FS_mknod = (...args) => FS.mknod(...args);
-
-var FS_statfs = (...args) => FS.statfs(...args);
-
-var FS_statfsStream = (...args) => FS.statfsStream(...args);
-
-var FS_statfsNode = (...args) => FS.statfsNode(...args);
-
-var FS_create = (...args) => FS.create(...args);
-
-var FS_mkdir = (...args) => FS.mkdir(...args);
-
-var FS_mkdev = (...args) => FS.mkdev(...args);
-
-var FS_symlink = (...args) => FS.symlink(...args);
-
-var FS_rename = (...args) => FS.rename(...args);
-
-var FS_rmdir = (...args) => FS.rmdir(...args);
-
-var FS_readdir = (...args) => FS.readdir(...args);
-
-var FS_readlink = (...args) => FS.readlink(...args);
-
-var FS_stat = (...args) => FS.stat(...args);
-
-var FS_fstat = (...args) => FS.fstat(...args);
-
-var FS_lstat = (...args) => FS.lstat(...args);
-
-var FS_doChmod = (...args) => FS.doChmod(...args);
-
-var FS_chmod = (...args) => FS.chmod(...args);
-
-var FS_lchmod = (...args) => FS.lchmod(...args);
-
-var FS_fchmod = (...args) => FS.fchmod(...args);
-
-var FS_doChown = (...args) => FS.doChown(...args);
-
-var FS_chown = (...args) => FS.chown(...args);
-
-var FS_lchown = (...args) => FS.lchown(...args);
-
-var FS_fchown = (...args) => FS.fchown(...args);
-
-var FS_doTruncate = (...args) => FS.doTruncate(...args);
-
-var FS_truncate = (...args) => FS.truncate(...args);
-
-var FS_ftruncate = (...args) => FS.ftruncate(...args);
-
-var FS_utime = (...args) => FS.utime(...args);
-
-var FS_open = (...args) => FS.open(...args);
-
-var FS_close = (...args) => FS.close(...args);
-
-var FS_isClosed = (...args) => FS.isClosed(...args);
-
-var FS_llseek = (...args) => FS.llseek(...args);
-
-var FS_read = (...args) => FS.read(...args);
-
-var FS_write = (...args) => FS.write(...args);
-
-var FS_mmap = (...args) => FS.mmap(...args);
-
-var FS_msync = (...args) => FS.msync(...args);
-
-var FS_ioctl = (...args) => FS.ioctl(...args);
-
-var FS_writeFile = (...args) => FS.writeFile(...args);
-
-var FS_cwd = (...args) => FS.cwd(...args);
-
-var FS_chdir = (...args) => FS.chdir(...args);
-
-var FS_createDefaultDirectories = (...args) => FS.createDefaultDirectories(...args);
-
-var FS_createDefaultDevices = (...args) => FS.createDefaultDevices(...args);
-
-var FS_createSpecialDirectories = (...args) => FS.createSpecialDirectories(...args);
-
-var FS_createStandardStreams = (...args) => FS.createStandardStreams(...args);
-
-var FS_staticInit = (...args) => FS.staticInit(...args);
-
-var FS_init = (...args) => FS.init(...args);
-
-var FS_quit = (...args) => FS.quit(...args);
-
-var FS_findObject = (...args) => FS.findObject(...args);
-
-var FS_analyzePath = (...args) => FS.analyzePath(...args);
-
-var FS_createFile = (...args) => FS.createFile(...args);
-
-var FS_forceLoadFile = (...args) => FS.forceLoadFile(...args);
-
-var FS_absolutePath = (...args) => FS.absolutePath(...args);
-
-var FS_createFolder = (...args) => FS.createFolder(...args);
-
-var FS_createLink = (...args) => FS.createLink(...args);
-
-var FS_joinPath = (...args) => FS.joinPath(...args);
-
-var FS_mmapAlloc = (...args) => FS.mmapAlloc(...args);
-
-var FS_standardizePath = (...args) => FS.standardizePath(...args);
-
-var _setNetworkCallback = (event, userData, callback) => {
-  function _callback(data) {
-    callUserCallback(() => {
-      if (event === "error") {
-        withStackSave(() => {
-          var msg = stringToUTF8OnStack(data[2]);
-          getWasmTableEntry(callback)(data[0], data[1], msg, userData);
-        });
-      } else {
-        getWasmTableEntry(callback)(data, userData);
-      }
-    });
-  }
-  // FIXME(sbc): This has no corresponding Pop so will currently keep the
-  // runtime alive indefinitely.
-  runtimeKeepalivePush();
-  SOCKFS.on(event, callback ? _callback : null);
-};
-
-var _emscripten_set_socket_error_callback = (userData, callback) => _setNetworkCallback("error", userData, callback);
-
-_emscripten_set_socket_error_callback.sig = "vpp";
-
-var _emscripten_set_socket_open_callback = (userData, callback) => _setNetworkCallback("open", userData, callback);
-
-_emscripten_set_socket_open_callback.sig = "vpp";
-
-var _emscripten_set_socket_listen_callback = (userData, callback) => _setNetworkCallback("listen", userData, callback);
-
-_emscripten_set_socket_listen_callback.sig = "vpp";
-
-var _emscripten_set_socket_connection_callback = (userData, callback) => _setNetworkCallback("connection", userData, callback);
-
-_emscripten_set_socket_connection_callback.sig = "vpp";
-
-var _emscripten_set_socket_message_callback = (userData, callback) => _setNetworkCallback("message", userData, callback);
-
-_emscripten_set_socket_message_callback.sig = "vpp";
-
-var _emscripten_set_socket_close_callback = (userData, callback) => _setNetworkCallback("close", userData, callback);
-
-_emscripten_set_socket_close_callback.sig = "vpp";
-
-var _emscripten_webgl_enable_ANGLE_instanced_arrays = ctx => webgl_enable_ANGLE_instanced_arrays(GL.contexts[ctx].GLctx);
-
-_emscripten_webgl_enable_ANGLE_instanced_arrays.sig = "ip";
-
-var _emscripten_webgl_enable_OES_vertex_array_object = ctx => webgl_enable_OES_vertex_array_object(GL.contexts[ctx].GLctx);
-
-_emscripten_webgl_enable_OES_vertex_array_object.sig = "ip";
-
-var _emscripten_webgl_enable_WEBGL_draw_buffers = ctx => webgl_enable_WEBGL_draw_buffers(GL.contexts[ctx].GLctx);
-
-_emscripten_webgl_enable_WEBGL_draw_buffers.sig = "ip";
-
-var _emscripten_webgl_enable_WEBGL_multi_draw = ctx => webgl_enable_WEBGL_multi_draw(GL.contexts[ctx].GLctx);
-
-_emscripten_webgl_enable_WEBGL_multi_draw.sig = "ip";
-
-var _emscripten_webgl_enable_EXT_polygon_offset_clamp = ctx => webgl_enable_EXT_polygon_offset_clamp(GL.contexts[ctx].GLctx);
-
-_emscripten_webgl_enable_EXT_polygon_offset_clamp.sig = "ip";
-
-var _emscripten_webgl_enable_EXT_clip_control = ctx => webgl_enable_EXT_clip_control(GL.contexts[ctx].GLctx);
-
-_emscripten_webgl_enable_EXT_clip_control.sig = "ip";
-
-var _emscripten_webgl_enable_WEBGL_polygon_mode = ctx => webgl_enable_WEBGL_polygon_mode(GL.contexts[ctx].GLctx);
-
-_emscripten_webgl_enable_WEBGL_polygon_mode.sig = "ip";
-
-var _glGetString = _emscripten_glGetString;
-
-_glGetString.sig = "pi";
-
-var _glGetIntegerv = _emscripten_glGetIntegerv;
-
-_glGetIntegerv.sig = "vip";
-
-var _glGetFloatv = _emscripten_glGetFloatv;
-
-_glGetFloatv.sig = "vip";
-
-var _glGetBooleanv = _emscripten_glGetBooleanv;
-
-_glGetBooleanv.sig = "vip";
-
-var _glDeleteTextures = _emscripten_glDeleteTextures;
-
-_glDeleteTextures.sig = "vip";
-
-var _glCompressedTexImage2D = _emscripten_glCompressedTexImage2D;
-
-_glCompressedTexImage2D.sig = "viiiiiiip";
-
-var _glCompressedTexSubImage2D = _emscripten_glCompressedTexSubImage2D;
-
-_glCompressedTexSubImage2D.sig = "viiiiiiiip";
-
-var _glReadPixels = _emscripten_glReadPixels;
-
-_glReadPixels.sig = "viiiiiip";
-
-var _glGetTexParameterfv = _emscripten_glGetTexParameterfv;
-
-_glGetTexParameterfv.sig = "viip";
-
-var _glGetTexParameteriv = _emscripten_glGetTexParameteriv;
-
-_glGetTexParameteriv.sig = "viip";
-
-var _glTexParameterfv = _emscripten_glTexParameterfv;
-
-_glTexParameterfv.sig = "viip";
-
-var _glTexParameteriv = _emscripten_glTexParameteriv;
-
-_glTexParameteriv.sig = "viip";
-
-var _glIsTexture = _emscripten_glIsTexture;
-
-_glIsTexture.sig = "ii";
-
-var _glDeleteBuffers = _emscripten_glDeleteBuffers;
-
-_glDeleteBuffers.sig = "vip";
-
-var _glGetBufferParameteriv = _emscripten_glGetBufferParameteriv;
-
-_glGetBufferParameteriv.sig = "viip";
-
-var _glGenQueriesEXT = _emscripten_glGenQueriesEXT;
-
-var _glDeleteQueriesEXT = _emscripten_glDeleteQueriesEXT;
-
-var _glIsQueryEXT = _emscripten_glIsQueryEXT;
-
-var _glBeginQueryEXT = _emscripten_glBeginQueryEXT;
-
-var _glEndQueryEXT = _emscripten_glEndQueryEXT;
-
-var _glQueryCounterEXT = _emscripten_glQueryCounterEXT;
-
-var _glGetQueryivEXT = _emscripten_glGetQueryivEXT;
-
-var _glGetQueryObjectuivEXT = _emscripten_glGetQueryObjectuivEXT;
-
-var _glGetQueryObjectui64vEXT = _emscripten_glGetQueryObjectui64vEXT;
-
-var _glIsBuffer = _emscripten_glIsBuffer;
-
-_glIsBuffer.sig = "ii";
-
-var _glGenRenderbuffers = _emscripten_glGenRenderbuffers;
-
-_glGenRenderbuffers.sig = "vip";
-
-var _glDeleteRenderbuffers = _emscripten_glDeleteRenderbuffers;
-
-_glDeleteRenderbuffers.sig = "vip";
-
-var _glBindRenderbuffer = _emscripten_glBindRenderbuffer;
-
-_glBindRenderbuffer.sig = "vii";
-
-var _glGetRenderbufferParameteriv = _emscripten_glGetRenderbufferParameteriv;
-
-_glGetRenderbufferParameteriv.sig = "viip";
-
-var _glIsRenderbuffer = _emscripten_glIsRenderbuffer;
-
-_glIsRenderbuffer.sig = "ii";
-
-var _glGetUniformfv = _emscripten_glGetUniformfv;
-
-_glGetUniformfv.sig = "viip";
-
-var _glGetUniformiv = _emscripten_glGetUniformiv;
-
-_glGetUniformiv.sig = "viip";
-
-var _glGetVertexAttribfv = _emscripten_glGetVertexAttribfv;
-
-_glGetVertexAttribfv.sig = "viip";
-
-var _glGetVertexAttribiv = _emscripten_glGetVertexAttribiv;
-
-_glGetVertexAttribiv.sig = "viip";
-
-var _glGetVertexAttribPointerv = _emscripten_glGetVertexAttribPointerv;
-
-_glGetVertexAttribPointerv.sig = "viip";
-
-var _glUniform3f = _emscripten_glUniform3f;
-
-_glUniform3f.sig = "vifff";
-
-var _glUniform4f = _emscripten_glUniform4f;
-
-_glUniform4f.sig = "viffff";
-
-var _glUniform2i = _emscripten_glUniform2i;
-
-_glUniform2i.sig = "viii";
-
-var _glUniform3i = _emscripten_glUniform3i;
-
-_glUniform3i.sig = "viiii";
-
-var _glUniform4i = _emscripten_glUniform4i;
-
-_glUniform4i.sig = "viiiii";
-
-var _glUniform1iv = _emscripten_glUniform1iv;
-
-_glUniform1iv.sig = "viip";
-
-var _glUniform2iv = _emscripten_glUniform2iv;
-
-_glUniform2iv.sig = "viip";
-
-var _glUniform3iv = _emscripten_glUniform3iv;
-
-_glUniform3iv.sig = "viip";
-
-var _glUniform4iv = _emscripten_glUniform4iv;
-
-_glUniform4iv.sig = "viip";
-
-var _glUniform1fv = _emscripten_glUniform1fv;
-
-_glUniform1fv.sig = "viip";
-
-var _glUniform2fv = _emscripten_glUniform2fv;
-
-_glUniform2fv.sig = "viip";
-
-var _glUniform3fv = _emscripten_glUniform3fv;
-
-_glUniform3fv.sig = "viip";
-
-var _glUniform4fv = _emscripten_glUniform4fv;
-
-_glUniform4fv.sig = "viip";
-
-var _glUniformMatrix2fv = _emscripten_glUniformMatrix2fv;
-
-_glUniformMatrix2fv.sig = "viiip";
-
-var _glUniformMatrix3fv = _emscripten_glUniformMatrix3fv;
-
-_glUniformMatrix3fv.sig = "viiip";
-
-var _glUniformMatrix4fv = _emscripten_glUniformMatrix4fv;
-
-_glUniformMatrix4fv.sig = "viiip";
-
-var _glVertexAttrib1fv = _emscripten_glVertexAttrib1fv;
-
-_glVertexAttrib1fv.sig = "vip";
-
-var _glVertexAttrib2fv = _emscripten_glVertexAttrib2fv;
-
-_glVertexAttrib2fv.sig = "vip";
-
-var _glVertexAttrib3fv = _emscripten_glVertexAttrib3fv;
-
-_glVertexAttrib3fv.sig = "vip";
-
-var _glVertexAttrib4fv = _emscripten_glVertexAttrib4fv;
-
-_glVertexAttrib4fv.sig = "vip";
-
-var _glGetAttribLocation = _emscripten_glGetAttribLocation;
-
-_glGetAttribLocation.sig = "iip";
-
-var _glGetActiveAttrib = _emscripten_glGetActiveAttrib;
-
-_glGetActiveAttrib.sig = "viiipppp";
-
-var _glGetActiveUniform = _emscripten_glGetActiveUniform;
-
-_glGetActiveUniform.sig = "viiipppp";
-
-var _glGetAttachedShaders = _emscripten_glGetAttachedShaders;
-
-_glGetAttachedShaders.sig = "viipp";
-
-var _glGetShaderSource = _emscripten_glGetShaderSource;
-
-_glGetShaderSource.sig = "viipp";
-
-var _glIsShader = _emscripten_glIsShader;
-
-_glIsShader.sig = "ii";
-
-var _glDeleteProgram = _emscripten_glDeleteProgram;
-
-_glDeleteProgram.sig = "vi";
-
-var _glDetachShader = _emscripten_glDetachShader;
-
-_glDetachShader.sig = "vii";
-
-var _glGetShaderPrecisionFormat = _emscripten_glGetShaderPrecisionFormat;
-
-_glGetShaderPrecisionFormat.sig = "viipp";
-
-var _glValidateProgram = _emscripten_glValidateProgram;
-
-_glValidateProgram.sig = "vi";
-
-var _glIsProgram = _emscripten_glIsProgram;
-
-_glIsProgram.sig = "ii";
-
-var _glBindFramebuffer = _emscripten_glBindFramebuffer;
-
-_glBindFramebuffer.sig = "vii";
-
-var _glGenFramebuffers = _emscripten_glGenFramebuffers;
-
-_glGenFramebuffers.sig = "vip";
-
-var _glDeleteFramebuffers = _emscripten_glDeleteFramebuffers;
-
-_glDeleteFramebuffers.sig = "vip";
-
-var _glFramebufferRenderbuffer = _emscripten_glFramebufferRenderbuffer;
-
-_glFramebufferRenderbuffer.sig = "viiii";
-
-var _glFramebufferTexture2D = _emscripten_glFramebufferTexture2D;
-
-_glFramebufferTexture2D.sig = "viiiii";
-
-var _glGetFramebufferAttachmentParameteriv = _emscripten_glGetFramebufferAttachmentParameteriv;
-
-_glGetFramebufferAttachmentParameteriv.sig = "viiip";
-
-var _glIsFramebuffer = _emscripten_glIsFramebuffer;
-
-_glIsFramebuffer.sig = "ii";
-
-var _emscripten_glVertexPointer = (size, type, stride, ptr) => abort("Legacy GL function (glVertexPointer) called. If you want legacy GL emulation, you need to compile with -sLEGACY_GL_EMULATION to enable legacy GL emulation.");
-
-_emscripten_glVertexPointer.sig = "viiip";
-
-var _glVertexPointer = _emscripten_glVertexPointer;
-
-_glVertexPointer.sig = "viiip";
-
-var _emscripten_glMatrixMode = () => abort("Legacy GL function (glMatrixMode) called. If you want legacy GL emulation, you need to compile with -sLEGACY_GL_EMULATION to enable legacy GL emulation.");
-
-_emscripten_glMatrixMode.sig = "vi";
-
-var _glMatrixMode = _emscripten_glMatrixMode;
-
-_glMatrixMode.sig = "vi";
-
-var _emscripten_glBegin = () => abort("Legacy GL function (glBegin) called. If you want legacy GL emulation, you need to compile with -sLEGACY_GL_EMULATION to enable legacy GL emulation.");
-
-_emscripten_glBegin.sig = "vi";
-
-var _glBegin = _emscripten_glBegin;
-
-_glBegin.sig = "vi";
-
-var _emscripten_glLoadIdentity = () => abort("Legacy GL function (glLoadIdentity) called. If you want legacy GL emulation, you need to compile with -sLEGACY_GL_EMULATION to enable legacy GL emulation.");
-
-_emscripten_glLoadIdentity.sig = "v";
-
-var _glLoadIdentity = _emscripten_glLoadIdentity;
-
-_glLoadIdentity.sig = "v";
-
-var _glGenVertexArraysOES = _emscripten_glGenVertexArraysOES;
-
-_glGenVertexArraysOES.sig = "vip";
-
-var _glDeleteVertexArraysOES = _emscripten_glDeleteVertexArraysOES;
-
-_glDeleteVertexArraysOES.sig = "vip";
-
-var _glBindVertexArrayOES = _emscripten_glBindVertexArrayOES;
-
-_glBindVertexArrayOES.sig = "vi";
-
-var _glIsVertexArrayOES = _emscripten_glIsVertexArrayOES;
-
-_glIsVertexArrayOES.sig = "ii";
-
-var _glDisableVertexAttribArray = _emscripten_glDisableVertexAttribArray;
-
-_glDisableVertexAttribArray.sig = "vi";
-
-var _glDrawElements = _emscripten_glDrawElements;
-
-_glDrawElements.sig = "viiip";
-
-var _glShaderBinary = _emscripten_glShaderBinary;
-
-_glShaderBinary.sig = "vipipi";
-
-var _glReleaseShaderCompiler = _emscripten_glReleaseShaderCompiler;
-
-_glReleaseShaderCompiler.sig = "v";
-
-var _glGetError = _emscripten_glGetError;
-
-_glGetError.sig = "i";
-
-var _emscripten_glVertexAttribDivisorNV = _glVertexAttribDivisor;
-
-var _glVertexAttribDivisorNV = _emscripten_glVertexAttribDivisorNV;
-
-var _emscripten_glDrawArraysInstancedNV = _glDrawArraysInstanced;
-
-var _glDrawArraysInstancedNV = _emscripten_glDrawArraysInstancedNV;
-
-var _emscripten_glDrawElementsInstancedNV = _glDrawElementsInstanced;
-
-var _glDrawElementsInstancedNV = _emscripten_glDrawElementsInstancedNV;
-
-var _emscripten_glVertexAttribDivisorEXT = _glVertexAttribDivisor;
-
-var _glVertexAttribDivisorEXT = _emscripten_glVertexAttribDivisorEXT;
-
-var _emscripten_glDrawArraysInstancedEXT = _glDrawArraysInstanced;
-
-var _glDrawArraysInstancedEXT = _emscripten_glDrawArraysInstancedEXT;
-
-var _emscripten_glDrawElementsInstancedEXT = _glDrawElementsInstanced;
-
-var _glDrawElementsInstancedEXT = _emscripten_glDrawElementsInstancedEXT;
-
-var _emscripten_glVertexAttribDivisorARB = _glVertexAttribDivisor;
-
-var _glVertexAttribDivisorARB = _emscripten_glVertexAttribDivisorARB;
-
-var _emscripten_glDrawArraysInstancedARB = _glDrawArraysInstanced;
-
-var _glDrawArraysInstancedARB = _emscripten_glDrawArraysInstancedARB;
-
-var _emscripten_glDrawElementsInstancedARB = _glDrawElementsInstanced;
-
-var _glDrawElementsInstancedARB = _emscripten_glDrawElementsInstancedARB;
-
-var _glVertexAttribDivisorANGLE = _emscripten_glVertexAttribDivisorANGLE;
-
-var _glDrawArraysInstancedANGLE = _emscripten_glDrawArraysInstancedANGLE;
-
-var _glDrawElementsInstancedANGLE = _emscripten_glDrawElementsInstancedANGLE;
-
-var _emscripten_glDrawBuffersEXT = _glDrawBuffers;
-
-var _glDrawBuffersEXT = _emscripten_glDrawBuffersEXT;
-
-var _glDrawBuffersWEBGL = _emscripten_glDrawBuffersWEBGL;
-
-var _glColorMask = _emscripten_glColorMask;
-
-_glColorMask.sig = "viiii";
-
-var _glDepthMask = _emscripten_glDepthMask;
-
-_glDepthMask.sig = "vi";
-
-var _glSampleCoverage = _emscripten_glSampleCoverage;
-
-_glSampleCoverage.sig = "vfi";
-
-var _emscripten_glMultiDrawArraysWEBGL = (mode, firsts, counts, drawcount) => {
-  GLctx.multiDrawWebgl["multiDrawArraysWEBGL"](mode, HEAP32, ((firsts) >> 2), HEAP32, ((counts) >> 2), drawcount);
-};
-
-_emscripten_glMultiDrawArraysWEBGL.sig = "vippi";
-
-var _glMultiDrawArraysWEBGL = _emscripten_glMultiDrawArraysWEBGL;
-
-var _emscripten_glMultiDrawArrays = _glMultiDrawArraysWEBGL;
-
-_emscripten_glMultiDrawArrays.sig = "vippi";
-
-var _glMultiDrawArrays = _emscripten_glMultiDrawArrays;
-
-_glMultiDrawArrays.sig = "vippi";
-
-var _emscripten_glMultiDrawArraysANGLE = _glMultiDrawArraysWEBGL;
-
-var _glMultiDrawArraysANGLE = _emscripten_glMultiDrawArraysANGLE;
-
-var _emscripten_glMultiDrawArraysInstancedWEBGL = (mode, firsts, counts, instanceCounts, drawcount) => {
-  GLctx.multiDrawWebgl["multiDrawArraysInstancedWEBGL"](mode, HEAP32, ((firsts) >> 2), HEAP32, ((counts) >> 2), HEAP32, ((instanceCounts) >> 2), drawcount);
-};
-
-_emscripten_glMultiDrawArraysInstancedWEBGL.sig = "vipppi";
-
-var _glMultiDrawArraysInstancedWEBGL = _emscripten_glMultiDrawArraysInstancedWEBGL;
-
-var _emscripten_glMultiDrawArraysInstancedANGLE = _glMultiDrawArraysInstancedWEBGL;
-
-var _glMultiDrawArraysInstancedANGLE = _emscripten_glMultiDrawArraysInstancedANGLE;
-
-var _emscripten_glMultiDrawElementsWEBGL = (mode, counts, type, offsets, drawcount) => {
-  GLctx.multiDrawWebgl["multiDrawElementsWEBGL"](mode, HEAP32, ((counts) >> 2), type, HEAP32, ((offsets) >> 2), drawcount);
-};
-
-_emscripten_glMultiDrawElementsWEBGL.sig = "vipipi";
-
-var _glMultiDrawElementsWEBGL = _emscripten_glMultiDrawElementsWEBGL;
-
-var _emscripten_glMultiDrawElements = _glMultiDrawElementsWEBGL;
-
-_emscripten_glMultiDrawElements.sig = "vipipi";
-
-var _glMultiDrawElements = _emscripten_glMultiDrawElements;
-
-_glMultiDrawElements.sig = "vipipi";
-
-var _emscripten_glMultiDrawElementsANGLE = _glMultiDrawElementsWEBGL;
-
-var _glMultiDrawElementsANGLE = _emscripten_glMultiDrawElementsANGLE;
-
-var _emscripten_glMultiDrawElementsInstancedWEBGL = (mode, counts, type, offsets, instanceCounts, drawcount) => {
-  GLctx.multiDrawWebgl["multiDrawElementsInstancedWEBGL"](mode, HEAP32, ((counts) >> 2), type, HEAP32, ((offsets) >> 2), HEAP32, ((instanceCounts) >> 2), drawcount);
-};
-
-_emscripten_glMultiDrawElementsInstancedWEBGL.sig = "vipippi";
-
-var _glMultiDrawElementsInstancedWEBGL = _emscripten_glMultiDrawElementsInstancedWEBGL;
-
-var _emscripten_glMultiDrawElementsInstancedANGLE = _glMultiDrawElementsInstancedWEBGL;
-
-var _glMultiDrawElementsInstancedANGLE = _emscripten_glMultiDrawElementsInstancedANGLE;
-
-var _glPolygonOffsetClampEXT = _emscripten_glPolygonOffsetClampEXT;
-
-var _glClipControlEXT = _emscripten_glClipControlEXT;
-
-var _glPolygonModeWEBGL = _emscripten_glPolygonModeWEBGL;
-
-var _glFinish = _emscripten_glFinish;
-
-_glFinish.sig = "v";
-
-var _glFlush = _emscripten_glFlush;
-
-_glFlush.sig = "v";
-
-var _emscripten_glClearDepth = x0 => GLctx.clearDepth(x0);
-
-_emscripten_glClearDepth.sig = "vd";
-
-var _glClearDepth = _emscripten_glClearDepth;
-
-_glClearDepth.sig = "vd";
-
-var _glClearDepthf = _emscripten_glClearDepthf;
-
-_glClearDepthf.sig = "vf";
-
-var _glDepthFunc = _emscripten_glDepthFunc;
-
-_glDepthFunc.sig = "vi";
-
-var _glEnable = _emscripten_glEnable;
-
-_glEnable.sig = "vi";
-
-var _glDisable = _emscripten_glDisable;
-
-_glDisable.sig = "vi";
-
-var _glFrontFace = _emscripten_glFrontFace;
-
-_glFrontFace.sig = "vi";
-
-var _glCullFace = _emscripten_glCullFace;
-
-_glCullFace.sig = "vi";
-
-var _glLineWidth = _emscripten_glLineWidth;
-
-_glLineWidth.sig = "vf";
-
-var _glClearStencil = _emscripten_glClearStencil;
-
-_glClearStencil.sig = "vi";
-
-var _glStencilMask = _emscripten_glStencilMask;
-
-_glStencilMask.sig = "vi";
-
-var _glCheckFramebufferStatus = _emscripten_glCheckFramebufferStatus;
-
-_glCheckFramebufferStatus.sig = "ii";
-
-var _glGenerateMipmap = _emscripten_glGenerateMipmap;
-
-_glGenerateMipmap.sig = "vi";
-
-var _glBlendEquation = _emscripten_glBlendEquation;
-
-_glBlendEquation.sig = "vi";
-
-var _glIsEnabled = _emscripten_glIsEnabled;
-
-_glIsEnabled.sig = "ii";
-
-var _glBlendFunc = _emscripten_glBlendFunc;
-
-_glBlendFunc.sig = "vii";
-
-var _glBlendEquationSeparate = _emscripten_glBlendEquationSeparate;
-
-_glBlendEquationSeparate.sig = "vii";
-
-var _emscripten_glDepthRange = (x0, x1) => GLctx.depthRange(x0, x1);
-
-_emscripten_glDepthRange.sig = "vdd";
-
-var _glDepthRange = _emscripten_glDepthRange;
-
-_glDepthRange.sig = "vdd";
-
-var _glDepthRangef = _emscripten_glDepthRangef;
-
-_glDepthRangef.sig = "vff";
-
-var _glStencilMaskSeparate = _emscripten_glStencilMaskSeparate;
-
-_glStencilMaskSeparate.sig = "vii";
-
-var _glHint = _emscripten_glHint;
-
-_glHint.sig = "vii";
-
-var _glPolygonOffset = _emscripten_glPolygonOffset;
-
-_glPolygonOffset.sig = "vff";
-
-var _glVertexAttrib1f = _emscripten_glVertexAttrib1f;
-
-_glVertexAttrib1f.sig = "vif";
-
-var _glTexParameterf = _emscripten_glTexParameterf;
-
-_glTexParameterf.sig = "viif";
-
-var _glVertexAttrib2f = _emscripten_glVertexAttrib2f;
-
-_glVertexAttrib2f.sig = "viff";
-
-var _glStencilFunc = _emscripten_glStencilFunc;
-
-_glStencilFunc.sig = "viii";
-
-var _glStencilOp = _emscripten_glStencilOp;
-
-_glStencilOp.sig = "viii";
-
-var _glViewport = _emscripten_glViewport;
-
-_glViewport.sig = "viiii";
-
-var _glClearColor = _emscripten_glClearColor;
-
-_glClearColor.sig = "vffff";
-
-var _glScissor = _emscripten_glScissor;
-
-_glScissor.sig = "viiii";
-
-var _glVertexAttrib3f = _emscripten_glVertexAttrib3f;
-
-_glVertexAttrib3f.sig = "vifff";
-
-var _glRenderbufferStorage = _emscripten_glRenderbufferStorage;
-
-_glRenderbufferStorage.sig = "viiii";
-
-var _glBlendFuncSeparate = _emscripten_glBlendFuncSeparate;
-
-_glBlendFuncSeparate.sig = "viiii";
-
-var _glBlendColor = _emscripten_glBlendColor;
-
-_glBlendColor.sig = "vffff";
-
-var _glStencilFuncSeparate = _emscripten_glStencilFuncSeparate;
-
-_glStencilFuncSeparate.sig = "viiii";
-
-var _glStencilOpSeparate = _emscripten_glStencilOpSeparate;
-
-_glStencilOpSeparate.sig = "viiii";
-
-var _glVertexAttrib4f = _emscripten_glVertexAttrib4f;
-
-_glVertexAttrib4f.sig = "viffff";
-
-var _glCopyTexImage2D = _emscripten_glCopyTexImage2D;
-
-_glCopyTexImage2D.sig = "viiiiiiii";
-
-var _glCopyTexSubImage2D = _emscripten_glCopyTexSubImage2D;
-
-_glCopyTexSubImage2D.sig = "viiiiiiii";
-
-var writeGLArray = (arr, dst, dstLength, heapType) => {
-  assert(arr);
-  assert(typeof arr.length != "undefined");
-  var len = arr.length;
-  var writeLength = dstLength < len ? dstLength : len;
-  var heap = heapType ? HEAPF32 : HEAP32;
-  // Works because HEAPF32 and HEAP32 have the same bytes-per-element
-  dst = ((dst) >> 2);
-  for (var i = 0; i < writeLength; ++i) {
-    heap[dst + i] = arr[i];
-  }
-  return len;
-};
-
-var webglPowerPreferences = [ "default", "low-power", "high-performance" ];
-
-var _emscripten_webgl_do_create_context = (target, attributes) => {
-  assert(attributes);
-  var attr32 = ((attributes) >> 2);
-  var powerPreference = HEAP32[SAFE_HEAP_INDEX(HEAP32, attr32 + (8 >> 2), "loading")];
-  var contextAttributes = {
-    "alpha": !!HEAP8[SAFE_HEAP_INDEX(HEAP8, attributes + 0, "loading")],
-    "depth": !!HEAP8[SAFE_HEAP_INDEX(HEAP8, attributes + 1, "loading")],
-    "stencil": !!HEAP8[SAFE_HEAP_INDEX(HEAP8, attributes + 2, "loading")],
-    "antialias": !!HEAP8[SAFE_HEAP_INDEX(HEAP8, attributes + 3, "loading")],
-    "premultipliedAlpha": !!HEAP8[SAFE_HEAP_INDEX(HEAP8, attributes + 4, "loading")],
-    "preserveDrawingBuffer": !!HEAP8[SAFE_HEAP_INDEX(HEAP8, attributes + 5, "loading")],
-    "powerPreference": webglPowerPreferences[powerPreference],
-    "failIfMajorPerformanceCaveat": !!HEAP8[SAFE_HEAP_INDEX(HEAP8, attributes + 12, "loading")],
-    // The following are not predefined WebGL context attributes in the WebGL specification, so the property names can be minified by Closure.
-    majorVersion: HEAP32[SAFE_HEAP_INDEX(HEAP32, attr32 + (16 >> 2), "loading")],
-    minorVersion: HEAP32[SAFE_HEAP_INDEX(HEAP32, attr32 + (20 >> 2), "loading")],
-    enableExtensionsByDefault: HEAP8[SAFE_HEAP_INDEX(HEAP8, attributes + 24, "loading")],
-    explicitSwapControl: HEAP8[SAFE_HEAP_INDEX(HEAP8, attributes + 25, "loading")],
-    proxyContextToMainThread: HEAP32[SAFE_HEAP_INDEX(HEAP32, attr32 + (28 >> 2), "loading")],
-    renderViaOffscreenBackBuffer: HEAP8[SAFE_HEAP_INDEX(HEAP8, attributes + 32, "loading")]
-  };
-  //  TODO: Make these into hard errors at some point in the future
-  if (contextAttributes.majorVersion !== 1 && contextAttributes.majorVersion !== 2) {
-    err(`Invalid WebGL version requested: ${contextAttributes.majorVersion}`);
-  }
-  if (contextAttributes.majorVersion !== 1) {
-    err("WebGL 2 requested but only WebGL 1 is supported (set -sMAX_WEBGL_VERSION=2 to fix the problem)");
-  }
-  var canvas = findCanvasEventTarget(target);
-  if (!canvas) {
-    return 0;
-  }
-  if (contextAttributes.explicitSwapControl) {
-    return 0;
-  }
-  var contextHandle = GL.createContext(canvas, contextAttributes);
-  return contextHandle;
-};
-
-_emscripten_webgl_do_create_context.sig = "ppp";
-
-var _emscripten_webgl_create_context = _emscripten_webgl_do_create_context;
-
-_emscripten_webgl_create_context.sig = "ppp";
-
-var _emscripten_webgl_do_get_current_context = () => GL.currentContext ? GL.currentContext.handle : 0;
-
-_emscripten_webgl_do_get_current_context.sig = "p";
-
-var _emscripten_webgl_get_current_context = _emscripten_webgl_do_get_current_context;
-
-_emscripten_webgl_get_current_context.sig = "p";
-
-var _emscripten_webgl_do_commit_frame = () => {
-  if (!GL.currentContext || !GL.currentContext.GLctx) {
-    return -3;
-  }
-  if (!GL.currentContext.attributes.explicitSwapControl) {
-    return -3;
-  }
-  // We would do GL.currentContext.GLctx.commit(); here, but the current implementation
-  // in browsers has removed it - swap is implicit, so this function is a no-op for now
-  // (until/unless the spec changes).
-  return 0;
-};
-
-_emscripten_webgl_do_commit_frame.sig = "i";
-
-var _emscripten_webgl_commit_frame = _emscripten_webgl_do_commit_frame;
-
-_emscripten_webgl_commit_frame.sig = "i";
-
-var _emscripten_webgl_make_context_current = contextHandle => {
-  var success = GL.makeContextCurrent(contextHandle);
-  return success ? 0 : -5;
-};
-
-_emscripten_webgl_make_context_current.sig = "ip";
-
-var _emscripten_webgl_get_drawing_buffer_size = (contextHandle, width, height) => {
-  var GLContext = GL.getContext(contextHandle);
-  if (!GLContext || !GLContext.GLctx || !width || !height) {
-    return -5;
-  }
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, ((width) >> 2), "storing")] = GLContext.GLctx.drawingBufferWidth;
-  checkInt32(GLContext.GLctx.drawingBufferWidth);
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, ((height) >> 2), "storing")] = GLContext.GLctx.drawingBufferHeight;
-  checkInt32(GLContext.GLctx.drawingBufferHeight);
-  return 0;
-};
-
-_emscripten_webgl_get_drawing_buffer_size.sig = "ippp";
-
-var _emscripten_webgl_get_context_attributes = (c, a) => {
-  if (!a) return -5;
-  c = GL.contexts[c];
-  if (!c) return -3;
-  var t = c.GLctx?.getContextAttributes();
-  if (!t) return -3;
-  HEAP8[SAFE_HEAP_INDEX(HEAP8, a, "storing")] = t.alpha;
-  checkInt8(t.alpha);
-  HEAP8[SAFE_HEAP_INDEX(HEAP8, (a) + (1), "storing")] = t.depth;
-  checkInt8(t.depth);
-  HEAP8[SAFE_HEAP_INDEX(HEAP8, (a) + (2), "storing")] = t.stencil;
-  checkInt8(t.stencil);
-  HEAP8[SAFE_HEAP_INDEX(HEAP8, (a) + (3), "storing")] = t.antialias;
-  checkInt8(t.antialias);
-  HEAP8[SAFE_HEAP_INDEX(HEAP8, (a) + (4), "storing")] = t.premultipliedAlpha;
-  checkInt8(t.premultipliedAlpha);
-  HEAP8[SAFE_HEAP_INDEX(HEAP8, (a) + (5), "storing")] = t.preserveDrawingBuffer;
-  checkInt8(t.preserveDrawingBuffer);
-  var power = t["powerPreference"] && webglPowerPreferences.indexOf(t["powerPreference"]);
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, (((a) + (8)) >> 2), "storing")] = power;
-  checkInt32(power);
-  HEAP8[SAFE_HEAP_INDEX(HEAP8, (a) + (12), "storing")] = t.failIfMajorPerformanceCaveat;
-  checkInt8(t.failIfMajorPerformanceCaveat);
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, (((a) + (16)) >> 2), "storing")] = c.version;
-  checkInt32(c.version);
-  HEAP32[SAFE_HEAP_INDEX(HEAP32, (((a) + (20)) >> 2), "storing")] = 0;
-  checkInt32(0);
-  HEAP8[SAFE_HEAP_INDEX(HEAP8, (a) + (24), "storing")] = c.attributes.enableExtensionsByDefault;
-  checkInt8(c.attributes.enableExtensionsByDefault);
-  return 0;
-};
-
-_emscripten_webgl_get_context_attributes.sig = "ipp";
-
-var _emscripten_webgl_destroy_context = contextHandle => {
-  if (GL.currentContext == contextHandle) GL.currentContext = 0;
-  GL.deleteContext(contextHandle);
-};
-
-_emscripten_webgl_destroy_context.sig = "ip";
-
-var emscripten_webgl_destroy_context_before_on_calling_thread = contextHandle => {
-  if (_emscripten_webgl_get_current_context() == contextHandle) _emscripten_webgl_make_context_current(0);
-};
-
-var _emscripten_webgl_enable_extension = (contextHandle, extension) => {
-  var context = GL.getContext(contextHandle);
-  var extString = UTF8ToString(extension);
-  if (extString.startsWith("GL_")) extString = extString.slice(3);
-  // Allow enabling extensions both with "GL_" prefix and without.
-  // Switch-board that pulls in code for all GL extensions, even if those are not used :/
-  // Build with -sGL_SUPPORT_SIMPLE_ENABLE_EXTENSIONS=0 to avoid this.
-  // Obtain function entry points to WebGL 1 extension related functions.
-  if (extString == "ANGLE_instanced_arrays") webgl_enable_ANGLE_instanced_arrays(GLctx);
-  if (extString == "OES_vertex_array_object") webgl_enable_OES_vertex_array_object(GLctx);
-  if (extString == "WEBGL_draw_buffers") webgl_enable_WEBGL_draw_buffers(GLctx);
-  if (extString == "WEBGL_multi_draw") webgl_enable_WEBGL_multi_draw(GLctx);
-  if (extString == "EXT_polygon_offset_clamp") webgl_enable_EXT_polygon_offset_clamp(GLctx);
-  if (extString == "EXT_clip_control") webgl_enable_EXT_clip_control(GLctx);
-  if (extString == "WEBGL_polygon_mode") webgl_enable_WEBGL_polygon_mode(GLctx);
-  var ext = context.GLctx.getExtension(extString);
-  return !!ext;
-};
-
-_emscripten_webgl_enable_extension.sig = "ipp";
-
-var _emscripten_supports_offscreencanvas = () => // TODO: Add a new build mode, e.g. OFFSCREENCANVAS_SUPPORT=2, which
-// necessitates OffscreenCanvas support at build time, and "return 1;" here in that build mode.
-0;
-
-_emscripten_supports_offscreencanvas.sig = "i";
-
-var registerWebGlEventCallback = (target, userData, useCapture, callbackfunc, eventTypeId, eventTypeString, targetThread) => {
-  targetThread = JSEvents.getTargetThreadForEventCallback(targetThread);
-  var webGlEventHandlerFunc = e => {
-    if (targetThread) __emscripten_run_callback_on_thread(targetThread, callbackfunc, eventTypeId, 0, userData); else if (getWasmTableEntry(callbackfunc)(eventTypeId, 0, userData)) e.preventDefault();
-  };
-  var eventHandler = {
-    target: findEventTarget(target),
-    eventTypeString,
-    eventTypeId,
-    userData,
-    callbackfunc,
-    handlerFunc: webGlEventHandlerFunc,
-    useCapture
-  };
-  JSEvents.registerOrRemoveHandler(eventHandler);
-};
-
-function _emscripten_set_webglcontextlost_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(168, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
-  registerWebGlEventCallback(target, userData, useCapture, callbackfunc, 31, "webglcontextlost", targetThread);
-  return 0;
-}
-
-_emscripten_set_webglcontextlost_callback_on_thread.sig = "ippipp";
-
-function _emscripten_set_webglcontextrestored_callback_on_thread(target, userData, useCapture, callbackfunc, targetThread) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(169, 0, 1, target, userData, useCapture, callbackfunc, targetThread);
-  registerWebGlEventCallback(target, userData, useCapture, callbackfunc, 32, "webglcontextrestored", targetThread);
-  return 0;
-}
-
-_emscripten_set_webglcontextrestored_callback_on_thread.sig = "ippipp";
-
-var _emscripten_is_webgl_context_lost = contextHandle => !GL.contexts[contextHandle] || GL.contexts[contextHandle].GLctx.isContextLost();
-
-_emscripten_is_webgl_context_lost.sig = "ip";
-
-var _emscripten_webgl_get_supported_extensions = () => stringToNewUTF8(GLctx.getSupportedExtensions().join(" "));
-
-_emscripten_webgl_get_supported_extensions.sig = "p";
-
-var _emscripten_webgl_get_program_parameter_d = (program, param) => GLctx.getProgramParameter(GL.programs[program], param);
-
-_emscripten_webgl_get_program_parameter_d.sig = "dii";
-
-var _emscripten_webgl_get_program_info_log_utf8 = program => stringToNewUTF8(GLctx.getProgramInfoLog(GL.programs[program]));
-
-_emscripten_webgl_get_program_info_log_utf8.sig = "pi";
-
-var _emscripten_webgl_get_shader_parameter_d = (shader, param) => GLctx.getShaderParameter(GL.shaders[shader], param);
-
-_emscripten_webgl_get_shader_parameter_d.sig = "dii";
-
-var _emscripten_webgl_get_shader_info_log_utf8 = shader => stringToNewUTF8(GLctx.getShaderInfoLog(GL.shaders[shader]));
-
-_emscripten_webgl_get_shader_info_log_utf8.sig = "pi";
-
-var _emscripten_webgl_get_shader_source_utf8 = shader => stringToNewUTF8(GLctx.getShaderSource(GL.shaders[shader]));
-
-_emscripten_webgl_get_shader_source_utf8.sig = "pi";
-
-var _emscripten_webgl_get_vertex_attrib_d = (index, param) => GLctx.getVertexAttrib(index, param);
-
-_emscripten_webgl_get_vertex_attrib_d.sig = "dii";
-
-var _emscripten_webgl_get_vertex_attrib_o = (index, param) => {
-  var obj = GLctx.getVertexAttrib(index, param);
-  return obj?.name;
-};
-
-_emscripten_webgl_get_vertex_attrib_o.sig = "iii";
-
-var _emscripten_webgl_get_vertex_attrib_v = (index, param, dst, dstLength, dstType) => writeGLArray(GLctx.getVertexAttrib(index, param), dst, dstLength, dstType);
-
-_emscripten_webgl_get_vertex_attrib_v.sig = "iiipii";
-
-var _emscripten_webgl_get_uniform_d = (program, location) => GLctx.getUniform(GL.programs[program], webglGetUniformLocation(location));
-
-_emscripten_webgl_get_uniform_d.sig = "dii";
-
-var _emscripten_webgl_get_uniform_v = (program, location, dst, dstLength, dstType) => writeGLArray(GLctx.getUniform(GL.programs[program], webglGetUniformLocation(location)), dst, dstLength, dstType);
-
-_emscripten_webgl_get_uniform_v.sig = "iiipii";
-
-var _emscripten_webgl_get_parameter_v = (param, dst, dstLength, dstType) => writeGLArray(GLctx.getParameter(param), dst, dstLength, dstType);
-
-_emscripten_webgl_get_parameter_v.sig = "iipii";
-
-var _emscripten_webgl_get_parameter_d = param => GLctx.getParameter(param);
-
-_emscripten_webgl_get_parameter_d.sig = "di";
-
-var _emscripten_webgl_get_parameter_o = param => {
-  var obj = GLctx.getParameter(param);
-  return obj?.name;
-};
-
-_emscripten_webgl_get_parameter_o.sig = "ii";
-
-var _emscripten_webgl_get_parameter_utf8 = param => stringToNewUTF8(GLctx.getParameter(param));
-
-_emscripten_webgl_get_parameter_utf8.sig = "pi";
-
-var _emscripten_webgl_get_parameter_i64v = (param, dst) => writeI53ToI64(dst, GLctx.getParameter(param));
-
-_emscripten_webgl_get_parameter_i64v.sig = "vip";
-
-var AL = {
-  QUEUE_INTERVAL: 25,
-  QUEUE_LOOKAHEAD: .1,
-  DEVICE_NAME: "Emscripten OpenAL",
-  CAPTURE_DEVICE_NAME: "Emscripten OpenAL capture",
-  ALC_EXTENSIONS: {
-    ALC_EXT_capture: true,
-    ALC_SOFT_pause_device: true,
-    ALC_SOFT_HRTF: true
-  },
-  AL_EXTENSIONS: {
-    AL_EXT_float32: true,
-    AL_SOFT_loop_points: true,
-    AL_SOFT_source_length: true,
-    AL_EXT_source_distance_model: true,
-    AL_SOFT_source_spatialize: true
-  },
-  _alcErr: 0,
-  alcErr: 0,
-  deviceRefCounts: {},
-  alcStringCache: {},
-  paused: false,
-  stringCache: {},
-  contexts: {},
-  currentCtx: null,
-  buffers: {
-    0: {
-      id: 0,
-      refCount: 0,
-      audioBuf: null,
-      frequency: 0,
-      bytesPerSample: 2,
-      channels: 1,
-      length: 0
-    }
-  },
-  paramArray: [],
-  _nextId: 1,
-  newId: () => AL.freeIds.length > 0 ? AL.freeIds.pop() : AL._nextId++,
-  freeIds: [],
-  scheduleContextAudio: ctx => {
-    // If we are animating using the requestAnimationFrame method, then the main loop does not run when in the background.
-    // To give a perfect glitch-free audio stop when switching from foreground to background, we need to avoid updating
-    // audio altogether when in the background, so detect that case and kill audio buffer streaming if so.
-    if (MainLoop.timingMode === 1 && document["visibilityState"] != "visible") {
-      return;
-    }
-    for (var i in ctx.sources) {
-      AL.scheduleSourceAudio(ctx.sources[i]);
-    }
-  },
-  scheduleSourceAudio: (src, lookahead) => {
-    // See comment on scheduleContextAudio above.
-    if (MainLoop.timingMode === 1 && document["visibilityState"] != "visible") {
-      return;
-    }
-    if (src.state !== 4114) {
-      return;
-    }
-    var currentTime = AL.updateSourceTime(src);
-    var startTime = src.bufStartTime;
-    var startOffset = src.bufOffset;
-    var bufCursor = src.bufsProcessed;
-    // Advance past any audio that is already scheduled
-    for (var i = 0; i < src.audioQueue.length; i++) {
-      var audioSrc = src.audioQueue[i];
-      startTime = audioSrc._startTime + audioSrc._duration;
-      startOffset = 0;
-      bufCursor += audioSrc._skipCount + 1;
-    }
-    if (!lookahead) {
-      lookahead = AL.QUEUE_LOOKAHEAD;
-    }
-    var lookaheadTime = currentTime + lookahead;
-    var skipCount = 0;
-    while (startTime < lookaheadTime) {
-      if (bufCursor >= src.bufQueue.length) {
-        if (src.looping) {
-          bufCursor %= src.bufQueue.length;
-        } else {
-          break;
-        }
-      }
-      var buf = src.bufQueue[bufCursor % src.bufQueue.length];
-      // If the buffer contains no data, skip it
-      if (buf.length === 0) {
-        skipCount++;
-        // If we've gone through the whole queue and everything is 0 length, just give up
-        if (skipCount === src.bufQueue.length) {
-          break;
-        }
-      } else {
-        var audioSrc = src.context.audioCtx.createBufferSource();
-        audioSrc.buffer = buf.audioBuf;
-        audioSrc.playbackRate.value = src.playbackRate;
-        if (buf.audioBuf._loopStart || buf.audioBuf._loopEnd) {
-          audioSrc.loopStart = buf.audioBuf._loopStart;
-          audioSrc.loopEnd = buf.audioBuf._loopEnd;
-        }
-        var duration = 0;
-        // If the source is a looping static buffer, use native looping for gapless playback
-        if (src.type === 4136 && src.looping) {
-          duration = Number.POSITIVE_INFINITY;
-          audioSrc.loop = true;
-          if (buf.audioBuf._loopStart) {
-            audioSrc.loopStart = buf.audioBuf._loopStart;
-          }
-          if (buf.audioBuf._loopEnd) {
-            audioSrc.loopEnd = buf.audioBuf._loopEnd;
-          }
-        } else {
-          duration = (buf.audioBuf.duration - startOffset) / src.playbackRate;
-        }
-        audioSrc._startOffset = startOffset;
-        audioSrc._duration = duration;
-        audioSrc._skipCount = skipCount;
-        skipCount = 0;
-        audioSrc.connect(src.gain);
-        if (typeof audioSrc.start != "undefined") {
-          // Sample the current time as late as possible to mitigate drift
-          startTime = Math.max(startTime, src.context.audioCtx.currentTime);
-          audioSrc.start(startTime, startOffset);
-        } else if (typeof audioSrc.noteOn != "undefined") {
-          startTime = Math.max(startTime, src.context.audioCtx.currentTime);
-          audioSrc.noteOn(startTime);
-        }
-        audioSrc._startTime = startTime;
-        src.audioQueue.push(audioSrc);
-        startTime += duration;
-      }
-      startOffset = 0;
-      bufCursor++;
-    }
-  },
-  updateSourceTime: src => {
-    var currentTime = src.context.audioCtx.currentTime;
-    if (src.state !== 4114) {
-      return currentTime;
-    }
-    // if the start time is unset, determine it based on the current offset.
-    // This will be the case when a source is resumed after being paused, and
-    // allows us to pretend that the source actually started playing some time
-    // in the past such that it would just now have reached the stored offset.
-    if (!isFinite(src.bufStartTime)) {
-      src.bufStartTime = currentTime - src.bufOffset / src.playbackRate;
-      src.bufOffset = 0;
-    }
-    var nextStartTime = 0;
-    while (src.audioQueue.length) {
-      var audioSrc = src.audioQueue[0];
-      src.bufsProcessed += audioSrc._skipCount;
-      nextStartTime = audioSrc._startTime + audioSrc._duration;
-      // n.b. audioSrc._duration already factors in playbackRate, so no divide by src.playbackRate on it.
-      if (currentTime < nextStartTime) {
-        break;
-      }
-      src.audioQueue.shift();
-      src.bufStartTime = nextStartTime;
-      src.bufOffset = 0;
-      src.bufsProcessed++;
-    }
-    if (src.bufsProcessed >= src.bufQueue.length && !src.looping) {
-      // The source has played its entire queue and is non-looping, so just mark it as stopped.
-      AL.setSourceState(src, 4116);
-    } else if (src.type === 4136 && src.looping) {
-      // If the source is a looping static buffer, determine the buffer offset based on the loop points
-      var buf = src.bufQueue[0];
-      if (buf.length === 0) {
-        src.bufOffset = 0;
-      } else {
-        var delta = (currentTime - src.bufStartTime) * src.playbackRate;
-        var loopStart = buf.audioBuf._loopStart || 0;
-        var loopEnd = buf.audioBuf._loopEnd || buf.audioBuf.duration;
-        if (loopEnd <= loopStart) {
-          loopEnd = buf.audioBuf.duration;
-        }
-        if (delta < loopEnd) {
-          src.bufOffset = delta;
-        } else {
-          src.bufOffset = loopStart + (delta - loopStart) % (loopEnd - loopStart);
-        }
-      }
-    } else if (src.audioQueue[0]) {
-      // The source is still actively playing, so we just need to calculate where we are in the current buffer
-      // so it can be remembered if the source gets paused.
-      src.bufOffset = (currentTime - src.audioQueue[0]._startTime) * src.playbackRate;
-    } else {
-      // The source hasn't finished yet, but there is no scheduled audio left for it. This can be because
-      // the source has just been started/resumed, or due to an underrun caused by a long blocking operation.
-      // We need to determine what state we would be in by this point in time so that when we next schedule
-      // audio playback, it will be just as if no underrun occurred.
-      if (src.type !== 4136 && src.looping) {
-        // if the source is a looping buffer queue, let's first calculate the queue duration, so we can
-        // quickly fast forward past any full loops of the queue and only worry about the remainder.
-        var srcDuration = AL.sourceDuration(src) / src.playbackRate;
-        if (srcDuration > 0) {
-          src.bufStartTime += Math.floor((currentTime - src.bufStartTime) / srcDuration) * srcDuration;
-        }
-      }
-      // Since we've already skipped any full-queue loops if there were any, we just need to find
-      // out where in the queue the remaining time puts us, which won't require stepping through the
-      // entire queue more than once.
-      for (var i = 0; i < src.bufQueue.length; i++) {
-        if (src.bufsProcessed >= src.bufQueue.length) {
-          if (src.looping) {
-            src.bufsProcessed %= src.bufQueue.length;
-          } else {
-            AL.setSourceState(src, 4116);
-            break;
-          }
-        }
-        var buf = src.bufQueue[src.bufsProcessed];
-        if (buf.length > 0) {
-          nextStartTime = src.bufStartTime + buf.audioBuf.duration / src.playbackRate;
-          if (currentTime < nextStartTime) {
-            src.bufOffset = (currentTime - src.bufStartTime) * src.playbackRate;
-            break;
-          }
-          src.bufStartTime = nextStartTime;
-        }
-        src.bufOffset = 0;
-        src.bufsProcessed++;
-      }
-    }
-    return currentTime;
-  },
-  cancelPendingSourceAudio: src => {
-    AL.updateSourceTime(src);
-    for (var i = 1; i < src.audioQueue.length; i++) {
-      var audioSrc = src.audioQueue[i];
-      audioSrc.stop();
-    }
-    if (src.audioQueue.length > 1) {
-      src.audioQueue.length = 1;
-    }
-  },
-  stopSourceAudio: src => {
-    for (var i = 0; i < src.audioQueue.length; i++) {
-      src.audioQueue[i].stop();
-    }
-    src.audioQueue.length = 0;
-  },
-  setSourceState: (src, state) => {
-    if (state === 4114) {
-      if (src.state === 4114 || src.state == 4116) {
-        src.bufsProcessed = 0;
-        src.bufOffset = 0;
-      } else {}
-      AL.stopSourceAudio(src);
-      src.state = 4114;
-      src.bufStartTime = Number.NEGATIVE_INFINITY;
-      AL.scheduleSourceAudio(src);
-    } else if (state === 4115) {
-      if (src.state === 4114) {
-        // Store off the current offset to restore with on resume.
-        AL.updateSourceTime(src);
-        AL.stopSourceAudio(src);
-        src.state = 4115;
-      }
-    } else if (state === 4116) {
-      if (src.state !== 4113) {
-        src.state = 4116;
-        src.bufsProcessed = src.bufQueue.length;
-        src.bufStartTime = Number.NEGATIVE_INFINITY;
-        src.bufOffset = 0;
-        AL.stopSourceAudio(src);
-      }
-    } else if (state === 4113) {
-      if (src.state !== 4113) {
-        src.state = 4113;
-        src.bufsProcessed = 0;
-        src.bufStartTime = Number.NEGATIVE_INFINITY;
-        src.bufOffset = 0;
-        AL.stopSourceAudio(src);
-      }
-    }
-  },
-  initSourcePanner: src => {
-    if (src.type === 4144) {
-      return;
-    }
-    // Find the first non-zero buffer in the queue to determine the proper format
-    var templateBuf = AL.buffers[0];
-    for (var i = 0; i < src.bufQueue.length; i++) {
-      if (src.bufQueue[i].id !== 0) {
-        templateBuf = src.bufQueue[i];
-        break;
-      }
-    }
-    // Create a panner if AL_SOURCE_SPATIALIZE_SOFT is set to true, or alternatively if it's set to auto and the source is mono
-    if (src.spatialize === 1 || (src.spatialize === 2 && templateBuf.channels === 1)) {
-      if (src.panner) {
-        return;
-      }
-      src.panner = src.context.audioCtx.createPanner();
-      AL.updateSourceGlobal(src);
-      AL.updateSourceSpace(src);
-      src.panner.connect(src.context.gain);
-      src.gain.disconnect();
-      src.gain.connect(src.panner);
-    } else {
-      if (!src.panner) {
-        return;
-      }
-      src.panner.disconnect();
-      src.gain.disconnect();
-      src.gain.connect(src.context.gain);
-      src.panner = null;
-    }
-  },
-  updateContextGlobal: ctx => {
-    for (var i in ctx.sources) {
-      AL.updateSourceGlobal(ctx.sources[i]);
-    }
-  },
-  updateSourceGlobal: src => {
-    var panner = src.panner;
-    if (!panner) {
-      return;
-    }
-    panner.refDistance = src.refDistance;
-    panner.maxDistance = src.maxDistance;
-    panner.rolloffFactor = src.rolloffFactor;
-    panner.panningModel = src.context.hrtf ? "HRTF" : "equalpower";
-    // Use the source's distance model if AL_SOURCE_DISTANCE_MODEL is enabled
-    var distanceModel = src.context.sourceDistanceModel ? src.distanceModel : src.context.distanceModel;
-    switch (distanceModel) {
-     case 0:
-      panner.distanceModel = "inverse";
-      panner.refDistance = 340282e33;
-      break;
-
-     case 53249:
-     case 53250:
-      panner.distanceModel = "inverse";
-      break;
-
-     case 53251:
-     case 53252:
-      panner.distanceModel = "linear";
-      break;
-
-     case 53253:
-     case 53254:
-      panner.distanceModel = "exponential";
-      break;
-    }
-  },
-  updateListenerSpace: ctx => {
-    var listener = ctx.audioCtx.listener;
-    if (listener.positionX) {
-      listener.positionX.value = ctx.listener.position[0];
-      listener.positionY.value = ctx.listener.position[1];
-      listener.positionZ.value = ctx.listener.position[2];
-    } else {
-      listener.setPosition(ctx.listener.position[0], ctx.listener.position[1], ctx.listener.position[2]);
-    }
-    if (listener.forwardX) {
-      listener.forwardX.value = ctx.listener.direction[0];
-      listener.forwardY.value = ctx.listener.direction[1];
-      listener.forwardZ.value = ctx.listener.direction[2];
-      listener.upX.value = ctx.listener.up[0];
-      listener.upY.value = ctx.listener.up[1];
-      listener.upZ.value = ctx.listener.up[2];
-    } else {
-      listener.setOrientation(ctx.listener.direction[0], ctx.listener.direction[1], ctx.listener.direction[2], ctx.listener.up[0], ctx.listener.up[1], ctx.listener.up[2]);
-    }
-    // Update sources that are relative to the listener
-    for (var i in ctx.sources) {
-      AL.updateSourceSpace(ctx.sources[i]);
-    }
-  },
-  updateSourceSpace: src => {
-    if (!src.panner) {
-      return;
-    }
-    var panner = src.panner;
-    var posX = src.position[0];
-    var posY = src.position[1];
-    var posZ = src.position[2];
-    var dirX = src.direction[0];
-    var dirY = src.direction[1];
-    var dirZ = src.direction[2];
-    var listener = src.context.listener;
-    var lPosX = listener.position[0];
-    var lPosY = listener.position[1];
-    var lPosZ = listener.position[2];
-    // WebAudio does spatialization in world-space coordinates, meaning both the buffer sources and
-    // the listener position are in the same absolute coordinate system relative to a fixed origin.
-    // By default, OpenAL works this way as well, but it also provides a "listener relative" mode, where
-    // a buffer source's coordinates are interpreted not in absolute world space, but as being relative
-    // to the listener object itself, so as the listener moves the source appears to move with it
-    // with no update required. Since web audio does not support this mode, we must transform the source
-    // coordinates from listener-relative space to absolute world space.
-    // We do this via affine transformation matrices applied to the source position and source direction.
-    // A change-of-basis converts from listener-space displacements to world-space displacements,
-    // which must be done for both the source position and direction. Lastly, the source position must be
-    // added to the listener position to get the final source position, since the source position represents
-    // a displacement from the listener.
-    if (src.relative) {
-      // Negate the listener direction since forward is -Z.
-      var lBackX = -listener.direction[0];
-      var lBackY = -listener.direction[1];
-      var lBackZ = -listener.direction[2];
-      var lUpX = listener.up[0];
-      var lUpY = listener.up[1];
-      var lUpZ = listener.up[2];
-      var inverseMagnitude = (x, y, z) => {
-        var length = Math.sqrt(x * x + y * y + z * z);
-        if (length < Number.EPSILON) {
-          return 0;
-        }
-        return 1 / length;
-      };
-      // Normalize the Back vector
-      var invMag = inverseMagnitude(lBackX, lBackY, lBackZ);
-      lBackX *= invMag;
-      lBackY *= invMag;
-      lBackZ *= invMag;
-      // ...and the Up vector
-      invMag = inverseMagnitude(lUpX, lUpY, lUpZ);
-      lUpX *= invMag;
-      lUpY *= invMag;
-      lUpZ *= invMag;
-      // Calculate the Right vector as the cross product of the Up and Back vectors
-      var lRightX = (lUpY * lBackZ - lUpZ * lBackY);
-      var lRightY = (lUpZ * lBackX - lUpX * lBackZ);
-      var lRightZ = (lUpX * lBackY - lUpY * lBackX);
-      // Back and Up might not be exactly perpendicular, so the cross product also needs normalization
-      invMag = inverseMagnitude(lRightX, lRightY, lRightZ);
-      lRightX *= invMag;
-      lRightY *= invMag;
-      lRightZ *= invMag;
-      // Recompute Up from the now orthonormal Right and Back vectors so we have a fully orthonormal basis
-      lUpX = (lBackY * lRightZ - lBackZ * lRightY);
-      lUpY = (lBackZ * lRightX - lBackX * lRightZ);
-      lUpZ = (lBackX * lRightY - lBackY * lRightX);
-      var oldX = dirX;
-      var oldY = dirY;
-      var oldZ = dirZ;
-      // Use our 3 vectors to apply a change-of-basis matrix to the source direction
-      dirX = oldX * lRightX + oldY * lUpX + oldZ * lBackX;
-      dirY = oldX * lRightY + oldY * lUpY + oldZ * lBackY;
-      dirZ = oldX * lRightZ + oldY * lUpZ + oldZ * lBackZ;
-      oldX = posX;
-      oldY = posY;
-      oldZ = posZ;
-      // ...and to the source position
-      posX = oldX * lRightX + oldY * lUpX + oldZ * lBackX;
-      posY = oldX * lRightY + oldY * lUpY + oldZ * lBackY;
-      posZ = oldX * lRightZ + oldY * lUpZ + oldZ * lBackZ;
-      // The change-of-basis corrects the orientation, but the origin is still the listener.
-      // Translate the source position by the listener position to finish.
-      posX += lPosX;
-      posY += lPosY;
-      posZ += lPosZ;
-    }
-    if (panner.positionX) {
-      // Assigning to panner.positionX/Y/Z unnecessarily seems to cause performance issues
-      // See https://github.com/emscripten-core/emscripten/issues/15847
-      if (posX != panner.positionX.value) panner.positionX.value = posX;
-      if (posY != panner.positionY.value) panner.positionY.value = posY;
-      if (posZ != panner.positionZ.value) panner.positionZ.value = posZ;
-    } else {
-      panner.setPosition(posX, posY, posZ);
-    }
-    if (panner.orientationX) {
-      // Assigning to panner.orientation/Y/Z unnecessarily seems to cause performance issues
-      // See https://github.com/emscripten-core/emscripten/issues/15847
-      if (dirX != panner.orientationX.value) panner.orientationX.value = dirX;
-      if (dirY != panner.orientationY.value) panner.orientationY.value = dirY;
-      if (dirZ != panner.orientationZ.value) panner.orientationZ.value = dirZ;
-    } else {
-      panner.setOrientation(dirX, dirY, dirZ);
-    }
-    var oldShift = src.dopplerShift;
-    var velX = src.velocity[0];
-    var velY = src.velocity[1];
-    var velZ = src.velocity[2];
-    var lVelX = listener.velocity[0];
-    var lVelY = listener.velocity[1];
-    var lVelZ = listener.velocity[2];
-    if (posX === lPosX && posY === lPosY && posZ === lPosZ || velX === lVelX && velY === lVelY && velZ === lVelZ) {
-      src.dopplerShift = 1;
-    } else {
-      // Doppler algorithm from 1.1 spec
-      var speedOfSound = src.context.speedOfSound;
-      var dopplerFactor = src.context.dopplerFactor;
-      var slX = lPosX - posX;
-      var slY = lPosY - posY;
-      var slZ = lPosZ - posZ;
-      var magSl = Math.sqrt(slX * slX + slY * slY + slZ * slZ);
-      var vls = (slX * lVelX + slY * lVelY + slZ * lVelZ) / magSl;
-      var vss = (slX * velX + slY * velY + slZ * velZ) / magSl;
-      vls = Math.min(vls, speedOfSound / dopplerFactor);
-      vss = Math.min(vss, speedOfSound / dopplerFactor);
-      src.dopplerShift = (speedOfSound - dopplerFactor * vls) / (speedOfSound - dopplerFactor * vss);
-    }
-    if (src.dopplerShift !== oldShift) {
-      AL.updateSourceRate(src);
-    }
-  },
-  updateSourceRate: src => {
-    if (src.state === 4114) {
-      // clear scheduled buffers
-      AL.cancelPendingSourceAudio(src);
-      var audioSrc = src.audioQueue[0];
-      if (!audioSrc) {
-        return;
-      }
-      var duration;
-      if (src.type === 4136 && src.looping) {
-        duration = Number.POSITIVE_INFINITY;
-      } else {
-        // audioSrc._duration is expressed after factoring in playbackRate, so when changing playback rate, need
-        // to recompute/rescale the rate to the new playback speed.
-        duration = (audioSrc.buffer.duration - audioSrc._startOffset) / src.playbackRate;
-      }
-      audioSrc._duration = duration;
-      audioSrc.playbackRate.value = src.playbackRate;
-      // reschedule buffers with the new playbackRate
-      AL.scheduleSourceAudio(src);
-    }
-  },
-  sourceDuration: src => {
-    var length = 0;
-    for (var i = 0; i < src.bufQueue.length; i++) {
-      var audioBuf = src.bufQueue[i].audioBuf;
-      length += audioBuf ? audioBuf.duration : 0;
-    }
-    return length;
-  },
-  sourceTell: src => {
-    AL.updateSourceTime(src);
-    var offset = 0;
-    for (var i = 0; i < src.bufsProcessed; i++) {
-      if (src.bufQueue[i].audioBuf) {
-        offset += src.bufQueue[i].audioBuf.duration;
-      }
-    }
-    offset += src.bufOffset;
-    return offset;
-  },
-  sourceSeek: (src, offset) => {
-    var playing = src.state == 4114;
-    if (playing) {
-      AL.setSourceState(src, 4113);
-    }
-    if (src.bufQueue[src.bufsProcessed].audioBuf !== null) {
-      src.bufsProcessed = 0;
-      while (offset > src.bufQueue[src.bufsProcessed].audioBuf.duration) {
-        offset -= src.bufQueue[src.bufsProcessed].audioBuf.duration;
-        src.bufsProcessed++;
-      }
-      src.bufOffset = offset;
-    }
-    if (playing) {
-      AL.setSourceState(src, 4114);
-    }
-  },
-  getGlobalParam: (funcname, param) => {
-    if (!AL.currentCtx) {
-      return null;
-    }
-    switch (param) {
-     case 49152:
-      return AL.currentCtx.dopplerFactor;
-
-     case 49155:
-      return AL.currentCtx.speedOfSound;
-
-     case 53248:
-      return AL.currentCtx.distanceModel;
-
-     default:
-      AL.currentCtx.err = 40962;
-      return null;
-    }
-  },
-  setGlobalParam: (funcname, param, value) => {
-    if (!AL.currentCtx) {
-      return;
-    }
-    switch (param) {
-     case 49152:
-      if (!Number.isFinite(value) || value < 0) {
-        // Strictly negative values are disallowed
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      AL.currentCtx.dopplerFactor = value;
-      AL.updateListenerSpace(AL.currentCtx);
-      break;
-
-     case 49155:
-      if (!Number.isFinite(value) || value <= 0) {
-        // Negative or zero values are disallowed
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      AL.currentCtx.speedOfSound = value;
-      AL.updateListenerSpace(AL.currentCtx);
-      break;
-
-     case 53248:
-      switch (value) {
-       case 0:
-       case 53249:
-       case 53250:
-       case 53251:
-       case 53252:
-       case 53253:
-       case 53254:
-        AL.currentCtx.distanceModel = value;
-        AL.updateContextGlobal(AL.currentCtx);
-        break;
-
-       default:
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      break;
-
-     default:
-      AL.currentCtx.err = 40962;
-      return;
-    }
-  },
-  getListenerParam: (funcname, param) => {
-    if (!AL.currentCtx) {
-      return null;
-    }
-    switch (param) {
-     case 4100:
-      return AL.currentCtx.listener.position;
-
-     case 4102:
-      return AL.currentCtx.listener.velocity;
-
-     case 4111:
-      return AL.currentCtx.listener.direction.concat(AL.currentCtx.listener.up);
-
-     case 4106:
-      return AL.currentCtx.gain.gain.value;
-
-     default:
-      AL.currentCtx.err = 40962;
-      return null;
-    }
-  },
-  setListenerParam: (funcname, param, value) => {
-    if (!AL.currentCtx) {
-      return;
-    }
-    if (value === null) {
-      AL.currentCtx.err = 40962;
-      return;
-    }
-    var listener = AL.currentCtx.listener;
-    switch (param) {
-     case 4100:
-      if (!Number.isFinite(value[0]) || !Number.isFinite(value[1]) || !Number.isFinite(value[2])) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      listener.position[0] = value[0];
-      listener.position[1] = value[1];
-      listener.position[2] = value[2];
-      AL.updateListenerSpace(AL.currentCtx);
-      break;
-
-     case 4102:
-      if (!Number.isFinite(value[0]) || !Number.isFinite(value[1]) || !Number.isFinite(value[2])) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      listener.velocity[0] = value[0];
-      listener.velocity[1] = value[1];
-      listener.velocity[2] = value[2];
-      AL.updateListenerSpace(AL.currentCtx);
-      break;
-
-     case 4106:
-      if (!Number.isFinite(value) || value < 0) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      AL.currentCtx.gain.gain.value = value;
-      break;
-
-     case 4111:
-      if (!Number.isFinite(value[0]) || !Number.isFinite(value[1]) || !Number.isFinite(value[2]) || !Number.isFinite(value[3]) || !Number.isFinite(value[4]) || !Number.isFinite(value[5])) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      listener.direction[0] = value[0];
-      listener.direction[1] = value[1];
-      listener.direction[2] = value[2];
-      listener.up[0] = value[3];
-      listener.up[1] = value[4];
-      listener.up[2] = value[5];
-      AL.updateListenerSpace(AL.currentCtx);
-      break;
-
-     default:
-      AL.currentCtx.err = 40962;
-      return;
-    }
-  },
-  getBufferParam: (funcname, bufferId, param) => {
-    if (!AL.currentCtx) {
-      return;
-    }
-    var buf = AL.buffers[bufferId];
-    if (!buf || bufferId === 0) {
-      AL.currentCtx.err = 40961;
-      return;
-    }
-    switch (param) {
-     case 8193:
-      return buf.frequency;
-
-     case 8194:
-      return buf.bytesPerSample * 8;
-
-     case 8195:
-      return buf.channels;
-
-     case 8196:
-      return buf.length * buf.bytesPerSample * buf.channels;
-
-     case 8213:
-      if (buf.length === 0) {
-        return [ 0, 0 ];
-      }
-      return [ (buf.audioBuf._loopStart || 0) * buf.frequency, (buf.audioBuf._loopEnd || buf.length) * buf.frequency ];
-
-     default:
-      AL.currentCtx.err = 40962;
-      return null;
-    }
-  },
-  setBufferParam: (funcname, bufferId, param, value) => {
-    if (!AL.currentCtx) {
-      return;
-    }
-    var buf = AL.buffers[bufferId];
-    if (!buf || bufferId === 0) {
-      AL.currentCtx.err = 40961;
-      return;
-    }
-    if (value === null) {
-      AL.currentCtx.err = 40962;
-      return;
-    }
-    switch (param) {
-     case 8196:
-      if (value !== 0) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      // Per the spec, setting AL_SIZE to 0 is a legal NOP.
-      break;
-
-     case 8213:
-      if (value[0] < 0 || value[0] > buf.length || value[1] < 0 || value[1] > buf.Length || value[0] >= value[1]) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      if (buf.refCount > 0) {
-        AL.currentCtx.err = 40964;
-        return;
-      }
-      if (buf.audioBuf) {
-        buf.audioBuf._loopStart = value[0] / buf.frequency;
-        buf.audioBuf._loopEnd = value[1] / buf.frequency;
-      }
-      break;
-
-     default:
-      AL.currentCtx.err = 40962;
-      return;
-    }
-  },
-  getSourceParam: (funcname, sourceId, param) => {
-    if (!AL.currentCtx) {
-      return null;
-    }
-    var src = AL.currentCtx.sources[sourceId];
-    if (!src) {
-      AL.currentCtx.err = 40961;
-      return null;
-    }
-    switch (param) {
-     case 514:
-      return src.relative;
-
-     case 4097:
-      return src.coneInnerAngle;
-
-     case 4098:
-      return src.coneOuterAngle;
-
-     case 4099:
-      return src.pitch;
-
-     case 4100:
-      return src.position;
-
-     case 4101:
-      return src.direction;
-
-     case 4102:
-      return src.velocity;
-
-     case 4103:
-      return src.looping;
-
-     case 4105:
-      if (src.type === 4136) {
-        return src.bufQueue[0].id;
-      }
-      return 0;
-
-     case 4106:
-      return src.gain.gain.value;
-
-     case 4109:
-      return src.minGain;
-
-     case 4110:
-      return src.maxGain;
-
-     case 4112:
-      return src.state;
-
-     case 4117:
-      if (src.bufQueue.length === 1 && src.bufQueue[0].id === 0) {
-        return 0;
-      }
-      return src.bufQueue.length;
-
-     case 4118:
-      if ((src.bufQueue.length === 1 && src.bufQueue[0].id === 0) || src.looping) {
-        return 0;
-      }
-      return src.bufsProcessed;
-
-     case 4128:
-      return src.refDistance;
-
-     case 4129:
-      return src.rolloffFactor;
-
-     case 4130:
-      return src.coneOuterGain;
-
-     case 4131:
-      return src.maxDistance;
-
-     case 4132:
-      return AL.sourceTell(src);
-
-     case 4133:
-      var offset = AL.sourceTell(src);
-      if (offset > 0) {
-        offset *= src.bufQueue[0].frequency;
-      }
-      return offset;
-
-     case 4134:
-      var offset = AL.sourceTell(src);
-      if (offset > 0) {
-        offset *= src.bufQueue[0].frequency * src.bufQueue[0].bytesPerSample;
-      }
-      return offset;
-
-     case 4135:
-      return src.type;
-
-     case 4628:
-      return src.spatialize;
-
-     case 8201:
-      var length = 0;
-      var bytesPerFrame = 0;
-      for (var i = 0; i < src.bufQueue.length; i++) {
-        length += src.bufQueue[i].length;
-        if (src.bufQueue[i].id !== 0) {
-          bytesPerFrame = src.bufQueue[i].bytesPerSample * src.bufQueue[i].channels;
-        }
-      }
-      return length * bytesPerFrame;
-
-     case 8202:
-      var length = 0;
-      for (var i = 0; i < src.bufQueue.length; i++) {
-        length += src.bufQueue[i].length;
-      }
-      return length;
-
-     case 8203:
-      return AL.sourceDuration(src);
-
-     case 53248:
-      return src.distanceModel;
-
-     default:
-      AL.currentCtx.err = 40962;
-      return null;
-    }
-  },
-  setSourceParam: (funcname, sourceId, param, value) => {
-    if (!AL.currentCtx) {
-      return;
-    }
-    var src = AL.currentCtx.sources[sourceId];
-    if (!src) {
-      AL.currentCtx.err = 40961;
-      return;
-    }
-    if (value === null) {
-      AL.currentCtx.err = 40962;
-      return;
-    }
-    switch (param) {
-     case 514:
-      if (value === 1) {
-        src.relative = true;
-        AL.updateSourceSpace(src);
-      } else if (value === 0) {
-        src.relative = false;
-        AL.updateSourceSpace(src);
-      } else {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      break;
-
-     case 4097:
-      if (!Number.isFinite(value)) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      src.coneInnerAngle = value;
-      if (src.panner) {
-        src.panner.coneInnerAngle = value % 360;
-      }
-      break;
-
-     case 4098:
-      if (!Number.isFinite(value)) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      src.coneOuterAngle = value;
-      if (src.panner) {
-        src.panner.coneOuterAngle = value % 360;
-      }
-      break;
-
-     case 4099:
-      if (!Number.isFinite(value) || value <= 0) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      if (src.pitch === value) {
-        break;
-      }
-      src.pitch = value;
-      AL.updateSourceRate(src);
-      break;
-
-     case 4100:
-      if (!Number.isFinite(value[0]) || !Number.isFinite(value[1]) || !Number.isFinite(value[2])) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      src.position[0] = value[0];
-      src.position[1] = value[1];
-      src.position[2] = value[2];
-      AL.updateSourceSpace(src);
-      break;
-
-     case 4101:
-      if (!Number.isFinite(value[0]) || !Number.isFinite(value[1]) || !Number.isFinite(value[2])) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      src.direction[0] = value[0];
-      src.direction[1] = value[1];
-      src.direction[2] = value[2];
-      AL.updateSourceSpace(src);
-      break;
-
-     case 4102:
-      if (!Number.isFinite(value[0]) || !Number.isFinite(value[1]) || !Number.isFinite(value[2])) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      src.velocity[0] = value[0];
-      src.velocity[1] = value[1];
-      src.velocity[2] = value[2];
-      AL.updateSourceSpace(src);
-      break;
-
-     case 4103:
-      if (value === 1) {
-        src.looping = true;
-        AL.updateSourceTime(src);
-        if (src.type === 4136 && src.audioQueue.length > 0) {
-          var audioSrc = src.audioQueue[0];
-          audioSrc.loop = true;
-          audioSrc._duration = Number.POSITIVE_INFINITY;
-        }
-      } else if (value === 0) {
-        src.looping = false;
-        var currentTime = AL.updateSourceTime(src);
-        if (src.type === 4136 && src.audioQueue.length > 0) {
-          var audioSrc = src.audioQueue[0];
-          audioSrc.loop = false;
-          audioSrc._duration = src.bufQueue[0].audioBuf.duration / src.playbackRate;
-          audioSrc._startTime = currentTime - src.bufOffset / src.playbackRate;
-        }
-      } else {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      break;
-
-     case 4105:
-      if (src.state === 4114 || src.state === 4115) {
-        AL.currentCtx.err = 40964;
-        return;
-      }
-      if (value === 0) {
-        for (var i in src.bufQueue) {
-          src.bufQueue[i].refCount--;
-        }
-        src.bufQueue.length = 1;
-        src.bufQueue[0] = AL.buffers[0];
-        src.bufsProcessed = 0;
-        src.type = 4144;
-      } else {
-        var buf = AL.buffers[value];
-        if (!buf) {
-          AL.currentCtx.err = 40963;
-          return;
-        }
-        for (var i in src.bufQueue) {
-          src.bufQueue[i].refCount--;
-        }
-        src.bufQueue.length = 0;
-        buf.refCount++;
-        src.bufQueue = [ buf ];
-        src.bufsProcessed = 0;
-        src.type = 4136;
-      }
-      AL.initSourcePanner(src);
-      AL.scheduleSourceAudio(src);
-      break;
-
-     case 4106:
-      if (!Number.isFinite(value) || value < 0) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      src.gain.gain.value = value;
-      break;
-
-     case 4109:
-      if (!Number.isFinite(value) || value < 0 || value > Math.min(src.maxGain, 1)) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      src.minGain = value;
-      break;
-
-     case 4110:
-      if (!Number.isFinite(value) || value < Math.max(0, src.minGain) || value > 1) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      src.maxGain = value;
-      break;
-
-     case 4128:
-      if (!Number.isFinite(value) || value < 0) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      src.refDistance = value;
-      if (src.panner) {
-        src.panner.refDistance = value;
-      }
-      break;
-
-     case 4129:
-      if (!Number.isFinite(value) || value < 0) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      src.rolloffFactor = value;
-      if (src.panner) {
-        src.panner.rolloffFactor = value;
-      }
-      break;
-
-     case 4130:
-      if (!Number.isFinite(value) || value < 0 || value > 1) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      src.coneOuterGain = value;
-      if (src.panner) {
-        src.panner.coneOuterGain = value;
-      }
-      break;
-
-     case 4131:
-      if (!Number.isFinite(value) || value < 0) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      src.maxDistance = value;
-      if (src.panner) {
-        src.panner.maxDistance = value;
-      }
-      break;
-
-     case 4132:
-      if (value < 0 || value > AL.sourceDuration(src)) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      AL.sourceSeek(src, value);
-      break;
-
-     case 4133:
-      var srcLen = AL.sourceDuration(src);
-      if (srcLen > 0) {
-        var frequency;
-        for (var bufId in src.bufQueue) {
-          if (bufId) {
-            frequency = src.bufQueue[bufId].frequency;
-            break;
-          }
-        }
-        value /= frequency;
-      }
-      if (value < 0 || value > srcLen) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      AL.sourceSeek(src, value);
-      break;
-
-     case 4134:
-      var srcLen = AL.sourceDuration(src);
-      if (srcLen > 0) {
-        var bytesPerSec;
-        for (var bufId in src.bufQueue) {
-          if (bufId) {
-            var buf = src.bufQueue[bufId];
-            bytesPerSec = buf.frequency * buf.bytesPerSample * buf.channels;
-            break;
-          }
-        }
-        value /= bytesPerSec;
-      }
-      if (value < 0 || value > srcLen) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      AL.sourceSeek(src, value);
-      break;
-
-     case 4628:
-      if (value !== 0 && value !== 1 && value !== 2) {
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      src.spatialize = value;
-      AL.initSourcePanner(src);
-      break;
-
-     case 8201:
-     case 8202:
-     case 8203:
-      AL.currentCtx.err = 40964;
-      break;
-
-     case 53248:
-      switch (value) {
-       case 0:
-       case 53249:
-       case 53250:
-       case 53251:
-       case 53252:
-       case 53253:
-       case 53254:
-        src.distanceModel = value;
-        if (AL.currentCtx.sourceDistanceModel) {
-          AL.updateContextGlobal(AL.currentCtx);
-        }
-        break;
-
-       default:
-        AL.currentCtx.err = 40963;
-        return;
-      }
-      break;
-
-     default:
-      AL.currentCtx.err = 40962;
-      return;
-    }
-  },
-  captures: {},
-  sharedCaptureAudioCtx: null,
-  requireValidCaptureDevice: (deviceId, funcname) => {
-    if (deviceId === 0) {
-      AL.alcErr = 40961;
-      return null;
-    }
-    var c = AL.captures[deviceId];
-    if (!c) {
-      AL.alcErr = 40961;
-      return null;
-    }
-    var err = c.mediaStreamError;
-    if (err) {
-      AL.alcErr = 40961;
-      return null;
-    }
-    return c;
-  }
-};
-
-function _alcCaptureOpenDevice(pDeviceName, requestedSampleRate, format, bufferFrameCapacity) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(170, 0, 1, pDeviceName, requestedSampleRate, format, bufferFrameCapacity);
-  var resolvedDeviceName = AL.CAPTURE_DEVICE_NAME;
-  // NULL is a valid device name here (resolves to default);
-  if (pDeviceName !== 0) {
-    resolvedDeviceName = UTF8ToString(pDeviceName);
-    if (resolvedDeviceName !== AL.CAPTURE_DEVICE_NAME) {
-      // ALC_OUT_OF_MEMORY
-      // From the programmer's guide, ALC_OUT_OF_MEMORY's meaning is
-      // overloaded here, to mean:
-      // 'The specified device is invalid, or can not capture audio.'
-      // This may be misleading to API users, but well...
-      AL.alcErr = 40965;
-      return 0;
-    }
-  }
-  // Otherwise it's probably okay (though useless) for bufferFrameCapacity to be zero.
-  if (bufferFrameCapacity < 0) {
-    // ALCsizei is signed int
-    AL.alcErr = 40964;
-    return 0;
-  }
-  navigator.getUserMedia = navigator.getUserMedia || navigator.webkitGetUserMedia || navigator.mozGetUserMedia || navigator.msGetUserMedia;
-  var has_getUserMedia = navigator.getUserMedia || (navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
-  if (!has_getUserMedia) {
-    // See previously mentioned rationale for ALC_OUT_OF_MEMORY
-    AL.alcErr = 40965;
-    return 0;
-  }
-  var AudioContext = window.AudioContext || window.webkitAudioContext;
-  if (!AL.sharedCaptureAudioCtx) {
-    try {
-      AL.sharedCaptureAudioCtx = new AudioContext;
-    } catch (e) {
-      // See previously mentioned rationale for ALC_OUT_OF_MEMORY
-      AL.alcErr = 40965;
-      return 0;
-    }
-  }
-  autoResumeAudioContext(AL.sharedCaptureAudioCtx);
-  var outputChannelCount;
-  switch (format) {
-   case 65552:
-   /* AL_FORMAT_MONO_FLOAT32 */ case 4353:
-   /* AL_FORMAT_MONO16 */ case 4352:
-    /* AL_FORMAT_MONO8 */ outputChannelCount = 1;
-    break;
-
-   case 65553:
-   /* AL_FORMAT_STEREO_FLOAT32 */ case 4355:
-   /* AL_FORMAT_STEREO16 */ case 4354:
-    /* AL_FORMAT_STEREO8 */ outputChannelCount = 2;
-    break;
-
-   default:
-    AL.alcErr = 40964;
-    return 0;
-  }
-  function newF32Array(cap) {
-    return new Float32Array(cap);
-  }
-  function newI16Array(cap) {
-    return new Int16Array(cap);
-  }
-  function newU8Array(cap) {
-    return new Uint8Array(cap);
-  }
-  var requestedSampleType;
-  var newSampleArray;
-  switch (format) {
-   case 65552:
-   /* AL_FORMAT_MONO_FLOAT32 */ case 65553:
-    /* AL_FORMAT_STEREO_FLOAT32 */ requestedSampleType = "f32";
-    newSampleArray = newF32Array;
-    break;
-
-   case 4353:
-   /* AL_FORMAT_MONO16 */ case 4355:
-    /* AL_FORMAT_STEREO16 */ requestedSampleType = "i16";
-    newSampleArray = newI16Array;
-    break;
-
-   case 4352:
-   /* AL_FORMAT_MONO8 */ case 4354:
-    /* AL_FORMAT_STEREO8 */ requestedSampleType = "u8";
-    newSampleArray = newU8Array;
-    break;
-  }
-  var buffers = [];
-  try {
-    for (var chan = 0; chan < outputChannelCount; ++chan) {
-      buffers[chan] = newSampleArray(bufferFrameCapacity);
-    }
-  } catch (e) {
-    AL.alcErr = 40965;
-    return 0;
-  }
-  // What we'll place into the `AL.captures` array in the end,
-  // declared here for closures to access it
-  var newCapture = {
-    audioCtx: AL.sharedCaptureAudioCtx,
-    deviceName: resolvedDeviceName,
-    requestedSampleRate,
-    requestedSampleType,
-    outputChannelCount,
-    inputChannelCount: null,
-    // Not known until the getUserMedia() promise resolves
-    mediaStreamError: null,
-    // Used by other functions to return early and report an error.
-    mediaStreamSourceNode: null,
-    mediaStream: null,
-    // Either one, or none of the below two, is active.
-    mergerNode: null,
-    splitterNode: null,
-    scriptProcessorNode: null,
-    isCapturing: false,
-    buffers,
-    get bufferFrameCapacity() {
-      return buffers[0].length;
-    },
-    capturePlayhead: 0,
-    // current write position, in sample frames
-    captureReadhead: 0,
-    capturedFrameCount: 0
-  };
-  // Preparing for getUserMedia()
-  var onError = mediaStreamError => {
-    newCapture.mediaStreamError = mediaStreamError;
-  };
-  var onSuccess = mediaStream => {
-    newCapture.mediaStreamSourceNode = newCapture.audioCtx.createMediaStreamSource(mediaStream);
-    newCapture.mediaStream = mediaStream;
-    var inputChannelCount = 1;
-    switch (newCapture.mediaStreamSourceNode.channelCountMode) {
-     case "max":
-      inputChannelCount = outputChannelCount;
-      break;
-
-     case "clamped-max":
-      inputChannelCount = Math.min(outputChannelCount, newCapture.mediaStreamSourceNode.channelCount);
-      break;
-
-     case "explicit":
-      inputChannelCount = newCapture.mediaStreamSourceNode.channelCount;
-      break;
-    }
-    newCapture.inputChannelCount = inputChannelCount;
-    // Have to pick a size from 256, 512, 1024, 2048, 4096, 8192, 16384.
-    // One can also set it to zero, which leaves the decision up to the impl.
-    // An extension could allow specifying this value.
-    var processorFrameCount = 512;
-    newCapture.scriptProcessorNode = newCapture.audioCtx.createScriptProcessor(processorFrameCount, inputChannelCount, outputChannelCount);
-    if (inputChannelCount > outputChannelCount) {
-      newCapture.mergerNode = newCapture.audioCtx.createChannelMerger(inputChannelCount);
-      newCapture.mediaStreamSourceNode.connect(newCapture.mergerNode);
-      newCapture.mergerNode.connect(newCapture.scriptProcessorNode);
-    } else if (inputChannelCount < outputChannelCount) {
-      newCapture.splitterNode = newCapture.audioCtx.createChannelSplitter(outputChannelCount);
-      newCapture.mediaStreamSourceNode.connect(newCapture.splitterNode);
-      newCapture.splitterNode.connect(newCapture.scriptProcessorNode);
-    } else {
-      newCapture.mediaStreamSourceNode.connect(newCapture.scriptProcessorNode);
-    }
-    newCapture.scriptProcessorNode.connect(newCapture.audioCtx.destination);
-    newCapture.scriptProcessorNode.onaudioprocess = audioProcessingEvent => {
-      if (!newCapture.isCapturing) {
-        return;
-      }
-      var c = newCapture;
-      var srcBuf = audioProcessingEvent.inputBuffer;
-      // Actually just copy srcBuf's channel data into
-      // c.buffers, optimizing for each case.
-      switch (format) {
-       case 65552:
-        /* AL_FORMAT_MONO_FLOAT32 */ var channel0 = srcBuf.getChannelData(0);
-        for (var i = 0; i < srcBuf.length; ++i) {
-          var wi = (c.capturePlayhead + i) % c.bufferFrameCapacity;
-          c.buffers[0][wi] = channel0[i];
-        }
-        break;
-
-       case 65553:
-        /* AL_FORMAT_STEREO_FLOAT32 */ var channel0 = srcBuf.getChannelData(0);
-        var channel1 = srcBuf.getChannelData(1);
-        for (var i = 0; i < srcBuf.length; ++i) {
-          var wi = (c.capturePlayhead + i) % c.bufferFrameCapacity;
-          c.buffers[0][wi] = channel0[i];
-          c.buffers[1][wi] = channel1[i];
-        }
-        break;
-
-       case 4353:
-        /* AL_FORMAT_MONO16 */ var channel0 = srcBuf.getChannelData(0);
-        for (var i = 0; i < srcBuf.length; ++i) {
-          var wi = (c.capturePlayhead + i) % c.bufferFrameCapacity;
-          c.buffers[0][wi] = channel0[i] * 32767;
-        }
-        break;
-
-       case 4355:
-        /* AL_FORMAT_STEREO16 */ var channel0 = srcBuf.getChannelData(0);
-        var channel1 = srcBuf.getChannelData(1);
-        for (var i = 0; i < srcBuf.length; ++i) {
-          var wi = (c.capturePlayhead + i) % c.bufferFrameCapacity;
-          c.buffers[0][wi] = channel0[i] * 32767;
-          c.buffers[1][wi] = channel1[i] * 32767;
-        }
-        break;
-
-       case 4352:
-        /* AL_FORMAT_MONO8 */ var channel0 = srcBuf.getChannelData(0);
-        for (var i = 0; i < srcBuf.length; ++i) {
-          var wi = (c.capturePlayhead + i) % c.bufferFrameCapacity;
-          c.buffers[0][wi] = (channel0[i] + 1) * 127;
-        }
-        break;
-
-       case 4354:
-        /* AL_FORMAT_STEREO8 */ var channel0 = srcBuf.getChannelData(0);
-        var channel1 = srcBuf.getChannelData(1);
-        for (var i = 0; i < srcBuf.length; ++i) {
-          var wi = (c.capturePlayhead + i) % c.bufferFrameCapacity;
-          c.buffers[0][wi] = (channel0[i] + 1) * 127;
-          c.buffers[1][wi] = (channel1[i] + 1) * 127;
-        }
-        break;
-      }
-      c.capturePlayhead += srcBuf.length;
-      c.capturePlayhead %= c.bufferFrameCapacity;
-      c.capturedFrameCount += srcBuf.length;
-      c.capturedFrameCount = Math.min(c.capturedFrameCount, c.bufferFrameCapacity);
-    };
-  };
-  // The latest way to call getUserMedia()
-  if (navigator.mediaDevices?.getUserMedia) {
-    navigator.mediaDevices.getUserMedia({
-      audio: true
-    }).then(onSuccess).catch(onError);
-  } else {
-    // The usual (now deprecated) way
-    navigator.getUserMedia({
-      audio: true
-    }, onSuccess, onError);
-  }
-  var id = AL.newId();
-  AL.captures[id] = newCapture;
-  return id;
-}
-
-_alcCaptureOpenDevice.sig = "ppiii";
-
-var _alcCaptureCloseDevice = function(deviceId) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(171, 0, 1, deviceId);
-  var c = AL.requireValidCaptureDevice(deviceId, "alcCaptureCloseDevice");
-  if (!c) return false;
-  delete AL.captures[deviceId];
-  AL.freeIds.push(deviceId);
-  // This clean-up might be unnecessary (paranoid) ?
-  // May happen if user hasn't decided to grant or deny input
-  c.mediaStreamSourceNode?.disconnect();
-  c.mergerNode?.disconnect();
-  c.splitterNode?.disconnect();
-  // May happen if user hasn't decided to grant or deny input
-  c.scriptProcessorNode?.disconnect();
-  if (c.mediaStream) {
-    // Disabling the microphone of the browser.
-    // Without this operation, the red dot on the browser tab page will remain.
-    c.mediaStream.getTracks().forEach(track => track.stop());
-  }
-  delete c.buffers;
-  c.capturedFrameCount = 0;
-  c.isCapturing = false;
-  return true;
-};
-
-_alcCaptureCloseDevice.sig = "ip";
-
-function _alcCaptureStart(deviceId) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(172, 0, 1, deviceId);
-  var c = AL.requireValidCaptureDevice(deviceId, "alcCaptureStart");
-  if (!c) return;
-  if (c.isCapturing) {
-    // NOTE: Spec says (emphasis mine):
-    //     The amount of audio samples available after **restarting** a
-    //     stopped capture device is reset to zero.
-    // So redundant calls to alcCaptureStart() must have no effect.
-    return;
-  }
-  c.isCapturing = true;
-  c.capturedFrameCount = 0;
-  c.capturePlayhead = 0;
-}
-
-_alcCaptureStart.sig = "vp";
-
-function _alcCaptureStop(deviceId) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(173, 0, 1, deviceId);
-  var c = AL.requireValidCaptureDevice(deviceId, "alcCaptureStop");
-  if (!c) return;
-  c.isCapturing = false;
-}
-
-_alcCaptureStop.sig = "vp";
-
-function _alcCaptureSamples(deviceId, pFrames, requestedFrameCount) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(174, 0, 1, deviceId, pFrames, requestedFrameCount);
-  var c = AL.requireValidCaptureDevice(deviceId, "alcCaptureSamples");
-  if (!c) return;
-  // ALCsizei is actually 32-bit signed int, so could be negative
-  // Also, spec says :
-  //   Requesting more sample frames than are currently available is
-  //   an error.
-  var dstfreq = c.requestedSampleRate;
-  var srcfreq = c.audioCtx.sampleRate;
-  var fratio = srcfreq / dstfreq;
-  if (requestedFrameCount < 0 || requestedFrameCount > (c.capturedFrameCount / fratio)) {
-    AL.alcErr = 40964;
-    return;
-  }
-  function setF32Sample(i, sample) {
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, (((pFrames) + (4 * i)) >> 2), "storing")] = sample;
-  }
-  function setI16Sample(i, sample) {
-    HEAP16[SAFE_HEAP_INDEX(HEAP16, (((pFrames) + (2 * i)) >> 1), "storing")] = sample;
-    checkInt16(sample);
-  }
-  function setU8Sample(i, sample) {
-    HEAP8[SAFE_HEAP_INDEX(HEAP8, (pFrames) + (i), "storing")] = sample;
-    checkInt8(sample);
-  }
-  var setSample;
-  switch (c.requestedSampleType) {
-   case "f32":
-    setSample = setF32Sample;
-    break;
-
-   case "i16":
-    setSample = setI16Sample;
-    break;
-
-   case "u8":
-    setSample = setU8Sample;
-    break;
-
-   default:
-    return;
-  }
-  // If fratio is an integer we don't need linear resampling, just skip samples
-  if (Math.floor(fratio) == fratio) {
-    for (var i = 0, frame_i = 0; frame_i < requestedFrameCount; ++frame_i) {
-      for (var chan = 0; chan < c.buffers.length; ++chan, ++i) {
-        setSample(i, c.buffers[chan][c.captureReadhead]);
-      }
-      c.captureReadhead = (fratio + c.captureReadhead) % c.bufferFrameCapacity;
-    }
-  } else {
-    // Perform linear resampling.
-    // There is room for improvement - right now we're fine with linear resampling.
-    // We don't use OfflineAudioContexts for this: See the discussion at
-    // https://github.com/jpernst/emscripten/issues/2#issuecomment-312729735
-    // if you're curious about why.
-    for (var i = 0, frame_i = 0; frame_i < requestedFrameCount; ++frame_i) {
-      var lefti = Math.floor(c.captureReadhead);
-      var righti = Math.ceil(c.captureReadhead);
-      var d = c.captureReadhead - lefti;
-      for (var chan = 0; chan < c.buffers.length; ++chan, ++i) {
-        var lefts = c.buffers[chan][lefti];
-        var rights = c.buffers[chan][righti];
-        setSample(i, (1 - d) * lefts + d * rights);
-      }
-      c.captureReadhead = (c.captureReadhead + fratio) % c.bufferFrameCapacity;
-    }
-  }
-  // Spec doesn't say if alcCaptureSamples() must zero the number
-  // of available captured sample-frames, but not only would it
-  // be insane not to do, OpenAL-Soft happens to do that as well.
-  c.capturedFrameCount = 0;
-}
-
-_alcCaptureSamples.sig = "vppi";
-
-function _alcOpenDevice(pDeviceName) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(175, 0, 1, pDeviceName);
-  if (pDeviceName) {
-    var name = UTF8ToString(pDeviceName);
-    if (name !== AL.DEVICE_NAME) {
-      return 0;
-    }
-  }
-  if (globalThis.AudioContext || globalThis.webkitAudioContext) {
-    var deviceId = AL.newId();
-    AL.deviceRefCounts[deviceId] = 0;
-    return deviceId;
-  }
-  return 0;
-}
-
-_alcOpenDevice.sig = "pp";
-
-function _alcCloseDevice(deviceId) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(176, 0, 1, deviceId);
-  if (!(deviceId in AL.deviceRefCounts) || AL.deviceRefCounts[deviceId] > 0) {
-    return 0;
-  }
-  delete AL.deviceRefCounts[deviceId];
-  AL.freeIds.push(deviceId);
-  return 1;
-}
-
-_alcCloseDevice.sig = "ip";
-
-function _alcCreateContext(deviceId, pAttrList) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(177, 0, 1, deviceId, pAttrList);
-  if (!(deviceId in AL.deviceRefCounts)) {
-    AL.alcErr = 40961;
-    /* ALC_INVALID_DEVICE */ return 0;
-  }
-  var options = null;
-  var attrs = [];
-  var hrtf = null;
-  pAttrList >>= 2;
-  if (pAttrList) {
-    var attr = 0;
-    var val = 0;
-    while (true) {
-      attr = HEAP32[SAFE_HEAP_INDEX(HEAP32, pAttrList++, "loading")];
-      attrs.push(attr);
-      if (attr === 0) {
-        break;
-      }
-      val = HEAP32[SAFE_HEAP_INDEX(HEAP32, pAttrList++, "loading")];
-      attrs.push(val);
-      switch (attr) {
-       case 4103:
-        if (!options) {
-          options = {};
-        }
-        options.sampleRate = val;
-        break;
-
-       case 4112:
-       // fallthrough
-        case 4113:
-        // Do nothing; these hints are satisfied by default
-        break;
-
-       case 6546:
-        switch (val) {
-         case 0:
-          hrtf = false;
-          break;
-
-         case 1:
-          hrtf = true;
-          break;
-
-         case 2:
-          break;
-
-         default:
-          AL.alcErr = 40964;
-          return 0;
-        }
-        break;
-
-       case 6550:
-        if (val !== 0) {
-          AL.alcErr = 40964;
-          return 0;
-        }
-        break;
-
-       default:
-        AL.alcErr = 40964;
-        /* ALC_INVALID_VALUE */ return 0;
-      }
-    }
-  }
-  var AudioContext = window.AudioContext || window.webkitAudioContext;
-  var ac = null;
-  try {
-    // Only try to pass options if there are any, for compat with browsers that don't support this
-    if (options) {
-      ac = new AudioContext(options);
-    } else {
-      ac = new AudioContext;
-    }
-  } catch (e) {
-    if (e.name === "NotSupportedError") {
-      AL.alcErr = 40964;
-    } else {
-      AL.alcErr = 40961;
-    }
-    return 0;
-  }
-  autoResumeAudioContext(ac);
-  // Old Web Audio API (e.g. Safari 6.0.5) had an inconsistently named createGainNode function.
-  if (typeof ac.createGain == "undefined") {
-    ac.createGain = ac.createGainNode;
-  }
-  var gain = ac.createGain();
-  gain.connect(ac.destination);
-  var ctx = {
-    deviceId,
-    id: AL.newId(),
-    attrs,
-    audioCtx: ac,
-    listener: {
-      position: [ 0, 0, 0 ],
-      velocity: [ 0, 0, 0 ],
-      direction: [ 0, 0, 0 ],
-      up: [ 0, 0, 0 ]
-    },
-    sources: [],
-    interval: setInterval(() => AL.scheduleContextAudio(ctx), AL.QUEUE_INTERVAL),
-    gain,
-    distanceModel: 53250,
-    speedOfSound: 343.3,
-    dopplerFactor: 1,
-    sourceDistanceModel: false,
-    hrtf: hrtf || false,
-    _err: 0,
-    get err() {
-      return this._err;
-    },
-    set err(val) {
-      // Errors should not be overwritten by later errors until they are cleared by a query.
-      if (this._err === 0 || val === 0) {
-        this._err = val;
-      }
-    }
-  };
-  AL.deviceRefCounts[deviceId]++;
-  AL.contexts[ctx.id] = ctx;
-  if (hrtf !== null) {
-    // Apply hrtf attrib to all contexts for this device
-    for (var ctxId in AL.contexts) {
-      var c = AL.contexts[ctxId];
-      if (c.deviceId === deviceId) {
-        c.hrtf = hrtf;
-        AL.updateContextGlobal(c);
-      }
-    }
-  }
-  return ctx.id;
-}
-
-_alcCreateContext.sig = "ppp";
-
-function _alcDestroyContext(contextId) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(178, 0, 1, contextId);
-  var ctx = AL.contexts[contextId];
-  if (AL.currentCtx === ctx) {
-    AL.alcErr = 40962;
-    return;
-  }
-  // Stop playback, etc
-  if (AL.contexts[contextId].interval) {
-    clearInterval(AL.contexts[contextId].interval);
-  }
-  AL.deviceRefCounts[ctx.deviceId]--;
-  delete AL.contexts[contextId];
-  AL.freeIds.push(contextId);
-}
-
-_alcDestroyContext.sig = "vp";
-
-function _alcGetError(deviceId) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(179, 0, 1, deviceId);
-  var err = AL.alcErr;
-  AL.alcErr = 0;
-  return err;
-}
-
-_alcGetError.sig = "ip";
-
-function _alcGetCurrentContext() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(180, 0, 1);
-  if (AL.currentCtx !== null) {
-    return AL.currentCtx.id;
-  }
-  return 0;
-}
-
-_alcGetCurrentContext.sig = "p";
-
-function _alcMakeContextCurrent(contextId) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(181, 0, 1, contextId);
-  if (contextId === 0) {
-    AL.currentCtx = null;
-  } else {
-    AL.currentCtx = AL.contexts[contextId];
-  }
-  return 1;
-}
-
-_alcMakeContextCurrent.sig = "ip";
-
-function _alcGetContextsDevice(contextId) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(182, 0, 1, contextId);
-  if (contextId in AL.contexts) {
-    return AL.contexts[contextId].deviceId;
-  }
-  return 0;
-}
-
-_alcGetContextsDevice.sig = "pp";
-
-var _alcProcessContext = contextId => {};
-
-_alcProcessContext.sig = "vp";
-
-var _alcSuspendContext = contextId => {};
-
-_alcSuspendContext.sig = "vp";
-
-function _alcIsExtensionPresent(deviceId, pExtName) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(183, 0, 1, deviceId, pExtName);
-  var name = UTF8ToString(pExtName);
-  return AL.ALC_EXTENSIONS[name] ? 1 : 0;
-}
-
-_alcIsExtensionPresent.sig = "ipp";
-
-function _alcGetEnumValue(deviceId, pEnumName) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(184, 0, 1, deviceId, pEnumName);
-  // Spec says :
-  // Using a NULL handle is legal, but only the
-  // tokens defined by the AL core are guaranteed.
-  if (deviceId !== 0 && !(deviceId in AL.deviceRefCounts)) {
-    // ALC_INVALID_DEVICE is not listed as a possible error state for
-    // this function, sadly.
-    return 0;
-  } else if (!pEnumName) {
-    AL.alcErr = 40964;
-    return 0;
-  }
-  var name = UTF8ToString(pEnumName);
-  // See alGetEnumValue(), but basically behave the same as OpenAL-Soft
-  switch (name) {
-   case "ALC_NO_ERROR":
-    return 0;
-
-   case "ALC_INVALID_DEVICE":
-    return 40961;
-
-   case "ALC_INVALID_CONTEXT":
-    return 40962;
-
-   case "ALC_INVALID_ENUM":
-    return 40963;
-
-   case "ALC_INVALID_VALUE":
-    return 40964;
-
-   case "ALC_OUT_OF_MEMORY":
-    return 40965;
-
-   case "ALC_MAJOR_VERSION":
-    return 4096;
-
-   case "ALC_MINOR_VERSION":
-    return 4097;
-
-   case "ALC_ATTRIBUTES_SIZE":
-    return 4098;
-
-   case "ALC_ALL_ATTRIBUTES":
-    return 4099;
-
-   case "ALC_DEFAULT_DEVICE_SPECIFIER":
-    return 4100;
-
-   case "ALC_DEVICE_SPECIFIER":
-    return 4101;
-
-   case "ALC_EXTENSIONS":
-    return 4102;
-
-   case "ALC_FREQUENCY":
-    return 4103;
-
-   case "ALC_REFRESH":
-    return 4104;
-
-   case "ALC_SYNC":
-    return 4105;
-
-   case "ALC_MONO_SOURCES":
-    return 4112;
-
-   case "ALC_STEREO_SOURCES":
-    return 4113;
-
-   case "ALC_CAPTURE_DEVICE_SPECIFIER":
-    return 784;
-
-   case "ALC_CAPTURE_DEFAULT_DEVICE_SPECIFIER":
-    return 785;
-
-   case "ALC_CAPTURE_SAMPLES":
-    return 786;
-
-   /* Extensions */ case "ALC_HRTF_SOFT":
-    return 6546;
-
-   case "ALC_HRTF_ID_SOFT":
-    return 6550;
-
-   case "ALC_DONT_CARE_SOFT":
-    return 2;
-
-   case "ALC_HRTF_STATUS_SOFT":
-    return 6547;
-
-   case "ALC_NUM_HRTF_SPECIFIERS_SOFT":
-    return 6548;
-
-   case "ALC_HRTF_SPECIFIER_SOFT":
-    return 6549;
-
-   case "ALC_HRTF_DISABLED_SOFT":
-    return 0;
-
-   case "ALC_HRTF_ENABLED_SOFT":
-    return 1;
-
-   case "ALC_HRTF_DENIED_SOFT":
-    return 2;
-
-   case "ALC_HRTF_REQUIRED_SOFT":
-    return 3;
-
-   case "ALC_HRTF_HEADPHONES_DETECTED_SOFT":
-    return 4;
-
-   case "ALC_HRTF_UNSUPPORTED_FORMAT_SOFT":
-    return 5;
-
-   default:
-    AL.alcErr = 40964;
-    return 0;
-  }
-}
-
-_alcGetEnumValue.sig = "ipp";
-
-function _alcGetString(deviceId, param) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(185, 0, 1, deviceId, param);
-  if (AL.alcStringCache[param]) {
-    return AL.alcStringCache[param];
-  }
-  var ret;
-  switch (param) {
-   case 0:
-    ret = "No Error";
-    break;
-
-   case 40961:
-    ret = "Invalid Device";
-    break;
-
-   case 40962:
-    ret = "Invalid Context";
-    break;
-
-   case 40963:
-    ret = "Invalid Enum";
-    break;
-
-   case 40964:
-    ret = "Invalid Value";
-    break;
-
-   case 40965:
-    ret = "Out of Memory";
-    break;
-
-   case 4100:
-    if (globalThis.AudioContext || globalThis.webkitAudioContext) {
-      ret = AL.DEVICE_NAME;
-    } else {
-      return 0;
-    }
-    break;
-
-   case 4101:
-    if (globalThis.AudioContext || globalThis.webkitAudioContext) {
-      ret = AL.DEVICE_NAME + "\0";
-    } else {
-      ret = "\0";
-    }
-    break;
-
-   case 785:
-    ret = AL.CAPTURE_DEVICE_NAME;
-    break;
-
-   case 784:
-    if (deviceId === 0) {
-      ret = AL.CAPTURE_DEVICE_NAME + "\0";
-    } else {
-      var c = AL.requireValidCaptureDevice(deviceId, "alcGetString");
-      if (!c) {
-        return 0;
-      }
-      ret = c.deviceName;
-    }
-    break;
-
-   case 4102:
-    if (!deviceId) {
-      AL.alcErr = 40961;
-      return 0;
-    }
-    ret = Object.keys(AL.ALC_EXTENSIONS).join(" ");
-    break;
-
-   default:
-    AL.alcErr = 40963;
-    return 0;
-  }
-  ret = stringToNewUTF8(ret);
-  AL.alcStringCache[param] = ret;
-  return ret;
-}
-
-_alcGetString.sig = "ppi";
-
-function _alcGetIntegerv(deviceId, param, size, pValues) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(186, 0, 1, deviceId, param, size, pValues);
-  if (size === 0 || !pValues) {
-    // Ignore the query, per the spec
-    return;
-  }
-  switch (param) {
-   case 4096:
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "storing")] = 1;
-    checkInt32(1);
-    break;
-
-   case 4097:
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "storing")] = 1;
-    checkInt32(1);
-    break;
-
-   case 4098:
-    if (!(deviceId in AL.deviceRefCounts)) {
-      AL.alcErr = 40961;
-      return;
-    }
-    if (!AL.currentCtx) {
-      AL.alcErr = 40962;
-      return;
-    }
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "storing")] = AL.currentCtx.attrs.length;
-    checkInt32(AL.currentCtx.attrs.length);
-    break;
-
-   case 4099:
-    if (!(deviceId in AL.deviceRefCounts)) {
-      AL.alcErr = 40961;
-      return;
-    }
-    if (!AL.currentCtx) {
-      AL.alcErr = 40962;
-      return;
-    }
-    for (var i = 0; i < AL.currentCtx.attrs.length; i++) {
-      HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (i * 4)) >> 2), "storing")] = AL.currentCtx.attrs[i];
-      checkInt32(AL.currentCtx.attrs[i]);
-    }
-    break;
-
-   case 4103:
-    if (!(deviceId in AL.deviceRefCounts)) {
-      AL.alcErr = 40961;
-      return;
-    }
-    if (!AL.currentCtx) {
-      AL.alcErr = 40962;
-      return;
-    }
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "storing")] = AL.currentCtx.audioCtx.sampleRate;
-    checkInt32(AL.currentCtx.audioCtx.sampleRate);
-    break;
-
-   case 4112:
-   case 4113:
-    if (!(deviceId in AL.deviceRefCounts)) {
-      AL.alcErr = 40961;
-      return;
-    }
-    if (!AL.currentCtx) {
-      AL.alcErr = 40962;
-      return;
-    }
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "storing")] = 2147483647;
-    checkInt32(2147483647);
-    break;
-
-   case 6546:
-   case 6547:
-    if (!(deviceId in AL.deviceRefCounts)) {
-      AL.alcErr = 40961;
-      return;
-    }
-    var hrtfStatus = 0;
-    for (var ctxId in AL.contexts) {
-      var ctx = AL.contexts[ctxId];
-      if (ctx.deviceId === deviceId) {
-        hrtfStatus = ctx.hrtf ? 1 : 0;
-      }
-    }
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "storing")] = hrtfStatus;
-    checkInt32(hrtfStatus);
-    break;
-
-   case 6548:
-    if (!(deviceId in AL.deviceRefCounts)) {
-      AL.alcErr = 40961;
-      return;
-    }
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "storing")] = 1;
-    checkInt32(1);
-    break;
-
-   case 131075:
-    if (!(deviceId in AL.deviceRefCounts)) {
-      AL.alcErr = 40961;
-      return;
-    }
-    if (!AL.currentCtx) {
-      AL.alcErr = 40962;
-      return;
-    }
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "storing")] = 1;
-    checkInt32(1);
-
-   case 786:
-    var c = AL.requireValidCaptureDevice(deviceId, "alcGetIntegerv");
-    if (!c) {
-      return;
-    }
-    var n = c.capturedFrameCount;
-    var dstfreq = c.requestedSampleRate;
-    var srcfreq = c.audioCtx.sampleRate;
-    var nsamples = Math.floor(n * (dstfreq / srcfreq));
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "storing")] = nsamples;
-    checkInt32(nsamples);
-    break;
-
-   default:
-    AL.alcErr = 40963;
-    return;
-  }
-}
-
-_alcGetIntegerv.sig = "vpiip";
-
-function _emscripten_alcDevicePauseSOFT(deviceId) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(187, 0, 1, deviceId);
-  if (!(deviceId in AL.deviceRefCounts)) {
-    AL.alcErr = 40961;
-    return;
-  }
-  if (AL.paused) {
-    return;
-  }
-  AL.paused = true;
-  for (var ctxId in AL.contexts) {
-    var ctx = AL.contexts[ctxId];
-    if (ctx.deviceId !== deviceId) {
-      continue;
-    }
-    ctx.audioCtx.suspend();
-    clearInterval(ctx.interval);
-    ctx.interval = null;
-  }
-}
-
-_emscripten_alcDevicePauseSOFT.sig = "vi";
-
-function _emscripten_alcDeviceResumeSOFT(deviceId) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(188, 0, 1, deviceId);
-  if (!(deviceId in AL.deviceRefCounts)) {
-    AL.alcErr = 40961;
-    return;
-  }
-  if (!AL.paused) {
-    return;
-  }
-  AL.paused = false;
-  for (var ctxId in AL.contexts) {
-    var ctx = AL.contexts[ctxId];
-    if (ctx.deviceId !== deviceId) {
-      continue;
-    }
-    ctx.interval = setInterval(() => AL.scheduleContextAudio(ctx), AL.QUEUE_INTERVAL);
-    ctx.audioCtx.resume();
-  }
-}
-
-_emscripten_alcDeviceResumeSOFT.sig = "vi";
-
-function _emscripten_alcGetStringiSOFT(deviceId, param, index) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(189, 0, 1, deviceId, param, index);
-  if (!(deviceId in AL.deviceRefCounts)) {
-    AL.alcErr = 40961;
-    return 0;
-  }
-  if (AL.alcStringCache[param]) {
-    return AL.alcStringCache[param];
-  }
-  var ret;
-  switch (param) {
-   case 6549:
-    if (index === 0) {
-      ret = "Web Audio HRTF";
-    } else {
-      AL.alcErr = 40964;
-      return 0;
-    }
-    break;
-
-   default:
-    if (index !== 0) {
-      AL.alcErr = 40963;
-      return 0;
-    }
-    return _alcGetString(deviceId, param);
-  }
-  ret = stringToNewUTF8(ret);
-  AL.alcStringCache[param] = ret;
-  return ret;
-}
-
-_emscripten_alcGetStringiSOFT.sig = "iiii";
-
-function _emscripten_alcResetDeviceSOFT(deviceId, pAttrList) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(190, 0, 1, deviceId, pAttrList);
-  if (!(deviceId in AL.deviceRefCounts)) {
-    AL.alcErr = 40961;
-    return 0;
-  }
-  var hrtf = null;
-  pAttrList >>= 2;
-  if (pAttrList) {
-    var attr = 0;
-    var val = 0;
-    while (true) {
-      attr = HEAP32[SAFE_HEAP_INDEX(HEAP32, pAttrList++, "loading")];
-      if (attr === 0) {
-        break;
-      }
-      val = HEAP32[SAFE_HEAP_INDEX(HEAP32, pAttrList++, "loading")];
-      switch (attr) {
-       case 6546:
-        if (val === 1) {
-          hrtf = true;
-        } else if (val === 0) {
-          hrtf = false;
-        }
-        break;
-      }
-    }
-  }
-  if (hrtf !== null) {
-    // Apply hrtf attrib to all contexts for this device
-    for (var ctxId in AL.contexts) {
-      var ctx = AL.contexts[ctxId];
-      if (ctx.deviceId === deviceId) {
-        ctx.hrtf = hrtf;
-        AL.updateContextGlobal(ctx);
-      }
-    }
-  }
-  return 1;
-}
-
-_emscripten_alcResetDeviceSOFT.sig = "iii";
-
-function _alGenBuffers(count, pBufferIds) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(191, 0, 1, count, pBufferIds);
-  if (!AL.currentCtx) {
-    return;
-  }
-  for (var i = 0; i < count; ++i) {
-    var buf = {
-      deviceId: AL.currentCtx.deviceId,
-      id: AL.newId(),
-      refCount: 0,
-      audioBuf: null,
-      frequency: 0,
-      bytesPerSample: 2,
-      channels: 1,
-      length: 0
-    };
-    AL.deviceRefCounts[buf.deviceId]++;
-    AL.buffers[buf.id] = buf;
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pBufferIds) + (i * 4)) >> 2), "storing")] = buf.id;
-    checkInt32(buf.id);
-  }
-}
-
-_alGenBuffers.sig = "vip";
-
-function _alDeleteBuffers(count, pBufferIds) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(192, 0, 1, count, pBufferIds);
-  if (!AL.currentCtx) {
-    return;
-  }
-  for (var i = 0; i < count; ++i) {
-    var bufId = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pBufferIds) + (i * 4)) >> 2), "loading")];
-    /// Deleting the zero buffer is a legal NOP, so ignore it
-    if (bufId === 0) {
-      continue;
-    }
-    // Make sure the buffer index is valid.
-    if (!AL.buffers[bufId]) {
-      AL.currentCtx.err = 40961;
-      return;
-    }
-    // Make sure the buffer is no longer in use.
-    if (AL.buffers[bufId].refCount) {
-      AL.currentCtx.err = 40964;
-      return;
-    }
-  }
-  for (var i = 0; i < count; ++i) {
-    var bufId = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pBufferIds) + (i * 4)) >> 2), "loading")];
-    if (bufId === 0) {
-      continue;
-    }
-    AL.deviceRefCounts[AL.buffers[bufId].deviceId]--;
-    delete AL.buffers[bufId];
-    AL.freeIds.push(bufId);
-  }
-}
-
-_alDeleteBuffers.sig = "vip";
-
-function _alGenSources(count, pSourceIds) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(193, 0, 1, count, pSourceIds);
-  if (!AL.currentCtx) {
-    return;
-  }
-  for (var i = 0; i < count; ++i) {
-    var gain = AL.currentCtx.audioCtx.createGain();
-    gain.connect(AL.currentCtx.gain);
-    var src = {
-      context: AL.currentCtx,
-      id: AL.newId(),
-      type: 4144,
-      state: 4113,
-      bufQueue: [ AL.buffers[0] ],
-      audioQueue: [],
-      looping: false,
-      pitch: 1,
-      dopplerShift: 1,
-      gain,
-      minGain: 0,
-      maxGain: 1,
-      panner: null,
-      bufsProcessed: 0,
-      bufStartTime: Number.NEGATIVE_INFINITY,
-      bufOffset: 0,
-      relative: false,
-      refDistance: 1,
-      maxDistance: 340282e33,
-      rolloffFactor: 1,
-      position: [ 0, 0, 0 ],
-      velocity: [ 0, 0, 0 ],
-      direction: [ 0, 0, 0 ],
-      coneOuterGain: 0,
-      coneInnerAngle: 360,
-      coneOuterAngle: 360,
-      distanceModel: 53250,
-      spatialize: 2,
-      get playbackRate() {
-        return this.pitch * this.dopplerShift;
-      }
-    };
-    AL.currentCtx.sources[src.id] = src;
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pSourceIds) + (i * 4)) >> 2), "storing")] = src.id;
-    checkInt32(src.id);
-  }
-}
-
-_alGenSources.sig = "vip";
-
-function _alSourcei(sourceId, param, value) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(195, 0, 1, sourceId, param, value);
-  switch (param) {
-   case 514:
-   case 4097:
-   case 4098:
-   case 4103:
-   case 4105:
-   case 4128:
-   case 4129:
-   case 4131:
-   case 4132:
-   case 4133:
-   case 4134:
-   case 4628:
-   case 8201:
-   case 8202:
-   case 53248:
-    AL.setSourceParam("alSourcei", sourceId, param, value);
-    break;
-
-   default:
-    AL.setSourceParam("alSourcei", sourceId, param, null);
-    break;
-  }
-}
-
-_alSourcei.sig = "viii";
-
-function _alDeleteSources(count, pSourceIds) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(194, 0, 1, count, pSourceIds);
-  if (!AL.currentCtx) {
-    return;
-  }
-  for (var i = 0; i < count; ++i) {
-    var srcId = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pSourceIds) + (i * 4)) >> 2), "loading")];
-    if (!AL.currentCtx.sources[srcId]) {
-      AL.currentCtx.err = 40961;
-      return;
-    }
-  }
-  for (var i = 0; i < count; ++i) {
-    var srcId = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pSourceIds) + (i * 4)) >> 2), "loading")];
-    AL.setSourceState(AL.currentCtx.sources[srcId], 4116);
-    _alSourcei(srcId, 4105, 0);
-    delete AL.currentCtx.sources[srcId];
-    AL.freeIds.push(srcId);
-  }
-}
-
-_alDeleteSources.sig = "vip";
-
-function _alGetError() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(196, 0, 1);
-  if (!AL.currentCtx) {
-    return 40964;
-  }
-  // Reset error on get.
-  var err = AL.currentCtx.err;
-  AL.currentCtx.err = 0;
-  return err;
-}
-
-_alGetError.sig = "i";
-
-function _alIsExtensionPresent(pExtName) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(197, 0, 1, pExtName);
-  var name = UTF8ToString(pExtName);
-  return AL.AL_EXTENSIONS[name] ? 1 : 0;
-}
-
-_alIsExtensionPresent.sig = "ip";
-
-function _alGetEnumValue(pEnumName) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(198, 0, 1, pEnumName);
-  if (!AL.currentCtx) {
-    return 0;
-  }
-  if (!pEnumName) {
-    AL.currentCtx.err = 40963;
-    return 0;
-  }
-  var name = UTF8ToString(pEnumName);
-  switch (name) {
-   // Spec doesn't clearly state that alGetEnumValue() is required to
-    // support _only_ extension tokens.
-    // We should probably follow OpenAL-Soft's example and support all
-    // of the names we know.
-    // See http://repo.or.cz/openal-soft.git/blob/HEAD:/Alc/ALc.c
-    case "AL_BITS":
-    return 8194;
-
-   case "AL_BUFFER":
-    return 4105;
-
-   case "AL_BUFFERS_PROCESSED":
-    return 4118;
-
-   case "AL_BUFFERS_QUEUED":
-    return 4117;
-
-   case "AL_BYTE_OFFSET":
-    return 4134;
-
-   case "AL_CHANNELS":
-    return 8195;
-
-   case "AL_CONE_INNER_ANGLE":
-    return 4097;
-
-   case "AL_CONE_OUTER_ANGLE":
-    return 4098;
-
-   case "AL_CONE_OUTER_GAIN":
-    return 4130;
-
-   case "AL_DIRECTION":
-    return 4101;
-
-   case "AL_DISTANCE_MODEL":
-    return 53248;
-
-   case "AL_DOPPLER_FACTOR":
-    return 49152;
-
-   case "AL_DOPPLER_VELOCITY":
-    return 49153;
-
-   case "AL_EXPONENT_DISTANCE":
-    return 53253;
-
-   case "AL_EXPONENT_DISTANCE_CLAMPED":
-    return 53254;
-
-   case "AL_EXTENSIONS":
-    return 45060;
-
-   case "AL_FORMAT_MONO16":
-    return 4353;
-
-   case "AL_FORMAT_MONO8":
-    return 4352;
-
-   case "AL_FORMAT_STEREO16":
-    return 4355;
-
-   case "AL_FORMAT_STEREO8":
-    return 4354;
-
-   case "AL_FREQUENCY":
-    return 8193;
-
-   case "AL_GAIN":
-    return 4106;
-
-   case "AL_INITIAL":
-    return 4113;
-
-   case "AL_INVALID":
-    return -1;
-
-   case "AL_ILLEGAL_ENUM":
-   // fallthrough
-    case "AL_INVALID_ENUM":
-    return 40962;
-
-   case "AL_INVALID_NAME":
-    return 40961;
-
-   case "AL_ILLEGAL_COMMAND":
-   // fallthrough
-    case "AL_INVALID_OPERATION":
-    return 40964;
-
-   case "AL_INVALID_VALUE":
-    return 40963;
-
-   case "AL_INVERSE_DISTANCE":
-    return 53249;
-
-   case "AL_INVERSE_DISTANCE_CLAMPED":
-    return 53250;
-
-   case "AL_LINEAR_DISTANCE":
-    return 53251;
-
-   case "AL_LINEAR_DISTANCE_CLAMPED":
-    return 53252;
-
-   case "AL_LOOPING":
-    return 4103;
-
-   case "AL_MAX_DISTANCE":
-    return 4131;
-
-   case "AL_MAX_GAIN":
-    return 4110;
-
-   case "AL_MIN_GAIN":
-    return 4109;
-
-   case "AL_NONE":
-    return 0;
-
-   case "AL_NO_ERROR":
-    return 0;
-
-   case "AL_ORIENTATION":
-    return 4111;
-
-   case "AL_OUT_OF_MEMORY":
-    return 40965;
-
-   case "AL_PAUSED":
-    return 4115;
-
-   case "AL_PENDING":
-    return 8209;
-
-   case "AL_PITCH":
-    return 4099;
-
-   case "AL_PLAYING":
-    return 4114;
-
-   case "AL_POSITION":
-    return 4100;
-
-   case "AL_PROCESSED":
-    return 8210;
-
-   case "AL_REFERENCE_DISTANCE":
-    return 4128;
-
-   case "AL_RENDERER":
-    return 45059;
-
-   case "AL_ROLLOFF_FACTOR":
-    return 4129;
-
-   case "AL_SAMPLE_OFFSET":
-    return 4133;
-
-   case "AL_SEC_OFFSET":
-    return 4132;
-
-   case "AL_SIZE":
-    return 8196;
-
-   case "AL_SOURCE_RELATIVE":
-    return 514;
-
-   case "AL_SOURCE_STATE":
-    return 4112;
-
-   case "AL_SOURCE_TYPE":
-    return 4135;
-
-   case "AL_SPEED_OF_SOUND":
-    return 49155;
-
-   case "AL_STATIC":
-    return 4136;
-
-   case "AL_STOPPED":
-    return 4116;
-
-   case "AL_STREAMING":
-    return 4137;
-
-   case "AL_UNDETERMINED":
-    return 4144;
-
-   case "AL_UNUSED":
-    return 8208;
-
-   case "AL_VELOCITY":
-    return 4102;
-
-   case "AL_VENDOR":
-    return 45057;
-
-   case "AL_VERSION":
-    return 45058;
-
-   /* Extensions */ case "AL_AUTO_SOFT":
-    return 2;
-
-   case "AL_SOURCE_DISTANCE_MODEL":
-    return 512;
-
-   case "AL_SOURCE_SPATIALIZE_SOFT":
-    return 4628;
-
-   case "AL_LOOP_POINTS_SOFT":
-    return 8213;
-
-   case "AL_BYTE_LENGTH_SOFT":
-    return 8201;
-
-   case "AL_SAMPLE_LENGTH_SOFT":
-    return 8202;
-
-   case "AL_SEC_LENGTH_SOFT":
-    return 8203;
-
-   case "AL_FORMAT_MONO_FLOAT32":
-    return 65552;
-
-   case "AL_FORMAT_STEREO_FLOAT32":
-    return 65553;
-
-   default:
-    AL.currentCtx.err = 40963;
-    return 0;
-  }
-}
-
-_alGetEnumValue.sig = "ip";
-
-function _alGetString(param) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(199, 0, 1, param);
-  if (AL.stringCache[param]) {
-    return AL.stringCache[param];
-  }
-  var ret;
-  switch (param) {
-   case 0:
-    ret = "No Error";
-    break;
-
-   case 40961:
-    ret = "Invalid Name";
-    break;
-
-   case 40962:
-    ret = "Invalid Enum";
-    break;
-
-   case 40963:
-    ret = "Invalid Value";
-    break;
-
-   case 40964:
-    ret = "Invalid Operation";
-    break;
-
-   case 40965:
-    ret = "Out of Memory";
-    break;
-
-   case 45057:
-    ret = "Emscripten";
-    break;
-
-   case 45058:
-    ret = "1.1";
-    break;
-
-   case 45059:
-    ret = "WebAudio";
-    break;
-
-   case 45060:
-    ret = Object.keys(AL.AL_EXTENSIONS).join(" ");
-    break;
-
-   default:
-    if (AL.currentCtx) {
-      AL.currentCtx.err = 40962;
-    } else {}
-    return 0;
-  }
-  ret = stringToNewUTF8(ret);
-  AL.stringCache[param] = ret;
-  return ret;
-}
-
-_alGetString.sig = "pi";
-
-function _alEnable(param) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(200, 0, 1, param);
-  if (!AL.currentCtx) {
-    return;
-  }
-  switch (param) {
-   case 512:
-    AL.currentCtx.sourceDistanceModel = true;
-    AL.updateContextGlobal(AL.currentCtx);
-    break;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return;
-  }
-}
-
-_alEnable.sig = "vi";
-
-function _alDisable(param) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(201, 0, 1, param);
-  if (!AL.currentCtx) {
-    return;
-  }
-  switch (param) {
-   case 512:
-    AL.currentCtx.sourceDistanceModel = false;
-    AL.updateContextGlobal(AL.currentCtx);
-    break;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return;
-  }
-}
-
-_alDisable.sig = "vi";
-
-function _alIsEnabled(param) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(202, 0, 1, param);
-  if (!AL.currentCtx) {
-    return 0;
-  }
-  switch (param) {
-   case 512:
-    return AL.currentCtx.sourceDistanceModel ? 0 : 1;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return 0;
-  }
-}
-
-_alIsEnabled.sig = "ii";
-
-function _alGetDouble(param) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(203, 0, 1, param);
-  var val = AL.getGlobalParam("alGetDouble", param);
-  if (val === null) {
-    return 0;
-  }
-  switch (param) {
-   case 49152:
-   case 49155:
-   case 53248:
-    return val;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return 0;
-  }
-}
-
-_alGetDouble.sig = "di";
-
-function _alGetDoublev(param, pValues) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(204, 0, 1, param, pValues);
-  var val = AL.getGlobalParam("alGetDoublev", param);
-  // Silently ignore null destinations, as per the spec for global state functions
-  if (val === null || !pValues) {
-    return;
-  }
-  switch (param) {
-   case 49152:
-   case 49155:
-   case 53248:
-    HEAPF64[SAFE_HEAP_INDEX(HEAPF64, ((pValues) >> 3), "storing")] = val;
-    break;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return;
-  }
-}
-
-_alGetDoublev.sig = "vip";
-
-function _alGetFloat(param) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(205, 0, 1, param);
-  var val = AL.getGlobalParam("alGetFloat", param);
-  if (val === null) {
-    return 0;
-  }
-  switch (param) {
-   case 49152:
-   case 49155:
-   case 53248:
-    return val;
-
-   default:
-    return 0;
-  }
-}
-
-_alGetFloat.sig = "fi";
-
-function _alGetFloatv(param, pValues) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(206, 0, 1, param, pValues);
-  var val = AL.getGlobalParam("alGetFloatv", param);
-  // Silently ignore null destinations, as per the spec for global state functions
-  if (val === null || !pValues) {
-    return;
-  }
-  switch (param) {
-   case 49152:
-   case 49155:
-   case 53248:
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((pValues) >> 2), "storing")] = val;
-    break;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return;
-  }
-}
-
-_alGetFloatv.sig = "vip";
-
-function _alGetInteger(param) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(207, 0, 1, param);
-  var val = AL.getGlobalParam("alGetInteger", param);
-  if (val === null) {
-    return 0;
-  }
-  switch (param) {
-   case 49152:
-   case 49155:
-   case 53248:
-    return val;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return 0;
-  }
-}
-
-_alGetInteger.sig = "ii";
-
-function _alGetIntegerv(param, pValues) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(208, 0, 1, param, pValues);
-  var val = AL.getGlobalParam("alGetIntegerv", param);
-  // Silently ignore null destinations, as per the spec for global state functions
-  if (val === null || !pValues) {
-    return;
-  }
-  switch (param) {
-   case 49152:
-   case 49155:
-   case 53248:
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "storing")] = val;
-    checkInt32(val);
-    break;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return;
-  }
-}
-
-_alGetIntegerv.sig = "vip";
-
-function _alGetBoolean(param) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(209, 0, 1, param);
-  var val = AL.getGlobalParam("alGetBoolean", param);
-  if (val === null) {
-    return 0;
-  }
-  switch (param) {
-   case 49152:
-   case 49155:
-   case 53248:
-    return val !== 0 ? 1 : 0;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return 0;
-  }
-}
-
-_alGetBoolean.sig = "ii";
-
-function _alGetBooleanv(param, pValues) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(210, 0, 1, param, pValues);
-  var val = AL.getGlobalParam("alGetBooleanv", param);
-  // Silently ignore null destinations, as per the spec for global state functions
-  if (val === null || !pValues) {
-    return;
-  }
-  switch (param) {
-   case 49152:
-   case 49155:
-   case 53248:
-    HEAP8[SAFE_HEAP_INDEX(HEAP8, pValues, "storing")] = val;
-    checkInt8(val);
-    break;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return;
-  }
-}
-
-_alGetBooleanv.sig = "vip";
-
-function _alDistanceModel(model) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(211, 0, 1, model);
-  AL.setGlobalParam("alDistanceModel", 53248, model);
-}
-
-_alDistanceModel.sig = "vi";
-
-function _alSpeedOfSound(value) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(212, 0, 1, value);
-  AL.setGlobalParam("alSpeedOfSound", 49155, value);
-}
-
-_alSpeedOfSound.sig = "vf";
-
-function _alDopplerFactor(value) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(213, 0, 1, value);
-  AL.setGlobalParam("alDopplerFactor", 49152, value);
-}
-
-_alDopplerFactor.sig = "vf";
-
-function _alDopplerVelocity(value) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(214, 0, 1, value);
-  warnOnce("alDopplerVelocity() is deprecated, and only kept for compatibility with OpenAL 1.0. Use alSpeedOfSound() instead.");
-  if (!AL.currentCtx) {
-    return;
-  }
-  if (value <= 0) {
-    // Negative or zero values are disallowed
-    AL.currentCtx.err = 40963;
-    return;
-  }
-}
-
-_alDopplerVelocity.sig = "vf";
-
-function _alGetListenerf(param, pValue) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(215, 0, 1, param, pValue);
-  var val = AL.getListenerParam("alGetListenerf", param);
-  if (val === null) {
-    return;
-  }
-  if (!pValue) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  switch (param) {
-   case 4106:
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((pValue) >> 2), "storing")] = val;
-    break;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return;
-  }
-}
-
-_alGetListenerf.sig = "vip";
-
-function _alGetListener3f(param, pValue0, pValue1, pValue2) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(216, 0, 1, param, pValue0, pValue1, pValue2);
-  var val = AL.getListenerParam("alGetListener3f", param);
-  if (val === null) {
-    return;
-  }
-  if (!pValue0 || !pValue1 || !pValue2) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  switch (param) {
-   case 4100:
-   case 4102:
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((pValue0) >> 2), "storing")] = val[0];
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((pValue1) >> 2), "storing")] = val[1];
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((pValue2) >> 2), "storing")] = val[2];
-    break;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return;
-  }
-}
-
-_alGetListener3f.sig = "vippp";
-
-function _alGetListenerfv(param, pValues) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(217, 0, 1, param, pValues);
-  var val = AL.getListenerParam("alGetListenerfv", param);
-  if (val === null) {
-    return;
-  }
-  if (!pValues) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  switch (param) {
-   case 4100:
-   case 4102:
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((pValues) >> 2), "storing")] = val[0];
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, (((pValues) + (4)) >> 2), "storing")] = val[1];
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, (((pValues) + (8)) >> 2), "storing")] = val[2];
-    break;
-
-   case 4111:
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((pValues) >> 2), "storing")] = val[0];
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, (((pValues) + (4)) >> 2), "storing")] = val[1];
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, (((pValues) + (8)) >> 2), "storing")] = val[2];
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, (((pValues) + (12)) >> 2), "storing")] = val[3];
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, (((pValues) + (16)) >> 2), "storing")] = val[4];
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, (((pValues) + (20)) >> 2), "storing")] = val[5];
-    break;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return;
-  }
-}
-
-_alGetListenerfv.sig = "vip";
-
-function _alGetListeneri(param, pValue) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(218, 0, 1, param, pValue);
-  var val = AL.getListenerParam("alGetListeneri", param);
-  if (val === null) {
-    return;
-  }
-  if (!pValue) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  AL.currentCtx.err = 40962;
-}
-
-_alGetListeneri.sig = "vip";
-
-function _alGetListener3i(param, pValue0, pValue1, pValue2) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(219, 0, 1, param, pValue0, pValue1, pValue2);
-  var val = AL.getListenerParam("alGetListener3i", param);
-  if (val === null) {
-    return;
-  }
-  if (!pValue0 || !pValue1 || !pValue2) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  switch (param) {
-   case 4100:
-   case 4102:
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValue0) >> 2), "storing")] = val[0];
-    checkInt32(val[0]);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValue1) >> 2), "storing")] = val[1];
-    checkInt32(val[1]);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValue2) >> 2), "storing")] = val[2];
-    checkInt32(val[2]);
-    break;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return;
-  }
-}
-
-_alGetListener3i.sig = "vippp";
-
-function _alGetListeneriv(param, pValues) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(220, 0, 1, param, pValues);
-  var val = AL.getListenerParam("alGetListeneriv", param);
-  if (val === null) {
-    return;
-  }
-  if (!pValues) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  switch (param) {
-   case 4100:
-   case 4102:
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "storing")] = val[0];
-    checkInt32(val[0]);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (4)) >> 2), "storing")] = val[1];
-    checkInt32(val[1]);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (8)) >> 2), "storing")] = val[2];
-    checkInt32(val[2]);
-    break;
-
-   case 4111:
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "storing")] = val[0];
-    checkInt32(val[0]);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (4)) >> 2), "storing")] = val[1];
-    checkInt32(val[1]);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (8)) >> 2), "storing")] = val[2];
-    checkInt32(val[2]);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (12)) >> 2), "storing")] = val[3];
-    checkInt32(val[3]);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (16)) >> 2), "storing")] = val[4];
-    checkInt32(val[4]);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (20)) >> 2), "storing")] = val[5];
-    checkInt32(val[5]);
-    break;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return;
-  }
-}
-
-_alGetListeneriv.sig = "vip";
-
-function _alListenerf(param, value) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(221, 0, 1, param, value);
-  switch (param) {
-   case 4106:
-    AL.setListenerParam("alListenerf", param, value);
-    break;
-
-   default:
-    AL.setListenerParam("alListenerf", param, null);
-    break;
-  }
-}
-
-_alListenerf.sig = "vif";
-
-function _alListener3f(param, value0, value1, value2) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(222, 0, 1, param, value0, value1, value2);
-  switch (param) {
-   case 4100:
-   case 4102:
-    AL.paramArray[0] = value0;
-    AL.paramArray[1] = value1;
-    AL.paramArray[2] = value2;
-    AL.setListenerParam("alListener3f", param, AL.paramArray);
-    break;
-
-   default:
-    AL.setListenerParam("alListener3f", param, null);
-    break;
-  }
-}
-
-_alListener3f.sig = "vifff";
-
-function _alListenerfv(param, pValues) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(223, 0, 1, param, pValues);
-  if (!AL.currentCtx) {
-    return;
-  }
-  if (!pValues) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  switch (param) {
-   case 4100:
-   case 4102:
-    AL.paramArray[0] = HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((pValues) >> 2), "loading")];
-    AL.paramArray[1] = HEAPF32[SAFE_HEAP_INDEX(HEAPF32, (((pValues) + (4)) >> 2), "loading")];
-    AL.paramArray[2] = HEAPF32[SAFE_HEAP_INDEX(HEAPF32, (((pValues) + (8)) >> 2), "loading")];
-    AL.setListenerParam("alListenerfv", param, AL.paramArray);
-    break;
-
-   case 4111:
-    AL.paramArray[0] = HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((pValues) >> 2), "loading")];
-    AL.paramArray[1] = HEAPF32[SAFE_HEAP_INDEX(HEAPF32, (((pValues) + (4)) >> 2), "loading")];
-    AL.paramArray[2] = HEAPF32[SAFE_HEAP_INDEX(HEAPF32, (((pValues) + (8)) >> 2), "loading")];
-    AL.paramArray[3] = HEAPF32[SAFE_HEAP_INDEX(HEAPF32, (((pValues) + (12)) >> 2), "loading")];
-    AL.paramArray[4] = HEAPF32[SAFE_HEAP_INDEX(HEAPF32, (((pValues) + (16)) >> 2), "loading")];
-    AL.paramArray[5] = HEAPF32[SAFE_HEAP_INDEX(HEAPF32, (((pValues) + (20)) >> 2), "loading")];
-    AL.setListenerParam("alListenerfv", param, AL.paramArray);
-    break;
-
-   default:
-    AL.setListenerParam("alListenerfv", param, null);
-    break;
-  }
-}
-
-_alListenerfv.sig = "vip";
-
-function _alListeneri(param, value) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(224, 0, 1, param, value);
-  AL.setListenerParam("alListeneri", param, null);
-}
-
-_alListeneri.sig = "vii";
-
-function _alListener3i(param, value0, value1, value2) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(225, 0, 1, param, value0, value1, value2);
-  switch (param) {
-   case 4100:
-   case 4102:
-    AL.paramArray[0] = value0;
-    AL.paramArray[1] = value1;
-    AL.paramArray[2] = value2;
-    AL.setListenerParam("alListener3i", param, AL.paramArray);
-    break;
-
-   default:
-    AL.setListenerParam("alListener3i", param, null);
-    break;
-  }
-}
-
-_alListener3i.sig = "viiii";
-
-function _alListeneriv(param, pValues) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(226, 0, 1, param, pValues);
-  if (!AL.currentCtx) {
-    return;
-  }
-  if (!pValues) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  switch (param) {
-   case 4100:
-   case 4102:
-    AL.paramArray[0] = HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "loading")];
-    AL.paramArray[1] = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (4)) >> 2), "loading")];
-    AL.paramArray[2] = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (8)) >> 2), "loading")];
-    AL.setListenerParam("alListeneriv", param, AL.paramArray);
-    break;
-
-   case 4111:
-    AL.paramArray[0] = HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "loading")];
-    AL.paramArray[1] = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (4)) >> 2), "loading")];
-    AL.paramArray[2] = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (8)) >> 2), "loading")];
-    AL.paramArray[3] = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (12)) >> 2), "loading")];
-    AL.paramArray[4] = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (16)) >> 2), "loading")];
-    AL.paramArray[5] = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (20)) >> 2), "loading")];
-    AL.setListenerParam("alListeneriv", param, AL.paramArray);
-    break;
-
-   default:
-    AL.setListenerParam("alListeneriv", param, null);
-    break;
-  }
-}
-
-_alListeneriv.sig = "vip";
-
-function _alIsBuffer(bufferId) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(227, 0, 1, bufferId);
-  if (!AL.currentCtx) {
-    return false;
-  }
-  if (bufferId > AL.buffers.length) {
-    return false;
-  }
-  if (!AL.buffers[bufferId]) {
-    return false;
-  }
-  return true;
-}
-
-_alIsBuffer.sig = "ii";
-
-function _alBufferData(bufferId, format, pData, size, freq) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(228, 0, 1, bufferId, format, pData, size, freq);
-  if (!AL.currentCtx) {
-    return;
-  }
-  var buf = AL.buffers[bufferId];
-  if (!buf) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  if (freq <= 0) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  var audioBuf = null;
-  try {
-    switch (format) {
-     case 4352:
-      if (size > 0) {
-        audioBuf = AL.currentCtx.audioCtx.createBuffer(1, size, freq);
-        var channel0 = audioBuf.getChannelData(0);
-        for (var i = 0; i < size; ++i) {
-          channel0[i] = HEAPU8[SAFE_HEAP_INDEX(HEAPU8, pData++, "loading")] * .0078125 - 1;
-        }
-      }
-      buf.bytesPerSample = 1;
-      buf.channels = 1;
-      buf.length = size;
-      break;
-
-     case 4353:
-      if (size > 0) {
-        audioBuf = AL.currentCtx.audioCtx.createBuffer(1, size >> 1, freq);
-        var channel0 = audioBuf.getChannelData(0);
-        pData >>= 1;
-        for (var i = 0; i < size >> 1; ++i) {
-          channel0[i] = HEAP16[SAFE_HEAP_INDEX(HEAP16, pData++, "loading")] * 30517578125e-15;
-        }
-      }
-      buf.bytesPerSample = 2;
-      buf.channels = 1;
-      buf.length = size >> 1;
-      break;
-
-     case 4354:
-      if (size > 0) {
-        audioBuf = AL.currentCtx.audioCtx.createBuffer(2, size >> 1, freq);
-        var channel0 = audioBuf.getChannelData(0);
-        var channel1 = audioBuf.getChannelData(1);
-        for (var i = 0; i < size >> 1; ++i) {
-          channel0[i] = HEAPU8[SAFE_HEAP_INDEX(HEAPU8, pData++, "loading")] * .0078125 - 1;
-          channel1[i] = HEAPU8[SAFE_HEAP_INDEX(HEAPU8, pData++, "loading")] * .0078125 - 1;
-        }
-      }
-      buf.bytesPerSample = 1;
-      buf.channels = 2;
-      buf.length = size >> 1;
-      break;
-
-     case 4355:
-      if (size > 0) {
-        audioBuf = AL.currentCtx.audioCtx.createBuffer(2, size >> 2, freq);
-        var channel0 = audioBuf.getChannelData(0);
-        var channel1 = audioBuf.getChannelData(1);
-        pData >>= 1;
-        for (var i = 0; i < size >> 2; ++i) {
-          channel0[i] = HEAP16[SAFE_HEAP_INDEX(HEAP16, pData++, "loading")] * 30517578125e-15;
-          channel1[i] = HEAP16[SAFE_HEAP_INDEX(HEAP16, pData++, "loading")] * 30517578125e-15;
-        }
-      }
-      buf.bytesPerSample = 2;
-      buf.channels = 2;
-      buf.length = size >> 2;
-      break;
-
-     case 65552:
-      if (size > 0) {
-        audioBuf = AL.currentCtx.audioCtx.createBuffer(1, size >> 2, freq);
-        var channel0 = audioBuf.getChannelData(0);
-        pData >>= 2;
-        for (var i = 0; i < size >> 2; ++i) {
-          channel0[i] = HEAPF32[SAFE_HEAP_INDEX(HEAPF32, pData++, "loading")];
-        }
-      }
-      buf.bytesPerSample = 4;
-      buf.channels = 1;
-      buf.length = size >> 2;
-      break;
-
-     case 65553:
-      if (size > 0) {
-        audioBuf = AL.currentCtx.audioCtx.createBuffer(2, size >> 3, freq);
-        var channel0 = audioBuf.getChannelData(0);
-        var channel1 = audioBuf.getChannelData(1);
-        pData >>= 2;
-        for (var i = 0; i < size >> 3; ++i) {
-          channel0[i] = HEAPF32[SAFE_HEAP_INDEX(HEAPF32, pData++, "loading")];
-          channel1[i] = HEAPF32[SAFE_HEAP_INDEX(HEAPF32, pData++, "loading")];
-        }
-      }
-      buf.bytesPerSample = 4;
-      buf.channels = 2;
-      buf.length = size >> 3;
-      break;
-
-     default:
-      AL.currentCtx.err = 40963;
-      return;
-    }
-    buf.frequency = freq;
-    buf.audioBuf = audioBuf;
-  } catch (e) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-}
-
-_alBufferData.sig = "viipii";
-
-function _alGetBufferf(bufferId, param, pValue) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(229, 0, 1, bufferId, param, pValue);
-  var val = AL.getBufferParam("alGetBufferf", bufferId, param);
-  if (val === null) {
-    return;
-  }
-  if (!pValue) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  AL.currentCtx.err = 40962;
-}
-
-_alGetBufferf.sig = "viip";
-
-function _alGetBuffer3f(bufferId, param, pValue0, pValue1, pValue2) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(230, 0, 1, bufferId, param, pValue0, pValue1, pValue2);
-  var val = AL.getBufferParam("alGetBuffer3f", bufferId, param);
-  if (val === null) {
-    return;
-  }
-  if (!pValue0 || !pValue1 || !pValue2) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  AL.currentCtx.err = 40962;
-}
-
-_alGetBuffer3f.sig = "viippp";
-
-function _alGetBufferfv(bufferId, param, pValues) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(231, 0, 1, bufferId, param, pValues);
-  var val = AL.getBufferParam("alGetBufferfv", bufferId, param);
-  if (val === null) {
-    return;
-  }
-  if (!pValues) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  AL.currentCtx.err = 40962;
-}
-
-_alGetBufferfv.sig = "viip";
-
-function _alGetBufferi(bufferId, param, pValue) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(232, 0, 1, bufferId, param, pValue);
-  var val = AL.getBufferParam("alGetBufferi", bufferId, param);
-  if (val === null) {
-    return;
-  }
-  if (!pValue) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  switch (param) {
-   case 8193:
-   case 8194:
-   case 8195:
-   case 8196:
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValue) >> 2), "storing")] = val;
-    checkInt32(val);
-    break;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return;
-  }
-}
-
-_alGetBufferi.sig = "viip";
-
-function _alGetBuffer3i(bufferId, param, pValue0, pValue1, pValue2) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(233, 0, 1, bufferId, param, pValue0, pValue1, pValue2);
-  var val = AL.getBufferParam("alGetBuffer3i", bufferId, param);
-  if (val === null) {
-    return;
-  }
-  if (!pValue0 || !pValue1 || !pValue2) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  AL.currentCtx.err = 40962;
-}
-
-_alGetBuffer3i.sig = "viippp";
-
-function _alGetBufferiv(bufferId, param, pValues) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(234, 0, 1, bufferId, param, pValues);
-  var val = AL.getBufferParam("alGetBufferiv", bufferId, param);
-  if (val === null) {
-    return;
-  }
-  if (!pValues) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  switch (param) {
-   case 8193:
-   case 8194:
-   case 8195:
-   case 8196:
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "storing")] = val;
-    checkInt32(val);
-    break;
-
-   case 8213:
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "storing")] = val[0];
-    checkInt32(val[0]);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (4)) >> 2), "storing")] = val[1];
-    checkInt32(val[1]);
-    break;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return;
-  }
-}
-
-_alGetBufferiv.sig = "viip";
-
-function _alBufferf(bufferId, param, value) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(235, 0, 1, bufferId, param, value);
-  AL.setBufferParam("alBufferf", bufferId, param, null);
-}
-
-_alBufferf.sig = "viif";
-
-function _alBuffer3f(bufferId, param, value0, value1, value2) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(236, 0, 1, bufferId, param, value0, value1, value2);
-  AL.setBufferParam("alBuffer3f", bufferId, param, null);
-}
-
-_alBuffer3f.sig = "viifff";
-
-function _alBufferfv(bufferId, param, pValues) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(237, 0, 1, bufferId, param, pValues);
-  if (!AL.currentCtx) {
-    return;
-  }
-  if (!pValues) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  AL.setBufferParam("alBufferfv", bufferId, param, null);
-}
-
-_alBufferfv.sig = "viip";
-
-function _alBufferi(bufferId, param, value) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(238, 0, 1, bufferId, param, value);
-  AL.setBufferParam("alBufferi", bufferId, param, null);
-}
-
-_alBufferi.sig = "viii";
-
-function _alBuffer3i(bufferId, param, value0, value1, value2) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(239, 0, 1, bufferId, param, value0, value1, value2);
-  AL.setBufferParam("alBuffer3i", bufferId, param, null);
-}
-
-_alBuffer3i.sig = "viiiii";
-
-function _alBufferiv(bufferId, param, pValues) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(240, 0, 1, bufferId, param, pValues);
-  if (!AL.currentCtx) {
-    return;
-  }
-  if (!pValues) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  switch (param) {
-   case 8213:
-    AL.paramArray[0] = HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "loading")];
-    AL.paramArray[1] = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (4)) >> 2), "loading")];
-    AL.setBufferParam("alBufferiv", bufferId, param, AL.paramArray);
-    break;
-
-   default:
-    AL.setBufferParam("alBufferiv", bufferId, param, null);
-    break;
-  }
-}
-
-_alBufferiv.sig = "viip";
-
-function _alIsSource(sourceId) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(241, 0, 1, sourceId);
-  if (!AL.currentCtx) {
-    return false;
-  }
-  if (!AL.currentCtx.sources[sourceId]) {
-    return false;
-  }
-  return true;
-}
-
-_alIsSource.sig = "ii";
-
-function _alSourceQueueBuffers(sourceId, count, pBufferIds) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(242, 0, 1, sourceId, count, pBufferIds);
-  if (!AL.currentCtx) {
-    return;
-  }
-  var src = AL.currentCtx.sources[sourceId];
-  if (!src) {
-    AL.currentCtx.err = 40961;
-    return;
-  }
-  if (src.type === 4136) {
-    AL.currentCtx.err = 40964;
-    return;
-  }
-  if (count === 0) {
-    return;
-  }
-  // Find the first non-zero buffer in the queue to determine the proper format
-  var templateBuf = AL.buffers[0];
-  for (var buf of src.bufQueue) {
-    if (buf.id !== 0) {
-      templateBuf = buf;
-      break;
-    }
-  }
-  for (var i = 0; i < count; ++i) {
-    var bufId = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pBufferIds) + (i * 4)) >> 2), "loading")];
-    var buf = AL.buffers[bufId];
-    if (!buf) {
-      AL.currentCtx.err = 40961;
-      return;
-    }
-    // Check that the added buffer has the correct format. If the template is the zero buffer, any format is valid.
-    if (templateBuf.id !== 0 && (buf.frequency !== templateBuf.frequency || buf.bytesPerSample !== templateBuf.bytesPerSample || buf.channels !== templateBuf.channels)) {
-      AL.currentCtx.err = 40964;
-    }
-  }
-  // If the only buffer in the queue is the zero buffer, clear the queue before we add anything.
-  if (src.bufQueue.length === 1 && src.bufQueue[0].id === 0) {
-    src.bufQueue.length = 0;
-  }
-  src.type = 4137;
-  for (var i = 0; i < count; ++i) {
-    var bufId = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pBufferIds) + (i * 4)) >> 2), "loading")];
-    var buf = AL.buffers[bufId];
-    buf.refCount++;
-    src.bufQueue.push(buf);
-  }
-  // if the source is looping, cancel the schedule so we can reschedule the loop order
-  if (src.looping) {
-    AL.cancelPendingSourceAudio(src);
-  }
-  AL.initSourcePanner(src);
-  AL.scheduleSourceAudio(src);
-}
-
-_alSourceQueueBuffers.sig = "viip";
-
-function _alSourceUnqueueBuffers(sourceId, count, pBufferIds) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(243, 0, 1, sourceId, count, pBufferIds);
-  if (!AL.currentCtx) {
-    return;
-  }
-  var src = AL.currentCtx.sources[sourceId];
-  if (!src) {
-    AL.currentCtx.err = 40961;
-    return;
-  }
-  if (count > (src.bufQueue.length === 1 && src.bufQueue[0].id === 0 ? 0 : src.bufsProcessed)) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  if (count === 0) {
-    return;
-  }
-  for (var i = 0; i < count; i++) {
-    var buf = src.bufQueue.shift();
-    buf.refCount--;
-    // Write the buffers index out to the return list.
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pBufferIds) + (i * 4)) >> 2), "storing")] = buf.id;
-    checkInt32(buf.id);
-    src.bufsProcessed--;
-  }
-  /// If the queue is empty, put the zero buffer back in
-  if (src.bufQueue.length === 0) {
-    src.bufQueue.push(AL.buffers[0]);
-  }
-  AL.initSourcePanner(src);
-  AL.scheduleSourceAudio(src);
-}
-
-_alSourceUnqueueBuffers.sig = "viip";
-
-function _alSourcePlay(sourceId) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(244, 0, 1, sourceId);
-  if (!AL.currentCtx) {
-    return;
-  }
-  var src = AL.currentCtx.sources[sourceId];
-  if (!src) {
-    AL.currentCtx.err = 40961;
-    return;
-  }
-  AL.setSourceState(src, 4114);
-}
-
-_alSourcePlay.sig = "vi";
-
-function _alSourcePlayv(count, pSourceIds) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(245, 0, 1, count, pSourceIds);
-  if (!AL.currentCtx) {
-    return;
-  }
-  if (!pSourceIds) {
-    AL.currentCtx.err = 40963;
-  }
-  for (var i = 0; i < count; ++i) {
-    if (!AL.currentCtx.sources[HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pSourceIds) + (i * 4)) >> 2), "loading")]]) {
-      AL.currentCtx.err = 40961;
-      return;
-    }
-  }
-  for (var i = 0; i < count; ++i) {
-    var srcId = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pSourceIds) + (i * 4)) >> 2), "loading")];
-    AL.setSourceState(AL.currentCtx.sources[srcId], 4114);
-  }
-}
-
-_alSourcePlayv.sig = "vip";
-
-function _alSourceStop(sourceId) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(246, 0, 1, sourceId);
-  if (!AL.currentCtx) {
-    return;
-  }
-  var src = AL.currentCtx.sources[sourceId];
-  if (!src) {
-    AL.currentCtx.err = 40961;
-    return;
-  }
-  AL.setSourceState(src, 4116);
-}
-
-_alSourceStop.sig = "vi";
-
-function _alSourceStopv(count, pSourceIds) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(247, 0, 1, count, pSourceIds);
-  if (!AL.currentCtx) {
-    return;
-  }
-  if (!pSourceIds) {
-    AL.currentCtx.err = 40963;
-  }
-  for (var i = 0; i < count; ++i) {
-    if (!AL.currentCtx.sources[HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pSourceIds) + (i * 4)) >> 2), "loading")]]) {
-      AL.currentCtx.err = 40961;
-      return;
-    }
-  }
-  for (var i = 0; i < count; ++i) {
-    var srcId = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pSourceIds) + (i * 4)) >> 2), "loading")];
-    AL.setSourceState(AL.currentCtx.sources[srcId], 4116);
-  }
-}
-
-_alSourceStopv.sig = "vip";
-
-function _alSourceRewind(sourceId) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(248, 0, 1, sourceId);
-  if (!AL.currentCtx) {
-    return;
-  }
-  var src = AL.currentCtx.sources[sourceId];
-  if (!src) {
-    AL.currentCtx.err = 40961;
-    return;
-  }
-  // Stop the source first to clear the source queue
-  AL.setSourceState(src, 4116);
-  // Now set the state of AL_INITIAL according to the specification
-  AL.setSourceState(src, 4113);
-}
-
-_alSourceRewind.sig = "vi";
-
-function _alSourceRewindv(count, pSourceIds) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(249, 0, 1, count, pSourceIds);
-  if (!AL.currentCtx) {
-    return;
-  }
-  if (!pSourceIds) {
-    AL.currentCtx.err = 40963;
-  }
-  for (var i = 0; i < count; ++i) {
-    if (!AL.currentCtx.sources[HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pSourceIds) + (i * 4)) >> 2), "loading")]]) {
-      AL.currentCtx.err = 40961;
-      return;
-    }
-  }
-  for (var i = 0; i < count; ++i) {
-    var srcId = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pSourceIds) + (i * 4)) >> 2), "loading")];
-    AL.setSourceState(AL.currentCtx.sources[srcId], 4113);
-  }
-}
-
-_alSourceRewindv.sig = "vip";
-
-function _alSourcePause(sourceId) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(250, 0, 1, sourceId);
-  if (!AL.currentCtx) {
-    return;
-  }
-  var src = AL.currentCtx.sources[sourceId];
-  if (!src) {
-    AL.currentCtx.err = 40961;
-    return;
-  }
-  AL.setSourceState(src, 4115);
-}
-
-_alSourcePause.sig = "vi";
-
-function _alSourcePausev(count, pSourceIds) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(251, 0, 1, count, pSourceIds);
-  if (!AL.currentCtx) {
-    return;
-  }
-  if (!pSourceIds) {
-    AL.currentCtx.err = 40963;
-  }
-  for (var i = 0; i < count; ++i) {
-    if (!AL.currentCtx.sources[HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pSourceIds) + (i * 4)) >> 2), "loading")]]) {
-      AL.currentCtx.err = 40961;
-      return;
-    }
-  }
-  for (var i = 0; i < count; ++i) {
-    var srcId = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pSourceIds) + (i * 4)) >> 2), "loading")];
-    AL.setSourceState(AL.currentCtx.sources[srcId], 4115);
-  }
-}
-
-_alSourcePausev.sig = "vip";
-
-function _alGetSourcef(sourceId, param, pValue) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(252, 0, 1, sourceId, param, pValue);
-  var val = AL.getSourceParam("alGetSourcef", sourceId, param);
-  if (val === null) {
-    return;
-  }
-  if (!pValue) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  switch (param) {
-   case 4097:
-   case 4098:
-   case 4099:
-   case 4106:
-   case 4109:
-   case 4110:
-   case 4128:
-   case 4129:
-   case 4130:
-   case 4131:
-   case 4132:
-   case 4133:
-   case 4134:
-   case 8203:
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((pValue) >> 2), "storing")] = val;
-    break;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return;
-  }
-}
-
-_alGetSourcef.sig = "viip";
-
-function _alGetSource3f(sourceId, param, pValue0, pValue1, pValue2) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(253, 0, 1, sourceId, param, pValue0, pValue1, pValue2);
-  var val = AL.getSourceParam("alGetSource3f", sourceId, param);
-  if (val === null) {
-    return;
-  }
-  if (!pValue0 || !pValue1 || !pValue2) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  switch (param) {
-   case 4100:
-   case 4101:
-   case 4102:
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((pValue0) >> 2), "storing")] = val[0];
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((pValue1) >> 2), "storing")] = val[1];
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((pValue2) >> 2), "storing")] = val[2];
-    break;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return;
-  }
-}
-
-_alGetSource3f.sig = "viippp";
-
-function _alGetSourcefv(sourceId, param, pValues) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(254, 0, 1, sourceId, param, pValues);
-  var val = AL.getSourceParam("alGetSourcefv", sourceId, param);
-  if (val === null) {
-    return;
-  }
-  if (!pValues) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  switch (param) {
-   case 4097:
-   case 4098:
-   case 4099:
-   case 4106:
-   case 4109:
-   case 4110:
-   case 4128:
-   case 4129:
-   case 4130:
-   case 4131:
-   case 4132:
-   case 4133:
-   case 4134:
-   case 8203:
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((pValues) >> 2), "storing")] = val[0];
-    break;
-
-   case 4100:
-   case 4101:
-   case 4102:
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((pValues) >> 2), "storing")] = val[0];
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, (((pValues) + (4)) >> 2), "storing")] = val[1];
-    HEAPF32[SAFE_HEAP_INDEX(HEAPF32, (((pValues) + (8)) >> 2), "storing")] = val[2];
-    break;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return;
-  }
-}
-
-_alGetSourcefv.sig = "viip";
-
-function _alGetSourcei(sourceId, param, pValue) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(255, 0, 1, sourceId, param, pValue);
-  var val = AL.getSourceParam("alGetSourcei", sourceId, param);
-  if (val === null) {
-    return;
-  }
-  if (!pValue) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  switch (param) {
-   case 514:
-   case 4097:
-   case 4098:
-   case 4103:
-   case 4105:
-   case 4112:
-   case 4117:
-   case 4118:
-   case 4128:
-   case 4129:
-   case 4131:
-   case 4132:
-   case 4133:
-   case 4134:
-   case 4135:
-   case 4628:
-   case 8201:
-   case 8202:
-   case 53248:
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValue) >> 2), "storing")] = val;
-    checkInt32(val);
-    break;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return;
-  }
-}
-
-_alGetSourcei.sig = "viip";
-
-function _alGetSource3i(sourceId, param, pValue0, pValue1, pValue2) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(256, 0, 1, sourceId, param, pValue0, pValue1, pValue2);
-  var val = AL.getSourceParam("alGetSource3i", sourceId, param);
-  if (val === null) {
-    return;
-  }
-  if (!pValue0 || !pValue1 || !pValue2) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  switch (param) {
-   case 4100:
-   case 4101:
-   case 4102:
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValue0) >> 2), "storing")] = val[0];
-    checkInt32(val[0]);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValue1) >> 2), "storing")] = val[1];
-    checkInt32(val[1]);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValue2) >> 2), "storing")] = val[2];
-    checkInt32(val[2]);
-    break;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return;
-  }
-}
-
-_alGetSource3i.sig = "viippp";
-
-function _alGetSourceiv(sourceId, param, pValues) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(257, 0, 1, sourceId, param, pValues);
-  var val = AL.getSourceParam("alGetSourceiv", sourceId, param);
-  if (val === null) {
-    return;
-  }
-  if (!pValues) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  switch (param) {
-   case 514:
-   case 4097:
-   case 4098:
-   case 4103:
-   case 4105:
-   case 4112:
-   case 4117:
-   case 4118:
-   case 4128:
-   case 4129:
-   case 4131:
-   case 4132:
-   case 4133:
-   case 4134:
-   case 4135:
-   case 4628:
-   case 8201:
-   case 8202:
-   case 53248:
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "storing")] = val;
-    checkInt32(val);
-    break;
-
-   case 4100:
-   case 4101:
-   case 4102:
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "storing")] = val[0];
-    checkInt32(val[0]);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (4)) >> 2), "storing")] = val[1];
-    checkInt32(val[1]);
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (8)) >> 2), "storing")] = val[2];
-    checkInt32(val[2]);
-    break;
-
-   default:
-    AL.currentCtx.err = 40962;
-    return;
-  }
-}
-
-_alGetSourceiv.sig = "viip";
-
-function _alSourcef(sourceId, param, value) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(258, 0, 1, sourceId, param, value);
-  switch (param) {
-   case 4097:
-   case 4098:
-   case 4099:
-   case 4106:
-   case 4109:
-   case 4110:
-   case 4128:
-   case 4129:
-   case 4130:
-   case 4131:
-   case 4132:
-   case 4133:
-   case 4134:
-   case 8203:
-    AL.setSourceParam("alSourcef", sourceId, param, value);
-    break;
-
-   default:
-    AL.setSourceParam("alSourcef", sourceId, param, null);
-    break;
-  }
-}
-
-_alSourcef.sig = "viif";
-
-function _alSource3f(sourceId, param, value0, value1, value2) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(259, 0, 1, sourceId, param, value0, value1, value2);
-  switch (param) {
-   case 4100:
-   case 4101:
-   case 4102:
-    AL.paramArray[0] = value0;
-    AL.paramArray[1] = value1;
-    AL.paramArray[2] = value2;
-    AL.setSourceParam("alSource3f", sourceId, param, AL.paramArray);
-    break;
-
-   default:
-    AL.setSourceParam("alSource3f", sourceId, param, null);
-    break;
-  }
-}
-
-_alSource3f.sig = "viifff";
-
-function _alSourcefv(sourceId, param, pValues) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(260, 0, 1, sourceId, param, pValues);
-  if (!AL.currentCtx) {
-    return;
-  }
-  if (!pValues) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  switch (param) {
-   case 4097:
-   case 4098:
-   case 4099:
-   case 4106:
-   case 4109:
-   case 4110:
-   case 4128:
-   case 4129:
-   case 4130:
-   case 4131:
-   case 4132:
-   case 4133:
-   case 4134:
-   case 8203:
-    var val = HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((pValues) >> 2), "loading")];
-    AL.setSourceParam("alSourcefv", sourceId, param, val);
-    break;
-
-   case 4100:
-   case 4101:
-   case 4102:
-    AL.paramArray[0] = HEAPF32[SAFE_HEAP_INDEX(HEAPF32, ((pValues) >> 2), "loading")];
-    AL.paramArray[1] = HEAPF32[SAFE_HEAP_INDEX(HEAPF32, (((pValues) + (4)) >> 2), "loading")];
-    AL.paramArray[2] = HEAPF32[SAFE_HEAP_INDEX(HEAPF32, (((pValues) + (8)) >> 2), "loading")];
-    AL.setSourceParam("alSourcefv", sourceId, param, AL.paramArray);
-    break;
-
-   default:
-    AL.setSourceParam("alSourcefv", sourceId, param, null);
-    break;
-  }
-}
-
-_alSourcefv.sig = "viip";
-
-function _alSource3i(sourceId, param, value0, value1, value2) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(261, 0, 1, sourceId, param, value0, value1, value2);
-  switch (param) {
-   case 4100:
-   case 4101:
-   case 4102:
-    AL.paramArray[0] = value0;
-    AL.paramArray[1] = value1;
-    AL.paramArray[2] = value2;
-    AL.setSourceParam("alSource3i", sourceId, param, AL.paramArray);
-    break;
-
-   default:
-    AL.setSourceParam("alSource3i", sourceId, param, null);
-    break;
-  }
-}
-
-_alSource3i.sig = "viiiii";
-
-function _alSourceiv(sourceId, param, pValues) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(262, 0, 1, sourceId, param, pValues);
-  if (!AL.currentCtx) {
-    return;
-  }
-  if (!pValues) {
-    AL.currentCtx.err = 40963;
-    return;
-  }
-  switch (param) {
-   case 514:
-   case 4097:
-   case 4098:
-   case 4103:
-   case 4105:
-   case 4128:
-   case 4129:
-   case 4131:
-   case 4132:
-   case 4133:
-   case 4134:
-   case 4628:
-   case 8201:
-   case 8202:
-   case 53248:
-    var val = HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "loading")];
-    AL.setSourceParam("alSourceiv", sourceId, param, val);
-    break;
-
-   case 4100:
-   case 4101:
-   case 4102:
-    AL.paramArray[0] = HEAP32[SAFE_HEAP_INDEX(HEAP32, ((pValues) >> 2), "loading")];
-    AL.paramArray[1] = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (4)) >> 2), "loading")];
-    AL.paramArray[2] = HEAP32[SAFE_HEAP_INDEX(HEAP32, (((pValues) + (8)) >> 2), "loading")];
-    AL.setSourceParam("alSourceiv", sourceId, param, AL.paramArray);
-    break;
-
-   default:
-    AL.setSourceParam("alSourceiv", sourceId, param, null);
-    break;
-  }
-}
-
-_alSourceiv.sig = "viip";
-
-var _glutPostRedisplay = function() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(263, 0, 1);
-  if (GLUT.displayFunc && !GLUT.requestedAnimationFrame) {
-    GLUT.requestedAnimationFrame = true;
-    MainLoop.requestAnimationFrame(() => {
-      GLUT.requestedAnimationFrame = false;
-      MainLoop.runIter(() => getWasmTableEntry(GLUT.displayFunc)());
-    });
-  }
-};
-
-_glutPostRedisplay.sig = "v";
-
-var GLUT = {
-  initTime: null,
-  idleFunc: null,
-  displayFunc: null,
-  keyboardFunc: null,
-  keyboardUpFunc: null,
-  specialFunc: null,
-  specialUpFunc: null,
-  reshapeFunc: null,
-  motionFunc: null,
-  passiveMotionFunc: null,
-  mouseFunc: null,
-  buttons: 0,
-  modifiers: 0,
-  initWindowWidth: 256,
-  initWindowHeight: 256,
-  initDisplayMode: 18,
-  windowX: 0,
-  windowY: 0,
-  windowWidth: 0,
-  windowHeight: 0,
-  requestedAnimationFrame: false,
-  saveModifiers: event => {
-    GLUT.modifiers = 0;
-    if (event["shiftKey"]) GLUT.modifiers += 1;
-    /* GLUT_ACTIVE_SHIFT */ if (event["ctrlKey"]) GLUT.modifiers += 2;
-    /* GLUT_ACTIVE_CTRL */ if (event["altKey"]) GLUT.modifiers += 4;
-  },
-  onMousemove: event => {
-    /* Send motion event only if the motion changed, prevents
-       * spamming our app with unnecessary callbacks. It does happen in
-       * Chrome on Windows.
-       */ var lastX = Browser.mouseX;
-    var lastY = Browser.mouseY;
-    Browser.calculateMouseEvent(event);
-    var newX = Browser.mouseX;
-    var newY = Browser.mouseY;
-    if (newX == lastX && newY == lastY) return;
-    if (GLUT.buttons == 0 && event.target == Browser.getCanvas() && GLUT.passiveMotionFunc) {
-      event.preventDefault();
-      GLUT.saveModifiers(event);
-      getWasmTableEntry(GLUT.passiveMotionFunc)(lastX, lastY);
-    } else if (GLUT.buttons != 0 && GLUT.motionFunc) {
-      event.preventDefault();
-      GLUT.saveModifiers(event);
-      getWasmTableEntry(GLUT.motionFunc)(lastX, lastY);
-    }
-  },
-  getSpecialKey: keycode => {
-    var key = null;
-    switch (keycode) {
-     case 8:
-      key = 120;
-      break;
-
-     case 46:
-      key = 111;
-      break;
-
-     case 112:
-      key = 1;
-      break;
-
-     case 113:
-      key = 2;
-      break;
-
-     case 114:
-      key = 3;
-      break;
-
-     case 115:
-      key = 4;
-      break;
-
-     case 116:
-      key = 5;
-      break;
-
-     case 117:
-      key = 6;
-      break;
-
-     case 118:
-      key = 7;
-      break;
-
-     case 119:
-      key = 8;
-      break;
-
-     case 120:
-      key = 9;
-      break;
-
-     case 121:
-      key = 10;
-      break;
-
-     case 122:
-      key = 11;
-      break;
-
-     case 123:
-      key = 12;
-      break;
-
-     case 37:
-      key = 100;
-      break;
-
-     case 38:
-      key = 101;
-      break;
-
-     case 39:
-      key = 102;
-      break;
-
-     case 40:
-      key = 103;
-      break;
-
-     case 33:
-      key = 104;
-      break;
-
-     case 34:
-      key = 105;
-      break;
-
-     case 36:
-      key = 106;
-      break;
-
-     case 35:
-      key = 107;
-      break;
-
-     case 45:
-      key = 108;
-      break;
-
-     case 16:
-     case 5:
-      key = 112;
-      break;
-
-     case 6:
-      key = 113;
-      break;
-
-     case 17:
-     case 3:
-      key = 114;
-      break;
-
-     case 4:
-      key = 115;
-      break;
-
-     case 18:
-     case 2:
-      key = 116;
-      break;
-
-     case 1:
-      key = 117;
-      break;
-    }
-    return key;
-  },
-  getASCIIKey: event => {
-    if (event["ctrlKey"] || event["altKey"] || event["metaKey"]) return null;
-    var keycode = event["keyCode"];
-    /* The exact list is soooo hard to find in a canonical place! */ if (48 <= keycode && keycode <= 57) return keycode;
-    // numeric  TODO handle shift?
-    if (65 <= keycode && keycode <= 90) return event["shiftKey"] ? keycode : keycode + 32;
-    if (96 <= keycode && keycode <= 105) return keycode - 48;
-    // numpad numbers
-    if (106 <= keycode && keycode <= 111) return keycode - 106 + 42;
-    // *,+-./  TODO handle shift?
-    switch (keycode) {
-     case 9:
-     // tab key
-      case 13:
-     // return key
-      case 27:
-     // escape
-      case 32:
-     // space
-      case 61:
-      // equal
-      return keycode;
-    }
-    var s = event["shiftKey"];
-    switch (keycode) {
-     case 186:
-      return s ? 58 : 59;
-
-     // colon / semi-colon
-      case 187:
-      return s ? 43 : 61;
-
-     // add / equal (these two may be wrong)
-      case 188:
-      return s ? 60 : 44;
-
-     // less-than / comma
-      case 189:
-      return s ? 95 : 45;
-
-     // dash
-      case 190:
-      return s ? 62 : 46;
-
-     // greater-than / period
-      case 191:
-      return s ? 63 : 47;
-
-     // forward slash
-      case 219:
-      return s ? 123 : 91;
-
-     // open bracket
-      case 220:
-      return s ? 124 : 47;
-
-     // back slash
-      case 221:
-      return s ? 125 : 93;
-
-     // close bracket
-      case 222:
-      return s ? 34 : 39;
-    }
-    return null;
-  },
-  onKeydown: event => {
-    if (GLUT.specialFunc || GLUT.keyboardFunc) {
-      var key = GLUT.getSpecialKey(event["keyCode"]);
-      if (key !== null) {
-        if (GLUT.specialFunc) {
-          event.preventDefault();
-          GLUT.saveModifiers(event);
-          getWasmTableEntry(GLUT.specialFunc)(key, Browser.mouseX, Browser.mouseY);
-        }
-      } else {
-        key = GLUT.getASCIIKey(event);
-        if (key !== null && GLUT.keyboardFunc) {
-          event.preventDefault();
-          GLUT.saveModifiers(event);
-          getWasmTableEntry(GLUT.keyboardFunc)(key, Browser.mouseX, Browser.mouseY);
-        }
-      }
-    }
-  },
-  onKeyup: event => {
-    if (GLUT.specialUpFunc || GLUT.keyboardUpFunc) {
-      var key = GLUT.getSpecialKey(event["keyCode"]);
-      if (key !== null) {
-        if (GLUT.specialUpFunc) {
-          event.preventDefault();
-          GLUT.saveModifiers(event);
-          getWasmTableEntry(GLUT.specialUpFunc)(key, Browser.mouseX, Browser.mouseY);
-        }
-      } else {
-        key = GLUT.getASCIIKey(event);
-        if (key !== null && GLUT.keyboardUpFunc) {
-          event.preventDefault();
-          GLUT.saveModifiers(event);
-          getWasmTableEntry(GLUT.keyboardUpFunc)(key, Browser.mouseX, Browser.mouseY);
-        }
-      }
-    }
-  },
-  touchHandler: event => {
-    if (event.target != Browser.getCanvas()) {
-      return;
-    }
-    var touches = event.changedTouches, main = touches[0], type = "";
-    switch (event.type) {
-     case "touchstart":
-      type = "mousedown";
-      break;
-
-     case "touchmove":
-      type = "mousemove";
-      break;
-
-     case "touchend":
-      type = "mouseup";
-      break;
-
-     default:
-      return;
-    }
-    var simulatedEvent = document.createEvent("MouseEvent");
-    simulatedEvent.initMouseEvent(type, true, true, window, 1, main.screenX, main.screenY, main.clientX, main.clientY, false, false, false, false, 0, null);
-    main.target.dispatchEvent(simulatedEvent);
-    event.preventDefault();
-  },
-  onMouseButtonDown: event => {
-    Browser.calculateMouseEvent(event);
-    GLUT.buttons |= (1 << event["button"]);
-    if (event.target == Browser.getCanvas() && GLUT.mouseFunc) {
-      try {
-        event.target.setCapture();
-      } catch (e) {}
-      event.preventDefault();
-      GLUT.saveModifiers(event);
-      getWasmTableEntry(GLUT.mouseFunc)(event["button"], 0, Browser.mouseX, Browser.mouseY);
-    }
-  },
-  onMouseButtonUp: event => {
-    Browser.calculateMouseEvent(event);
-    GLUT.buttons &= ~(1 << event["button"]);
-    if (GLUT.mouseFunc) {
-      event.preventDefault();
-      GLUT.saveModifiers(event);
-      getWasmTableEntry(GLUT.mouseFunc)(event["button"], 1, Browser.mouseX, Browser.mouseY);
-    }
-  },
-  onMouseWheel: event => {
-    Browser.calculateMouseEvent(event);
-    // cross-browser wheel delta
-    // Note the minus sign that flips browser wheel direction (positive direction scrolls page down) to native wheel direction (positive direction is mouse wheel up)
-    var delta = -Browser.getMouseWheelDelta(event);
-    delta = (delta == 0) ? 0 : (delta > 0 ? Math.max(delta, 1) : Math.min(delta, -1));
-    // Quantize to integer so that minimum scroll is at least +/- 1.
-    var button = 3;
-    // wheel up
-    if (delta < 0) {
-      button = 4;
-    }
-    if (GLUT.mouseFunc) {
-      event.preventDefault();
-      GLUT.saveModifiers(event);
-      getWasmTableEntry(GLUT.mouseFunc)(button, 0, Browser.mouseX, Browser.mouseY);
-    }
-  },
-  onFullscreenEventChange: event => {
-    var width;
-    var height;
-    if (getFullscreenElement()) {
-      width = screen["width"];
-      height = screen["height"];
-    } else {
-      width = GLUT.windowWidth;
-      height = GLUT.windowHeight;
-      // TODO set position
-      document.removeEventListener("fullscreenchange", GLUT.onFullscreenEventChange, true);
-      document.removeEventListener("mozfullscreenchange", GLUT.onFullscreenEventChange, true);
-      document.removeEventListener("webkitfullscreenchange", GLUT.onFullscreenEventChange, true);
-    }
-    Browser.setCanvasSize(width, height, true);
-    // N.B. GLUT.reshapeFunc is also registered as a canvas resize callback.
-    // Just call it once here.
-    /* Can't call _glutReshapeWindow as that requests cancelling fullscreen. */ if (GLUT.reshapeFunc) {
-      // out("GLUT.reshapeFunc (from FS): " + width + ", " + height);
-      getWasmTableEntry(GLUT.reshapeFunc)(width, height);
-    }
-    _glutPostRedisplay();
-  },
-  onResize: () => {
-    // Update canvas size to clientWidth and clientHeight, which include CSS scaling
-    var canvas = Browser.getCanvas();
-    Browser.setCanvasSize(canvas.clientWidth, canvas.clientHeight, /*noUpdates*/ false);
-  }
-};
-
-function _glutGetModifiers() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(264, 0, 1);
-  return GLUT.modifiers;
-}
-
-_glutGetModifiers.sig = "i";
-
-function _glutInit(argcp, argv) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(265, 0, 1, argcp, argv);
-  // Ignore arguments
-  GLUT.initTime = Date.now();
-  var isTouchDevice = "ontouchstart" in document.documentElement;
-  if (isTouchDevice) {
-    // onMouseButtonDown, onMouseButtonUp and onMousemove handlers
-    // depend on Browser.mouseX / Browser.mouseY fields. Those fields
-    // don't get updated by touch events. So register a touchHandler
-    // function that translates the touch events to mouse events.
-    // GLUT doesn't support touch, mouse only, so from touch events we
-    // are only looking at single finger touches to emulate left click,
-    // so we can use workaround and convert all touch events in mouse
-    // events. See touchHandler.
-    window.addEventListener("touchmove", GLUT.touchHandler, true);
-    window.addEventListener("touchstart", GLUT.touchHandler, true);
-    window.addEventListener("touchend", GLUT.touchHandler, true);
-  }
-  window.addEventListener("keydown", GLUT.onKeydown, true);
-  window.addEventListener("keyup", GLUT.onKeyup, true);
-  window.addEventListener("mousemove", GLUT.onMousemove, true);
-  window.addEventListener("mousedown", GLUT.onMouseButtonDown, true);
-  window.addEventListener("mouseup", GLUT.onMouseButtonUp, true);
-  // IE9, Chrome, Safari, Opera
-  window.addEventListener("mousewheel", GLUT.onMouseWheel, true);
-  // Firefox
-  window.addEventListener("DOMMouseScroll", GLUT.onMouseWheel, true);
-  // Resize callback stage 1: update canvas which notifies resizeListeners
-  window.addEventListener("resize", GLUT.onResize, true);
-  // Resize callback stage 2: updateResizeListeners notifies reshapeFunc
-  Browser.resizeListeners.push((width, height) => {
-    if (GLUT.reshapeFunc) {
-      getWasmTableEntry(GLUT.reshapeFunc)(width, height);
-    }
-  });
-  addOnExit(() => {
-    if (isTouchDevice) {
-      window.removeEventListener("touchmove", GLUT.touchHandler, true);
-      window.removeEventListener("touchstart", GLUT.touchHandler, true);
-      window.removeEventListener("touchend", GLUT.touchHandler, true);
-    }
-    window.removeEventListener("keydown", GLUT.onKeydown, true);
-    window.removeEventListener("keyup", GLUT.onKeyup, true);
-    window.removeEventListener("mousemove", GLUT.onMousemove, true);
-    window.removeEventListener("mousedown", GLUT.onMouseButtonDown, true);
-    window.removeEventListener("mouseup", GLUT.onMouseButtonUp, true);
-    // IE9, Chrome, Safari, Opera
-    window.removeEventListener("mousewheel", GLUT.onMouseWheel, true);
-    // Firefox
-    window.removeEventListener("DOMMouseScroll", GLUT.onMouseWheel, true);
-    window.removeEventListener("resize", GLUT.onResize, true);
-    var canvas = Browser.getCanvas();
-    canvas.width = canvas.height = 1;
-  });
-}
-
-_glutInit.sig = "vpp";
-
-function _glutInitWindowSize(width, height) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(266, 0, 1, width, height);
-  Browser.setCanvasSize(GLUT.initWindowWidth = width, GLUT.initWindowHeight = height);
-}
-
-_glutInitWindowSize.sig = "vii";
-
-function _glutInitWindowPosition(x, y) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(267, 0, 1, x, y);
-}
-
-_glutInitWindowPosition.sig = "vii";
-
-var _glutGet = type => {
-  switch (type) {
-   case 100:
-    /* GLUT_WINDOW_X */ return 0;
-
-   /* TODO */ case 101:
-    /* GLUT_WINDOW_Y */ return 0;
-
-   /* TODO */ case 102:
-    /* GLUT_WINDOW_WIDTH */ return Browser.getCanvas().width;
-
-   case 103:
-    /* GLUT_WINDOW_HEIGHT */ return Browser.getCanvas().height;
-
-   case 200:
-    /* GLUT_SCREEN_WIDTH */ return Browser.getCanvas().width;
-
-   case 201:
-    /* GLUT_SCREEN_HEIGHT */ return Browser.getCanvas().height;
-
-   case 500:
-    /* GLUT_INIT_WINDOW_X */ return 0;
-
-   /* TODO */ case 501:
-    /* GLUT_INIT_WINDOW_Y */ return 0;
-
-   /* TODO */ case 502:
-    /* GLUT_INIT_WINDOW_WIDTH */ return GLUT.initWindowWidth;
-
-   case 503:
-    /* GLUT_INIT_WINDOW_HEIGHT */ return GLUT.initWindowHeight;
-
-   case 700:
-    /* GLUT_ELAPSED_TIME */ var now = Date.now();
-    return now - GLUT.initTime;
-
-   case 105:
-    /* GLUT_WINDOW_STENCIL_SIZE */ return GLctx.getContextAttributes().stencil ? 8 : 0;
-
-   case 106:
-    /* GLUT_WINDOW_DEPTH_SIZE */ return GLctx.getContextAttributes().depth ? 8 : 0;
-
-   case 110:
-    /* GLUT_WINDOW_ALPHA_SIZE */ return GLctx.getContextAttributes().alpha ? 8 : 0;
-
-   case 120:
-    /* GLUT_WINDOW_NUM_SAMPLES */ return GLctx.getContextAttributes().antialias ? 1 : 0;
-
-   default:
-    abort("glutGet(" + type + ") not implemented yet");
-  }
-};
-
-_glutGet.sig = "ii";
-
-function _glutIdleFunc(func) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(268, 0, 1, func);
-  function callback() {
-    if (GLUT.idleFunc) {
-      getWasmTableEntry(GLUT.idleFunc)();
-      safeSetTimeout(callback, 4);
-    }
-  }
-  if (!GLUT.idleFunc) {
-    safeSetTimeout(callback, 0);
-  }
-  GLUT.idleFunc = func;
-}
-
-_glutIdleFunc.sig = "vp";
-
-var _glutTimerFunc = function(msec, func, value) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(269, 0, 1, msec, func, value);
-  return safeSetTimeout(() => getWasmTableEntry(func)(value), msec);
-};
-
-_glutTimerFunc.sig = "vipi";
-
-function _glutDisplayFunc(func) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(270, 0, 1, func);
-  GLUT.displayFunc = func;
-}
-
-_glutDisplayFunc.sig = "vp";
-
-function _glutKeyboardFunc(func) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(271, 0, 1, func);
-  GLUT.keyboardFunc = func;
-}
-
-_glutKeyboardFunc.sig = "vp";
-
-function _glutKeyboardUpFunc(func) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(272, 0, 1, func);
-  GLUT.keyboardUpFunc = func;
-}
-
-_glutKeyboardUpFunc.sig = "vp";
-
-function _glutSpecialFunc(func) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(273, 0, 1, func);
-  GLUT.specialFunc = func;
-}
-
-_glutSpecialFunc.sig = "vp";
-
-function _glutSpecialUpFunc(func) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(274, 0, 1, func);
-  GLUT.specialUpFunc = func;
-}
-
-_glutSpecialUpFunc.sig = "vp";
-
-function _glutReshapeFunc(func) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(275, 0, 1, func);
-  GLUT.reshapeFunc = func;
-}
-
-_glutReshapeFunc.sig = "vp";
-
-function _glutMotionFunc(func) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(276, 0, 1, func);
-  GLUT.motionFunc = func;
-}
-
-_glutMotionFunc.sig = "vp";
-
-function _glutPassiveMotionFunc(func) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(277, 0, 1, func);
-  GLUT.passiveMotionFunc = func;
-}
-
-_glutPassiveMotionFunc.sig = "vp";
-
-function _glutMouseFunc(func) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(278, 0, 1, func);
-  GLUT.mouseFunc = func;
-}
-
-_glutMouseFunc.sig = "vp";
-
-function _glutSetCursor(cursor) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(279, 0, 1, cursor);
-  var cursorStyle = "auto";
-  switch (cursor) {
-   case 0:
-    /* GLUT_CURSOR_RIGHT_ARROW */ // No equivalent css cursor style, fallback to 'auto'
-    break;
-
-   case 1:
-    /* GLUT_CURSOR_LEFT_ARROW */ // No equivalent css cursor style, fallback to 'auto'
-    break;
-
-   case 2:
-    /* GLUT_CURSOR_INFO */ cursorStyle = "pointer";
-    break;
-
-   case 3:
-    /* GLUT_CURSOR_DESTROY */ // No equivalent css cursor style, fallback to 'auto'
-    break;
-
-   case 4:
-    /* GLUT_CURSOR_HELP */ cursorStyle = "help";
-    break;
-
-   case 5:
-    /* GLUT_CURSOR_CYCLE */ // No equivalent css cursor style, fallback to 'auto'
-    break;
-
-   case 6:
-    /* GLUT_CURSOR_SPRAY */ // No equivalent css cursor style, fallback to 'auto'
-    break;
-
-   case 7:
-    /* GLUT_CURSOR_WAIT */ cursorStyle = "wait";
-    break;
-
-   case 8:
-    /* GLUT_CURSOR_TEXT */ cursorStyle = "text";
-    break;
-
-   case 9:
-   /* GLUT_CURSOR_CROSSHAIR */ case 102:
-    /* GLUT_CURSOR_FULL_CROSSHAIR */ cursorStyle = "crosshair";
-    break;
-
-   case 10:
-    /* GLUT_CURSOR_UP_DOWN */ cursorStyle = "ns-resize";
-    break;
-
-   case 11:
-    /* GLUT_CURSOR_LEFT_RIGHT */ cursorStyle = "ew-resize";
-    break;
-
-   case 12:
-    /* GLUT_CURSOR_TOP_SIDE */ cursorStyle = "n-resize";
-    break;
-
-   case 13:
-    /* GLUT_CURSOR_BOTTOM_SIDE */ cursorStyle = "s-resize";
-    break;
-
-   case 14:
-    /* GLUT_CURSOR_LEFT_SIDE */ cursorStyle = "w-resize";
-    break;
-
-   case 15:
-    /* GLUT_CURSOR_RIGHT_SIDE */ cursorStyle = "e-resize";
-    break;
-
-   case 16:
-    /* GLUT_CURSOR_TOP_LEFT_CORNER */ cursorStyle = "nw-resize";
-    break;
-
-   case 17:
-    /* GLUT_CURSOR_TOP_RIGHT_CORNER */ cursorStyle = "ne-resize";
-    break;
-
-   case 18:
-    /* GLUT_CURSOR_BOTTOM_RIGHT_CORNER */ cursorStyle = "se-resize";
-    break;
-
-   case 19:
-    /* GLUT_CURSOR_BOTTOM_LEFT_CORNER */ cursorStyle = "sw-resize";
-    break;
-
-   case 100:
-    /* GLUT_CURSOR_INHERIT */ break;
-
-   case 101:
-    /* GLUT_CURSOR_NONE */ cursorStyle = "none";
-    break;
-
-   default:
-    abort("glutSetCursor: Unknown cursor type: " + cursor);
-  }
-  Browser.getCanvas().style.cursor = cursorStyle;
-}
-
-_glutSetCursor.sig = "vi";
-
-function _glutCreateWindow(name) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(280, 0, 1, name);
-  var contextAttributes = {
-    antialias: ((GLUT.initDisplayMode & 128) != 0),
-    depth: ((GLUT.initDisplayMode & 16) != 0),
-    stencil: ((GLUT.initDisplayMode & 32) != 0),
-    alpha: ((GLUT.initDisplayMode & 8) != 0)
-  };
-  if (!Browser.createContext(Browser.getCanvas(), /*useWebGL=*/ true, /*setInModule=*/ true, contextAttributes)) {
-    return 0;
-  }
-  return 1;
-}
-
-_glutCreateWindow.sig = "ip";
-
-function _glutDestroyWindow(name) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(281, 0, 1, name);
-  delete Module["ctx"];
-  return 1;
-}
-
-_glutDestroyWindow.sig = "vi";
-
-function _glutReshapeWindow(width, height) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(282, 0, 1, width, height);
-  Browser.exitFullscreen();
-  Browser.setCanvasSize(width, height, true);
-  // N.B. GLUT.reshapeFunc is also registered as a canvas resize callback.
-  // Just call it once here.
-  if (GLUT.reshapeFunc) {
-    getWasmTableEntry(GLUT.reshapeFunc)(width, height);
-  }
-  _glutPostRedisplay();
-}
-
-_glutReshapeWindow.sig = "vii";
-
-function _glutPositionWindow(x, y) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(283, 0, 1, x, y);
-  Browser.exitFullscreen();
-  /* TODO */ _glutPostRedisplay();
-}
-
-_glutPositionWindow.sig = "vii";
-
-function _glutFullScreen() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(284, 0, 1);
-  GLUT.windowX = 0;
-  // TODO
-  GLUT.windowY = 0;
-  // TODO
-  var canvas = Browser.getCanvas();
-  GLUT.windowWidth = canvas.width;
-  GLUT.windowHeight = canvas.height;
-  document.addEventListener("fullscreenchange", GLUT.onFullscreenEventChange, true);
-  document.addEventListener("mozfullscreenchange", GLUT.onFullscreenEventChange, true);
-  document.addEventListener("webkitfullscreenchange", GLUT.onFullscreenEventChange, true);
-  Browser.requestFullscreen(/*lockPointer=*/ false, /*resizeCanvas=*/ false);
-}
-
-_glutFullScreen.sig = "v";
-
-function _glutInitDisplayMode(mode) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(285, 0, 1, mode);
-  return GLUT.initDisplayMode = mode;
-}
-
-_glutInitDisplayMode.sig = "vi";
-
-function _glutSwapBuffers() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(286, 0, 1);
-}
-
-_glutSwapBuffers.sig = "v";
-
-function _glutMainLoop() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(287, 0, 1);
-  // Do an initial resize, since there's no window resize event on startup
-  GLUT.onResize();
-  _glutPostRedisplay();
-  throw "unwind";
-}
-
-_glutMainLoop.sig = "v";
-
-var _XOpenDisplay = name => 1;
-
-_XOpenDisplay.sig = "pp";
-
-var _XCreateWindow = (display, parent, x, y, width, height, border_width, depth, class_, visual, valuemask, attributes) => {
-  // All we can do is set the width and height
-  Browser.setCanvasSize(width, height);
-  return 2;
-};
-
-_XCreateWindow.sig = "pppiiiiiiippp";
-
-var _XChangeWindowAttributes = (display, window, valuemask, attributes) => {};
-
-_XChangeWindowAttributes.sig = "ipppp";
-
-var _XSetWMHints = (display, win, hints) => {};
-
-_XSetWMHints.sig = "ippp";
-
-var _XMapWindow = (display, win) => {};
-
-_XMapWindow.sig = "ipp";
-
-var _XStoreName = (display, win, name) => {};
-
-_XStoreName.sig = "ippp";
-
-var _XInternAtom = (display, name_, hmm) => 0;
-
-_XInternAtom.sig = "pppi";
-
-var _XSendEvent = (display, win, propagate, event_mask, even_send) => {};
-
-_XSendEvent.sig = "ippipp";
-
-var _XPending = display => 0;
-
-_XPending.sig = "ip";
-
-function _eglGetConfigs(display, configs, config_size, numConfigs) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(288, 0, 1, display, configs, config_size, numConfigs);
-  return EGL.chooseConfig(display, 0, configs, config_size, numConfigs);
-}
-
-_eglGetConfigs.sig = "ippip";
-
-function _eglQuerySurface(display, surface, attribute, value) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(289, 0, 1, display, surface, attribute, value);
-  if (display != 62e3) {
-    EGL.setErrorCode(12296);
-    return 0;
-  }
-  if (surface != 62006) {
-    EGL.setErrorCode(12301);
-    return 0;
-  }
-  if (!value) {
-    EGL.setErrorCode(12300);
-    return 0;
-  }
-  EGL.setErrorCode(12288);
-  switch (attribute) {
-   case 12328:
-    // EGL_CONFIG_ID
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((value) >> 2), "storing")] = 62002;
-    checkInt32(62002);
-    return 1;
-
-   case 12376:
-    // EGL_LARGEST_PBUFFER
-    // Odd EGL API: If surface is not a pbuffer surface, 'value' should not be written to. It's not specified as an error, so true should(?) be returned.
-    // Existing Android implementation seems to do so at least.
-    return 1;
-
-   case 12375:
-    // EGL_WIDTH
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((value) >> 2), "storing")] = Browser.getCanvas().width;
-    checkInt32(Browser.getCanvas().width);
-    return 1;
-
-   case 12374:
-    // EGL_HEIGHT
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((value) >> 2), "storing")] = Browser.getCanvas().height;
-    checkInt32(Browser.getCanvas().height);
-    return 1;
-
-   case 12432:
-    // EGL_HORIZONTAL_RESOLUTION
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((value) >> 2), "storing")] = -1;
-    checkInt32(-1);
-    return 1;
-
-   case 12433:
-    // EGL_VERTICAL_RESOLUTION
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((value) >> 2), "storing")] = -1;
-    checkInt32(-1);
-    return 1;
-
-   case 12434:
-    // EGL_PIXEL_ASPECT_RATIO
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((value) >> 2), "storing")] = -1;
-    checkInt32(-1);
-    return 1;
-
-   case 12422:
-    // EGL_RENDER_BUFFER
-    // The main surface is bound to the visible canvas window - it's always backbuffered.
-    // Alternative to EGL_BACK_BUFFER would be EGL_SINGLE_BUFFER.
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((value) >> 2), "storing")] = 12420;
-    checkInt32(12420);
-    return 1;
-
-   case 12441:
-    // EGL_MULTISAMPLE_RESOLVE
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((value) >> 2), "storing")] = 12442;
-    checkInt32(12442);
-    return 1;
-
-   case 12435:
-    // EGL_SWAP_BEHAVIOR
-    // The two possibilities are EGL_BUFFER_PRESERVED and EGL_BUFFER_DESTROYED. Slightly unsure which is the
-    // case for browser environment, but advertise the 'weaker' behavior to be sure.
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((value) >> 2), "storing")] = 12437;
-    checkInt32(12437);
-    return 1;
-
-   case 12416:
-   // EGL_TEXTURE_FORMAT
-    case 12417:
-   // EGL_TEXTURE_TARGET
-    case 12418:
-   // EGL_MIPMAP_TEXTURE
-    case 12419:
-    // EGL_MIPMAP_LEVEL
-    // This is a window surface, not a pbuffer surface. Spec:
-    // "Querying EGL_TEXTURE_FORMAT, EGL_TEXTURE_TARGET, EGL_MIPMAP_TEXTURE, or EGL_MIPMAP_LEVEL for a non-pbuffer surface is not an error, but value is not modified."
-    // So pass-through.
-    return 1;
-
-   default:
-    EGL.setErrorCode(12292);
-    return 0;
-  }
-}
-
-_eglQuerySurface.sig = "ippip";
-
-function _eglQueryContext(display, context, attribute, value) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(290, 0, 1, display, context, attribute, value);
-  if (display != 62e3) {
-    EGL.setErrorCode(12296);
-    return 0;
-  }
-  //\todo An EGL_NOT_INITIALIZED error is generated if EGL is not initialized for dpy.
-  if (context != 62004) {
-    EGL.setErrorCode(12294);
-    return 0;
-  }
-  if (!value) {
-    EGL.setErrorCode(12300);
-    return 0;
-  }
-  EGL.setErrorCode(12288);
-  switch (attribute) {
-   case 12328:
-    // EGL_CONFIG_ID
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((value) >> 2), "storing")] = 62002;
-    checkInt32(62002);
-    return 1;
-
-   case 12439:
-    // EGL_CONTEXT_CLIENT_TYPE
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((value) >> 2), "storing")] = 12448;
-    checkInt32(12448);
-    return 1;
-
-   case 12440:
-    // EGL_CONTEXT_CLIENT_VERSION
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((value) >> 2), "storing")] = EGL.contextAttributes.majorVersion + 1;
-    checkInt32(EGL.contextAttributes.majorVersion + 1);
-    return 1;
-
-   case 12422:
-    // EGL_RENDER_BUFFER
-    // The context is bound to the visible canvas window - it's always backbuffered.
-    // Alternative to EGL_BACK_BUFFER would be EGL_SINGLE_BUFFER.
-    HEAP32[SAFE_HEAP_INDEX(HEAP32, ((value) >> 2), "storing")] = 12420;
-    checkInt32(12420);
-    return 1;
-
-   default:
-    EGL.setErrorCode(12292);
-    return 0;
-  }
-}
-
-_eglQueryContext.sig = "ippip";
-
-function _eglQueryAPI() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(291, 0, 1);
-  EGL.setErrorCode(12288);
-  return 12448;
-}
-
-_eglQueryAPI.sig = "i";
-
-function _eglGetCurrentContext() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(292, 0, 1);
-  return EGL.currentContext;
-}
-
-_eglGetCurrentContext.sig = "p";
-
-function _eglGetCurrentSurface(readdraw) {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(293, 0, 1, readdraw);
-  if (readdraw == 12378) {
-    return EGL.currentReadSurface;
-  } else if (readdraw == 12377) {
-    return EGL.currentDrawSurface;
-  } else {
-    EGL.setErrorCode(12300);
-    return 0;
-  }
-}
-
-_eglGetCurrentSurface.sig = "pi";
-
-function _eglGetCurrentDisplay() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(294, 0, 1);
-  return EGL.currentContext ? 62e3 : 0;
-}
-
-_eglGetCurrentDisplay.sig = "p";
-
-function _eglReleaseThread() {
-  if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(295, 0, 1);
-  // Equivalent to eglMakeCurrent with EGL_NO_CONTEXT and EGL_NO_SURFACE.
-  EGL.currentContext = 0;
-  EGL.currentReadSurface = 0;
-  EGL.currentDrawSurface = 0;
-  // EGL spec v1.4 p.55:
-  // "calling eglGetError immediately following a successful call to eglReleaseThread should not be done.
-  //  Such a call will return EGL_SUCCESS - but will also result in reallocating per-thread state."
-  EGL.setErrorCode(12288);
-  return 1;
-}
-
-_eglReleaseThread.sig = "i";
-
-var _uuid_clear = uu => zeroMemory(uu, 16);
-
-_uuid_clear.sig = "vp";
-
-var _uuid_compare = (uu1, uu2) => _memcmp(uu1, uu2, 16);
-
-_uuid_compare.sig = "ipp";
-
-var _uuid_copy = (dst, src) => _memcpy(dst, src, 16);
-
-_uuid_copy.sig = "vpp";
-
-var _uuid_generate = out => {
-  // void uuid_generate(uuid_t out);
-  var uuid = new Uint8Array(16);
-  randomFill(uuid);
-  // Makes uuid compliant to RFC-4122
-  uuid[6] = (uuid[6] & 15) | 64;
-  // uuid version
-  uuid[8] = (uuid[8] & 63) | 128;
-  // uuid variant
-  writeArrayToMemory(uuid, out);
-};
-
-_uuid_generate.sig = "vp";
-
-var _uuid_is_null = uu => {
-  // int uuid_is_null(const uuid_t uu);
-  for (var i = 0; i < 4; i++, uu = (uu + 4) | 0) {
-    var val = HEAP32[SAFE_HEAP_INDEX(HEAP32, ((uu) >> 2), "loading")];
-    if (val) {
-      return 0;
-    }
-  }
-  return 1;
-};
-
-_uuid_is_null.sig = "ip";
-
-var _uuid_parse = (inp, uu) => {
-  // int uuid_parse(const char *in, uuid_t uu);
-  inp = UTF8ToString(inp);
-  if (inp.length === 36) {
-    var i = 0;
-    var uuid = new Array(16);
-    inp.toLowerCase().replace(/[0-9a-f]{2}/g, function(byte) {
-      if (i < 16) {
-        uuid[i++] = parseInt(byte, 16);
-      }
-    });
-    if (i < 16) {
-      return -1;
-    }
-    writeArrayToMemory(uuid, uu);
-    return 0;
-  }
-  return -1;
-};
-
-_uuid_parse.sig = "ipp";
-
-/** @param {number|boolean=} upper */ var _uuid_unparse = (uu, out, upper) => {
-  // void uuid_unparse(const uuid_t uu, char *out);
-  var i = 0;
-  var uuid = "xxxx-xx-xx-xx-xxxxxx".replace(/[x]/g, function(c) {
-    var r = upper ? (HEAPU8[SAFE_HEAP_INDEX(HEAPU8, (uu) + (i), "loading")]).toString(16).toUpperCase() : (HEAPU8[SAFE_HEAP_INDEX(HEAPU8, (uu) + (i), "loading")]).toString(16);
-    r = (r.length === 1) ? "0" + r : r;
-    // Zero pad single digit hex values
-    i++;
-    return r;
-  });
-  stringToUTF8(uuid, out, 37);
-};
-
-_uuid_unparse.sig = "vpp";
-
-var _uuid_unparse_lower = (uu, out) => {
-  // void uuid_unparse_lower(const uuid_t uu, char *out);
-  _uuid_unparse(uu, out);
-};
-
-_uuid_unparse_lower.sig = "vpp";
-
-var _uuid_unparse_upper = (uu, out) => {
-  // void uuid_unparse_upper(const uuid_t uu, char *out);
-  _uuid_unparse(uu, out, true);
-};
-
-_uuid_unparse_upper.sig = "vpp";
-
-var _uuid_type = uu => 4;
-
-_uuid_type.sig = "ip";
-
-var _uuid_variant = uu => 1;
-
-_uuid_variant.sig = "ip";
-
-var GLEW = {
-  isLinaroFork: 1,
-  extensions: null,
-  error: {
-    0: null,
-    1: null,
-    2: null,
-    3: null,
-    4: null,
-    5: null,
-    6: null,
-    7: null,
-    8: null
-  },
-  version: {
-    1: null,
-    2: null,
-    3: null,
-    4: null
-  },
-  errorStringConstantFromCode(error) {
-    if (GLEW.isLinaroFork) {
-      switch (error) {
-       case 4:
-        return "OpenGL ES lib expected, found OpenGL lib";
-
-       // GLEW_ERROR_NOT_GLES_VERSION
-        case 5:
-        return "OpenGL lib expected, found OpenGL ES lib";
-
-       // GLEW_ERROR_GLES_VERSION
-        case 6:
-        return "Missing EGL version";
-
-       // GLEW_ERROR_NO_EGL_VERSION
-        case 7:
-        return "EGL 1.1 and up are supported";
-
-       // GLEW_ERROR_EGL_VERSION_10_ONLY
-        default:
-        break;
-      }
-    }
-    switch (error) {
-     case 0:
-      return "No error";
-
-     // GLEW_OK || GLEW_NO_ERROR
-      case 1:
-      return "Missing GL version";
-
-     // GLEW_ERROR_NO_GL_VERSION
-      case 2:
-      return "GL 1.1 and up are supported";
-
-     // GLEW_ERROR_GL_VERSION_10_ONLY
-      case 3:
-      return "GLX 1.2 and up are supported";
-
-     // GLEW_ERROR_GLX_VERSION_11_ONLY
-      default:
-      return null;
-    }
-  },
-  errorString(error) {
-    if (!GLEW.error[error]) {
-      var string = GLEW.errorStringConstantFromCode(error);
-      if (!string) {
-        string = "Unknown error";
-        error = 8;
-      }
-      GLEW.error[error] = stringToNewUTF8(string);
-    }
-    return GLEW.error[error];
-  },
-  versionStringConstantFromCode(name) {
-    switch (name) {
-     case 1:
-      return "1.10.0";
-
-     // GLEW_VERSION
-      case 2:
-      return "1";
-
-     // GLEW_VERSION_MAJOR
-      case 3:
-      return "10";
-
-     // GLEW_VERSION_MINOR
-      case 4:
-      return "0";
-
-     // GLEW_VERSION_MICRO
-      default:
-      return null;
-    }
-  },
-  versionString(name) {
-    if (!GLEW.version[name]) {
-      var string = GLEW.versionStringConstantFromCode(name);
-      if (!string) return 0;
-      GLEW.version[name] = stringToNewUTF8(string);
-    }
-    return GLEW.version[name];
-  },
-  extensionIsSupported(name) {
-    GLEW.extensions ||= webglGetExtensions();
-    if (GLEW.extensions.includes(name)) return 1;
-    // extensions from GLEmulations do not come unprefixed
-    // so, try with prefix
-    return (GLEW.extensions.includes("GL_" + name));
-  }
-};
-
-var _glewInit = () => 0;
-
-_glewInit.sig = "i";
-
-var _glewIsSupported = name => {
-  var exts = UTF8ToString(name).split(" ");
-  for (var ext of exts) {
-    if (!GLEW.extensionIsSupported(ext)) return 0;
-  }
-  return 1;
-};
-
-_glewIsSupported.sig = "ip";
-
-var _glewGetExtension = name => GLEW.extensionIsSupported(UTF8ToString(name));
-
-_glewGetExtension.sig = "ip";
-
-var _glewGetErrorString = error => GLEW.errorString(error);
-
-_glewGetErrorString.sig = "pi";
-
-var _glewGetString = name => GLEW.versionString(name);
-
-_glewGetString.sig = "pi";
-
-var IDBStore = {
-  indexedDB() {
-    assert(typeof indexedDB != "undefined", "IDBStore used, but indexedDB not supported");
-    return indexedDB;
-  },
-  DB_VERSION: 22,
-  DB_STORE_NAME: "FILE_DATA",
-  dbs: {},
-  blobs: [ 0 ],
-  getDB(name, callback) {
-    // check the cache first
-    var db = IDBStore.dbs[name];
-    if (db) {
-      return callback(null, db);
-    }
-    var req;
-    try {
-      req = IDBStore.indexedDB().open(name, IDBStore.DB_VERSION);
-    } catch (e) {
-      return callback(e);
-    }
-    req.onupgradeneeded = e => {
-      var db = /** @type {IDBDatabase} */ (e.target.result);
-      var transaction = e.target.transaction;
-      var fileStore;
-      if (db.objectStoreNames.contains(IDBStore.DB_STORE_NAME)) {
-        fileStore = transaction.objectStore(IDBStore.DB_STORE_NAME);
-      } else {
-        fileStore = db.createObjectStore(IDBStore.DB_STORE_NAME);
-      }
-    };
-    req.onsuccess = () => {
-      db = /** @type {IDBDatabase} */ (req.result);
-      // add to the cache
-      IDBStore.dbs[name] = db;
-      callback(null, db);
-    };
-    req.onerror = function(event) {
-      callback(event.target.error || "unknown error");
-      event.preventDefault();
-    };
-  },
-  getStore(dbName, type, callback) {
-    IDBStore.getDB(dbName, (error, db) => {
-      if (error) return callback(error);
-      var transaction = db.transaction([ IDBStore.DB_STORE_NAME ], type);
-      transaction.onerror = event => {
-        callback(event.target.error || "unknown error");
-        event.preventDefault();
-      };
-      var store = transaction.objectStore(IDBStore.DB_STORE_NAME);
-      callback(null, store);
-    });
-  },
-  getFile(dbName, id, callback) {
-    IDBStore.getStore(dbName, "readonly", (err, store) => {
-      if (err) return callback(err);
-      var req = store.get(id);
-      req.onsuccess = event => {
-        var result = event.target.result;
-        if (!result) {
-          return callback(`file ${id} not found`);
-        }
-        return callback(null, result);
-      };
-      req.onerror = callback;
-    });
-  },
-  setFile(dbName, id, data, callback) {
-    IDBStore.getStore(dbName, "readwrite", (err, store) => {
-      if (err) return callback(err);
-      var req = store.put(data, id);
-      req.onsuccess = event => callback();
-      req.onerror = callback;
-    });
-  },
-  deleteFile(dbName, id, callback) {
-    IDBStore.getStore(dbName, "readwrite", (err, store) => {
-      if (err) return callback(err);
-      var req = store.delete(id);
-      req.onsuccess = event => callback();
-      req.onerror = callback;
-    });
-  },
-  existsFile(dbName, id, callback) {
-    IDBStore.getStore(dbName, "readonly", (err, store) => {
-      if (err) return callback(err);
-      var req = store.count(id);
-      req.onsuccess = event => callback(null, event.target.result > 0);
-      req.onerror = callback;
-    });
-  },
-  clearStore(dbName, callback) {
-    IDBStore.getStore(dbName, "readwrite", (err, store) => {
-      if (err) return callback(err);
-      var req = store.clear();
-      req.onsuccess = event => callback();
-      req.onerror = callback;
-    });
-  }
-};
-
-var _emscripten_idb_async_load = (db, id, arg, onload, onerror) => {
-  runtimeKeepalivePush();
-  IDBStore.getFile(UTF8ToString(db), UTF8ToString(id), (error, byteArray) => {
-    runtimeKeepalivePop();
-    callUserCallback(() => {
-      if (error) {
-        if (onerror) getWasmTableEntry(onerror)(arg);
-        return;
-      }
-      var buffer = _malloc(byteArray.length);
-      HEAPU8.set(byteArray, buffer);
-      getWasmTableEntry(onload)(arg, buffer, byteArray.length);
-      _free(buffer);
-    });
-  });
-};
-
-_emscripten_idb_async_load.sig = "vppppp";
-
-var _emscripten_idb_async_store = (db, id, ptr, num, arg, onstore, onerror) => {
-  // note that we copy the data here, as these are async operations - changes
-  // to HEAPU8 meanwhile should not affect us!
-  runtimeKeepalivePush();
-  IDBStore.setFile(UTF8ToString(db), UTF8ToString(id), new Uint8Array(HEAPU8.subarray(ptr, ptr + num)), error => {
-    runtimeKeepalivePop();
-    callUserCallback(() => {
-      if (error) {
-        if (onerror) getWasmTableEntry(onerror)(arg);
-        return;
-      }
-      if (onstore) getWasmTableEntry(onstore)(arg);
-    });
-  });
-};
-
-_emscripten_idb_async_store.sig = "vpppippp";
-
-var _emscripten_idb_async_delete = (db, id, arg, ondelete, onerror) => {
-  runtimeKeepalivePush();
-  IDBStore.deleteFile(UTF8ToString(db), UTF8ToString(id), error => {
-    runtimeKeepalivePop();
-    callUserCallback(() => {
-      if (error) {
-        if (onerror) getWasmTableEntry(onerror)(arg);
-        return;
-      }
-      if (ondelete) getWasmTableEntry(ondelete)(arg);
-    });
-  });
-};
-
-_emscripten_idb_async_delete.sig = "vppppp";
-
-var _emscripten_idb_async_exists = (db, id, arg, oncheck, onerror) => {
-  runtimeKeepalivePush();
-  IDBStore.existsFile(UTF8ToString(db), UTF8ToString(id), (error, exists) => {
-    runtimeKeepalivePop();
-    callUserCallback(() => {
-      if (error) {
-        if (onerror) getWasmTableEntry(onerror)(arg);
-        return;
-      }
-      if (oncheck) getWasmTableEntry(oncheck)(arg, exists);
-    });
-  });
-};
-
-_emscripten_idb_async_exists.sig = "vppppp";
-
-var _emscripten_idb_async_clear = (db, arg, onclear, onerror) => {
-  runtimeKeepalivePush();
-  IDBStore.clearStore(UTF8ToString(db), error => {
-    runtimeKeepalivePop();
-    callUserCallback(() => {
-      if (error) {
-        if (onerror) getWasmTableEntry(onerror)(arg);
-        return;
-      }
-      if (onclear) getWasmTableEntry(onclear)(arg);
-    });
-  });
-};
-
-_emscripten_idb_async_clear.sig = "vpppp";
-
-var _emscripten_idb_load = (db, id, pbuffer, pnum, perror) => {
-  abort("Please compile your program with async support in order to use synchronous operations like emscripten_idb_load, etc.");
-};
-
-_emscripten_idb_load.sig = "vppppp";
-
-var _emscripten_idb_store = (db, id, ptr, num, perror) => {
-  abort("Please compile your program with async support in order to use synchronous operations like emscripten_idb_store, etc.");
-};
-
-_emscripten_idb_store.sig = "vpppip";
-
-var _emscripten_idb_delete = (db, id, perror) => {
-  abort("Please compile your program with async support in order to use synchronous operations like emscripten_idb_delete, etc.");
-};
-
-_emscripten_idb_delete.sig = "vppp";
-
-var _emscripten_idb_exists = (db, id, pexists, perror) => {
-  abort("Please compile your program with async support in order to use synchronous operations like emscripten_idb_exists, etc.");
-};
-
-_emscripten_idb_exists.sig = "vpppp";
-
-var _emscripten_idb_clear = (db, perror) => {
-  abort("Please compile your program with async support in order to use synchronous operations like emscripten_idb_clear, etc.");
-};
-
-_emscripten_idb_clear.sig = "vpp";
-
-var runAndAbortIfError = func => {
-  try {
-    return func();
-  } catch (e) {
-    abort(e);
-  }
-};
-
-var _emscripten_wget = (url, file) => {
-  abort("Please compile your program with async support in order to use asynchronous operations like emscripten_wget");
-};
-
-_emscripten_wget.sig = "ipp";
-
-var _emscripten_wget_data = (url, pbuffer, pnum, perror) => {
-  abort("Please compile your program with async support in order to use asynchronous operations like emscripten_wget_data");
-};
-
-_emscripten_wget_data.sig = "vpppp";
-
-var _emscripten_scan_registers = func => {
-  abort("Please compile your program with async support in order to use asynchronous operations like emscripten_scan_registers");
-};
-
-_emscripten_scan_registers.sig = "vp";
-
-var _emscripten_fiber_swap = (oldFiber, newFiber) => {
-  abort("Please compile your program with async support in order to use asynchronous operations like emscripten_fiber_swap");
-};
-
-_emscripten_fiber_swap.sig = "vpp";
-
-var polyfillWaitAsync = () => {};
-
-var atomicWaitStates = [ "ok", "not-equal", "timed-out" ];
-
-var liveAtomicWaitAsyncs = {};
-
-var liveAtomicWaitAsyncCounter = 0;
-
-var _emscripten_atomic_wait_async = (addr, val, asyncWaitFinished, userData, maxWaitMilliseconds) => {
-  let wait = Atomics.waitAsync(HEAP32, ((addr) >> 2), val, maxWaitMilliseconds);
-  if (!wait.async) return atomicWaitStates.indexOf(wait.value);
-  // Increment waitAsync generation counter, account for wraparound in case
-  // application does huge amounts of waitAsyncs per second (not sure if
-  // possible?)
-  // Valid counter range: 0...2^31-1
-  let counter = liveAtomicWaitAsyncCounter;
-  liveAtomicWaitAsyncCounter = Math.max(0, (liveAtomicWaitAsyncCounter + 1) | 0);
-  liveAtomicWaitAsyncs[counter] = addr;
-  runtimeKeepalivePush();
-  wait.value.then(value => {
-    if (liveAtomicWaitAsyncs[counter]) {
-      runtimeKeepalivePop();
-      delete liveAtomicWaitAsyncs[counter];
-      callUserCallback(() => getWasmTableEntry(asyncWaitFinished)(addr, val, atomicWaitStates.indexOf(value), userData));
-    }
-  });
-  return -counter;
-};
-
-_emscripten_atomic_wait_async.sig = "ipippd";
-
-var _emscripten_atomic_cancel_wait_async = waitToken => {
-  if (waitToken == 1) {
-    warnOnce("Attempted to call emscripten_atomic_cancel_wait_async() with a value ATOMICS_WAIT_NOT_EQUAL (1) that is not a valid wait token! Check success in return value from call to emscripten_atomic_wait_async()");
-  } else if (waitToken == 2) {
-    warnOnce("Attempted to call emscripten_atomic_cancel_wait_async() with a value ATOMICS_WAIT_TIMED_OUT (2) that is not a valid wait token! Check success in return value from call to emscripten_atomic_wait_async()");
-  } else if (waitToken > 0) {
-    warnOnce(`Attempted to call emscripten_atomic_cancel_wait_async() with an invalid wait token value ${waitToken}`);
-  }
-  var address = liveAtomicWaitAsyncs[waitToken];
-  if (address) {
-    // Notify the waitAsync waiters on the memory location, so that JavaScript
-    // garbage collection can occur.
-    // See https://github.com/WebAssembly/threads/issues/176
-    // This has the unfortunate effect of causing spurious wakeup of all other
-    // waiters at the address (which causes a small performance loss).
-    Atomics.notify(HEAP32, ((address) >> 2));
-    delete liveAtomicWaitAsyncs[waitToken];
-    runtimeKeepalivePop();
-    return 0;
-  }
-  // This waitToken does not exist.
-  return -5;
-};
-
-_emscripten_atomic_cancel_wait_async.sig = "ii";
-
-var _emscripten_atomic_cancel_all_wait_asyncs = () => {
-  let waitAsyncs = Object.values(liveAtomicWaitAsyncs);
-  for (var address of waitAsyncs) {
-    Atomics.notify(HEAP32, ((address) >> 2));
-  }
-  liveAtomicWaitAsyncs = {};
-  return waitAsyncs.length;
-};
-
-_emscripten_atomic_cancel_all_wait_asyncs.sig = "i";
-
-var _emscripten_atomic_cancel_all_wait_asyncs_at_address = address => {
-  let numCancelled = 0;
-  for (var [waitToken, waitAddress] of Object.entries(liveAtomicWaitAsyncs)) {
-    if (waitAddress == address) {
-      Atomics.notify(HEAP32, ((address) >> 2));
-      delete liveAtomicWaitAsyncs[waitToken];
-      numCancelled++;
-    }
-  }
-  return numCancelled;
-};
-
-_emscripten_atomic_cancel_all_wait_asyncs_at_address.sig = "ip";
-
-var ALLOC_NORMAL = 0;
-
-var ALLOC_STACK = 1;
-
-var allocate = (slab, allocator) => {
-  var ret;
-  assert(typeof allocator == "number", "allocate no longer takes a type argument");
-  assert(typeof slab != "number", "allocate no longer takes a number as arg0");
-  if (allocator == ALLOC_STACK) {
-    ret = stackAlloc(slab.length);
-  } else {
-    ret = _malloc(slab.length);
-  }
-  if (!slab.subarray && !slab.slice) {
-    slab = new Uint8Array(slab);
-  }
-  HEAPU8.set(slab, ret);
-  return ret;
-};
-
-/** @deprecated @param {boolean=} dontAddNull */ var writeStringToMemory = (string, buffer, dontAddNull) => {
-  warnOnce("writeStringToMemory is deprecated and should not be called! Use stringToUTF8() instead!");
-  var /** @type {number} */ lastChar, /** @type {number} */ end;
-  if (dontAddNull) {
-    // stringToUTF8 always appends null. If we don't want to do that, remember the
-    // character that existed at the location where the null will be placed, and restore
-    // that after the write (below).
-    end = buffer + lengthBytesUTF8(string);
-    lastChar = HEAP8[SAFE_HEAP_INDEX(HEAP8, end, "loading")];
-  }
-  stringToUTF8(string, buffer, Infinity);
-  if (dontAddNull) HEAP8[SAFE_HEAP_INDEX(HEAP8, end, "storing")] = lastChar;
-};
-
-/** @param {boolean=} dontAddNull */ var writeAsciiToMemory = (str, buffer, dontAddNull) => {
-  for (var i = 0; i < str.length; ++i) {
-    assert(str.charCodeAt(i) === (str.charCodeAt(i) & 255));
-    HEAP8[SAFE_HEAP_INDEX(HEAP8, buffer++, "storing")] = str.charCodeAt(i);
-    checkInt8(str.charCodeAt(i));
-  }
-  // Null-terminate the string
-  if (!dontAddNull) HEAP8[SAFE_HEAP_INDEX(HEAP8, buffer, "storing")] = 0;
-  checkInt8(0);
-};
-
-var allocateUTF8 = (...args) => stringToNewUTF8(...args);
-
-var allocateUTF8OnStack = (...args) => stringToUTF8OnStack(...args);
-
-var demangle = func => {
-  // If demangle has failed before, stop demangling any further function names
-  // This avoids an infinite recursion with malloc()->abort()->stackTrace()->demangle()->malloc()->...
-  demangle.recursionGuard = (demangle.recursionGuard | 0) + 1;
-  if (demangle.recursionGuard > 1) return func;
-  return withStackSave(() => {
-    try {
-      var s = func;
-      if (s.startsWith("__Z")) s = s.slice(1);
-      var buf = stringToUTF8OnStack(s);
-      var status = stackAlloc(4);
-      var ret = ___cxa_demangle(buf, 0, 0, status);
-      if (HEAP32[SAFE_HEAP_INDEX(HEAP32, ((status) >> 2), "loading")] === 0 && ret) {
-        return UTF8ToString(ret);
-      }
-    } catch (e) {} finally {
-      _free(ret);
-      if (demangle.recursionGuard < 2) --demangle.recursionGuard;
-    }
-    // failure when using libcxxabi, don't demangle
-    return func;
-  });
-};
-
-var stackTrace = () => {
-  var js = jsStackTrace();
-  if (Module["extraStackTrace"]) js += "\n" + Module["extraStackTrace"]();
-  return js;
-};
-
-var print = out;
-
-var printErr = err;
-
-var jstoi_s = Number;
-
-function getNativeTypeSize(type) {
-  // prettier-ignore
-  switch (type) {
-   case "i1":
-   case "i8":
-   case "u8":
-    return 1;
-
-   case "i16":
-   case "u16":
-    return 2;
-
-   case "i32":
-   case "u32":
-    return 4;
-
-   case "i64":
-   case "u64":
-    return 8;
-
-   case "float":
-    return 4;
-
-   case "double":
-    return 8;
-
-   default:
-    {
-      if (type.endsWith("*")) {
-        return POINTER_SIZE;
-      }
-      if (type[0] === "i") {
-        const bits = Number(type.slice(1));
-        // [FIXME] Cannot use assert here since this function is included directly
-        // in the runtime JS library, where assert is not always available.
-        // assert(bits % 8 === 0, `getNativeTypeSize invalid bits ${bits}, ${type} type`);
-        return bits / 8;
-      }
-      return 0;
-    }
-  }
-}
-
 PThread.init();
-
-registerWasmPlugin();
 
 FS.createPreloadedFile = FS_createPreloadedFile;
 
@@ -24572,78 +10035,6 @@ for (/**@suppress{duplicate}*/ var i = 0; i <= 288; ++i) {
   miniTempWebGLIntBuffers[i] = miniTempWebGLIntBuffersStorage.subarray(0, i);
 }
 
-if (globalThis.setImmediate) {
-  emSetImmediate = setImmediateWrapped;
-  emClearImmediate = clearImmediateWrapped;
-} else if (globalThis.addEventListener) {
-  var __setImmediate_id_counter = 0;
-  var __setImmediate_queue = [];
-  var __setImmediate_message_id = "_si";
-  /** @param {Event} e */ var __setImmediate_cb = e => {
-    if (e.data === __setImmediate_message_id) {
-      e.stopPropagation();
-      __setImmediate_queue.shift()();
-      ++__setImmediate_id_counter;
-    }
-  };
-  addEventListener("message", __setImmediate_cb, true);
-  emSetImmediate = func => {
-    postMessage(__setImmediate_message_id, "*");
-    return __setImmediate_id_counter + __setImmediate_queue.push(func) - 1;
-  };
-  emClearImmediate = /**@type{function(number=)}*/ (id => {
-    var index = id - __setImmediate_id_counter;
-    // must preserve the order and count of elements in the queue, so replace the pending callback with an empty function
-    if (index >= 0 && index < __setImmediate_queue.length) __setImmediate_queue[index] = () => {};
-  });
-}
-
-if (waitAsyncPolyfilled) {
-  let __Atomics_waitAsyncAddresses = [];
-  function __Atomics_pollWaitAsyncAddresses() {
-    let now = performance.now();
-    let l = __Atomics_waitAsyncAddresses.length;
-    for (let i = 0; i < l; ++i) {
-      let a = __Atomics_waitAsyncAddresses[i];
-      let expired = (now > a[3]);
-      let awoken = (Atomics.load(a[0], a[1]) != a[2]);
-      if (expired || awoken) {
-        __Atomics_waitAsyncAddresses[i--] = __Atomics_waitAsyncAddresses[--l];
-        __Atomics_waitAsyncAddresses.length = l;
-        a[4](awoken ? "ok" : "timed-out");
-      }
-    }
-    if (l) {
-      // If we still have addresses to wait, loop the timeout handler to continue polling.
-      setTimeout(__Atomics_pollWaitAsyncAddresses, 10);
-    }
-  }
-  /**
-   * @param {number=} maxWaitMilliseconds
-   */ Atomics.waitAsync = (i32a, index, value, maxWaitMilliseconds) => {
-    let val = Atomics.load(i32a, index);
-    if (val != value) return {
-      async: false,
-      value: "not-equal"
-    };
-    if (maxWaitMilliseconds <= 0) return {
-      async: false,
-      value: "timed-out"
-    };
-    maxWaitMilliseconds = performance.now() + (maxWaitMilliseconds || Infinity);
-    let promiseResolve;
-    let promise = new Promise(resolve => {
-      promiseResolve = resolve;
-    });
-    if (!__Atomics_waitAsyncAddresses[0]) setTimeout(__Atomics_pollWaitAsyncAddresses, 10);
-    __Atomics_waitAsyncAddresses.push([ i32a, index, value, maxWaitMilliseconds, promiseResolve ]);
-    return {
-      async: true,
-      value: promise
-    };
-  };
-}
-
 // End JS library code
 // include: postlibrary.js
 // This file is included after the automatically-generated JS library code
@@ -24653,11 +10044,10 @@ if (waitAsyncPolyfilled) {
   // delayed until processModuleArgs.
   initMemory();
   // Begin ATMODULES hooks
-  if (Module["preloadPlugins"]) preloadPlugins = Module["preloadPlugins"];
   if (Module["noExitRuntime"]) noExitRuntime = Module["noExitRuntime"];
+  if (Module["preloadPlugins"]) preloadPlugins = Module["preloadPlugins"];
   if (Module["print"]) out = Module["print"];
   if (Module["printErr"]) err = Module["printErr"];
-  if (Module["dynamicLibraries"]) dynamicLibraries = Module["dynamicLibraries"];
   if (Module["wasmBinary"]) wasmBinary = Module["wasmBinary"];
   // End ATMODULES hooks
   checkIncomingModuleAPI();
@@ -24707,31 +10097,23 @@ Module["FS_createDataFile"] = FS_createDataFile;
 
 Module["FS_createLazyFile"] = FS_createLazyFile;
 
-var unexportedSymbols = [ "run", "out", "err", "callMain", "abort", "wasmExports", "HEAP64", "HEAPU64", "writeStackCookie", "checkStackCookie", "writeI53ToI64", "writeI53ToI64Clamped", "writeI53ToI64Signaling", "writeI53ToU64Clamped", "writeI53ToU64Signaling", "readI53FromI64", "readI53FromU64", "convertI32PairToI53", "convertI32PairToI53Checked", "convertU32PairToI53", "INT53_MAX", "INT53_MIN", "bigintToI53Checked", "stackSave", "stackRestore", "stackAlloc", "getTempRet0", "setTempRet0", "createNamedFunction", "ptrToString", "zeroMemory", "exitJS", "getHeapMax", "growMemory", "ENV", "setStackLimits", "withStackSave", "ERRNO_CODES", "strError", "inetPton4", "inetNtop4", "inetPton6", "inetNtop6", "readSockaddr", "writeSockaddr", "DNS", "Protocols", "Sockets", "timers", "warnOnce", "readEmAsmArgsArray", "readEmAsmArgs", "runEmAsmFunction", "runMainThreadEmAsm", "jstoi_q", "getExecutableName", "autoResumeAudioContext", "getDynCaller", "dynCall", "setWasmTableEntry", "getWasmTableEntry", "handleException", "keepRuntimeAlive", "runtimeKeepalivePush", "runtimeKeepalivePop", "callUserCallback", "maybeExit", "asyncLoad", "asmjsMangle", "alignMemory", "mmapAlloc", "HandleAllocator", "wasmTable", "wasmMemory", "getUniqueRunDependency", "noExitRuntime", "addOnPreRun", "addOnInit", "addOnPostCtor", "addOnPreMain", "addOnExit", "addOnPostRun", "STACK_SIZE", "STACK_ALIGN", "POINTER_SIZE", "ASSERTIONS", "convertJsFunctionToWasm", "freeTableIndexes", "functionsInTableMap", "getEmptyTableSlot", "updateTableMap", "getFunctionAddress", "addFunction", "removeFunction", "setValue", "getValue", "PATH", "PATH_FS", "UTF8Decoder", "UTF8ArrayToString", "UTF8ToString", "stringToUTF8Array", "stringToUTF8", "lengthBytesUTF8", "intArrayFromString", "intArrayToString", "AsciiToString", "stringToAscii", "UTF16Decoder", "UTF16ToString", "stringToUTF16", "lengthBytesUTF16", "UTF32ToString", "stringToUTF32", "lengthBytesUTF32", "stringToNewUTF8", "stringToUTF8OnStack", "writeArrayToMemory", "JSEvents", "registerKeyEventCallback", "specialHTMLTargets", "maybeCStringToJsString", "findEventTarget", "findCanvasEventTarget", "getBoundingClientRect", "fillMouseEventData", "registerMouseEventCallback", "registerWheelEventCallback", "registerUiEventCallback", "registerFocusEventCallback", "fillDeviceOrientationEventData", "registerDeviceOrientationEventCallback", "fillDeviceMotionEventData", "registerDeviceMotionEventCallback", "screenOrientation", "fillOrientationChangeEventData", "registerOrientationChangeEventCallback", "fillFullscreenChangeEventData", "registerFullscreenChangeEventCallback", "JSEvents_requestFullscreen", "JSEvents_resizeCanvasForFullscreen", "registerRestoreOldStyle", "hideEverythingExceptGivenElement", "restoreHiddenElements", "setLetterbox", "currentFullscreenStrategy", "restoreOldWindowedStyle", "softFullscreenResizeWebGLRenderTarget", "doRequestFullscreen", "fillPointerlockChangeEventData", "registerPointerlockChangeEventCallback", "registerPointerlockErrorEventCallback", "requestPointerLock", "fillVisibilityChangeEventData", "registerVisibilityChangeEventCallback", "registerTouchEventCallback", "fillGamepadEventData", "registerGamepadEventCallback", "registerBeforeUnloadEventCallback", "fillBatteryEventData", "registerBatteryEventCallback", "setCanvasElementSizeCallingThread", "setCanvasElementSizeMainThread", "setCanvasElementSize", "getCanvasSizeCallingThread", "getCanvasSizeMainThread", "getCanvasElementSize", "jsStackTrace", "getCallstack", "UNWIND_CACHE", "convertPCtoSourceLocation", "ExitStatus", "getEnvStrings", "checkWasiClock", "doReadv", "doWritev", "wasiRightsToMuslOFlags", "wasiOFlagsToMuslOFlags", "initRandomFill", "randomFill", "safeSetTimeout", "setImmediateWrapped", "safeRequestAnimationFrame", "clearImmediateWrapped", "emSetImmediate", "emClearImmediate_deps", "emClearImmediate", "registerPostMainLoop", "registerPreMainLoop", "promiseMap", "getPromise", "makePromise", "idsToPromises", "makePromiseCallback", "uncaughtExceptionCount", "exceptionLast", "exceptionCaught", "ExceptionInfo", "findMatchingCatch", "Browser", "requestFullscreen", "requestFullScreen", "setCanvasSize", "getUserMedia", "Browser_asyncPrepareDataCounter", "getPreloadedImageData__data", "wget", "MONTH_DAYS_REGULAR", "MONTH_DAYS_LEAP", "MONTH_DAYS_REGULAR_CUMULATIVE", "MONTH_DAYS_LEAP_CUMULATIVE", "isLeapYear", "ydayFromDate", "arraySum", "addDays", "SYSCALLS", "getSocketFromFD", "getSocketAddress", "registerWasmPlugin", "preloadedWasm", "replaceORIGIN", "isSymbolDefined", "GOT", "LDSO", "getMemory", "mergeLibSymbols", "loadWebAssemblyModule", "setDylinkStackLimits", "newDSO", "findLibraryFS", "loadDynamicLibrary", "dlopenInternal", "preloadPlugins", "FS_createPreloadedFile", "FS_modeStringToFlags", "FS_getMode", "FS_stdin_getChar_buffer", "FS_stdin_getChar", "FS_readFile", "FS", "FS_mkdirTree", "FS_root", "FS_mounts", "FS_devices", "FS_streams", "FS_nextInode", "FS_nameTable", "FS_currentPath", "FS_initialized", "FS_ignorePermissions", "FS_filesystems", "FS_syncFSRequests", "FS_lookupPath", "FS_getPath", "FS_hashName", "FS_hashAddNode", "FS_hashRemoveNode", "FS_lookupNode", "FS_createNode", "FS_destroyNode", "FS_isRoot", "FS_isMountpoint", "FS_isFile", "FS_isDir", "FS_isLink", "FS_isChrdev", "FS_isBlkdev", "FS_isFIFO", "FS_isSocket", "FS_flagsToPermissionString", "FS_nodePermissions", "FS_mayLookup", "FS_mayCreate", "FS_mayDelete", "FS_mayOpen", "FS_checkOpExists", "FS_nextfd", "FS_getStreamChecked", "FS_getStream", "FS_createStream", "FS_closeStream", "FS_dupStream", "FS_doSetAttr", "FS_chrdev_stream_ops", "FS_major", "FS_minor", "FS_makedev", "FS_registerDevice", "FS_getDevice", "FS_getMounts", "FS_syncfs", "FS_mount", "FS_unmount", "FS_lookup", "FS_mknod", "FS_statfs", "FS_statfsStream", "FS_statfsNode", "FS_create", "FS_mkdir", "FS_mkdev", "FS_symlink", "FS_rename", "FS_rmdir", "FS_readdir", "FS_readlink", "FS_stat", "FS_fstat", "FS_lstat", "FS_doChmod", "FS_chmod", "FS_lchmod", "FS_fchmod", "FS_doChown", "FS_chown", "FS_lchown", "FS_fchown", "FS_doTruncate", "FS_truncate", "FS_ftruncate", "FS_utime", "FS_open", "FS_close", "FS_isClosed", "FS_llseek", "FS_read", "FS_write", "FS_mmap", "FS_msync", "FS_ioctl", "FS_writeFile", "FS_cwd", "FS_chdir", "FS_createDefaultDirectories", "FS_createDefaultDevices", "FS_createSpecialDirectories", "FS_createStandardStreams", "FS_staticInit", "FS_init", "FS_quit", "FS_findObject", "FS_analyzePath", "FS_createFile", "FS_forceLoadFile", "FS_absolutePath", "FS_createFolder", "FS_createLink", "FS_joinPath", "FS_mmapAlloc", "FS_standardizePath", "MEMFS", "TTY", "PIPEFS", "SOCKFS", "_setNetworkCallback", "tempFixedLengthArray", "miniTempWebGLFloatBuffers", "miniTempWebGLIntBuffers", "heapObjectForWebGLType", "toTypedArrayIndex", "webgl_enable_ANGLE_instanced_arrays", "webgl_enable_OES_vertex_array_object", "webgl_enable_WEBGL_draw_buffers", "webgl_enable_WEBGL_multi_draw", "webgl_enable_EXT_polygon_offset_clamp", "webgl_enable_EXT_clip_control", "webgl_enable_WEBGL_polygon_mode", "GL", "emscriptenWebGLGet", "computeUnpackAlignedImageSize", "colorChannelsInGlTextureFormat", "emscriptenWebGLGetTexPixelData", "emscriptenWebGLGetUniform", "webglGetUniformLocation", "webglPrepareUniformLocationsBeforeFirstUse", "webglGetLeftBracePos", "emscriptenWebGLGetVertexAttrib", "__glGetActiveAttribOrUniform", "writeGLArray", "emscripten_webgl_destroy_context_before_on_calling_thread", "registerWebGlEventCallback", "AL", "GLUT", "EGL", "GLEW", "IDBStore", "runAndAbortIfError", "waitAsyncPolyfilled", "ALLOC_NORMAL", "ALLOC_STACK", "allocate", "writeStringToMemory", "writeAsciiToMemory", "allocateUTF8", "allocateUTF8OnStack", "demangle", "stackTrace", "print", "printErr", "jstoi_s", "getNativeTypeSize", "PThread", "terminateWorker", "cleanupThread", "registerTLSInit", "spawnThread", "exitOnMainThread", "proxyToMainThread", "proxiedJSCallArgs", "invokeEntryPoint", "markAsFinished", "dlsyncThreadsAsync", "checkMailbox", "IDBFS" ];
+var missingLibrarySymbols = [ "writeI53ToI64Clamped", "writeI53ToI64Signaling", "writeI53ToU64Clamped", "writeI53ToU64Signaling", "convertI32PairToI53", "convertI32PairToI53Checked", "convertU32PairToI53", "getTempRet0", "setTempRet0", "createNamedFunction", "zeroMemory", "getHeapMax", "growMemory", "withStackSave", "inetPton4", "inetNtop4", "inetPton6", "inetNtop6", "readSockaddr", "writeSockaddr", "getDynCaller", "setWasmTableEntry", "asmjsMangle", "alignMemory", "HandleAllocator", "addOnInit", "addOnPostCtor", "addOnPreMain", "STACK_SIZE", "STACK_ALIGN", "POINTER_SIZE", "ASSERTIONS", "convertJsFunctionToWasm", "getEmptyTableSlot", "updateTableMap", "getFunctionAddress", "addFunction", "removeFunction", "intArrayToString", "AsciiToString", "stringToAscii", "UTF16ToString", "stringToUTF16", "lengthBytesUTF16", "UTF32ToString", "stringToUTF32", "lengthBytesUTF32", "fillDeviceOrientationEventData", "registerDeviceOrientationEventCallback", "fillDeviceMotionEventData", "registerDeviceMotionEventCallback", "screenOrientation", "fillOrientationChangeEventData", "registerOrientationChangeEventCallback", "hideEverythingExceptGivenElement", "restoreHiddenElements", "softFullscreenResizeWebGLRenderTarget", "registerPointerlockErrorEventCallback", "fillBatteryEventData", "registerBatteryEventCallback", "jsStackTrace", "getCallstack", "convertPCtoSourceLocation", "wasiRightsToMuslOFlags", "wasiOFlagsToMuslOFlags", "setImmediateWrapped", "safeRequestAnimationFrame", "clearImmediateWrapped", "registerPostMainLoop", "registerPreMainLoop", "getPromise", "makePromise", "idsToPromises", "makePromiseCallback", "findMatchingCatch", "Browser_asyncPrepareDataCounter", "arraySum", "addDays", "getSocketFromFD", "getSocketAddress", "FS_mkdirTree", "_setNetworkCallback", "writeGLArray", "emscripten_webgl_destroy_context_before_on_calling_thread", "registerWebGlEventCallback", "runAndAbortIfError", "ALLOC_NORMAL", "ALLOC_STACK", "allocate", "writeStringToMemory", "writeAsciiToMemory", "allocateUTF8", "allocateUTF8OnStack", "demangle", "stackTrace", "getNativeTypeSize" ];
+
+missingLibrarySymbols.forEach(missingLibrarySymbol);
+
+var unexportedSymbols = [ "run", "out", "err", "callMain", "abort", "wasmExports", "HEAP64", "HEAPU64", "writeStackCookie", "checkStackCookie", "writeI53ToI64", "readI53FromI64", "readI53FromU64", "INT53_MAX", "INT53_MIN", "bigintToI53Checked", "stackSave", "stackRestore", "stackAlloc", "ptrToString", "exitJS", "ENV", "setStackLimits", "ERRNO_CODES", "strError", "DNS", "Protocols", "Sockets", "timers", "warnOnce", "readEmAsmArgsArray", "readEmAsmArgs", "runEmAsmFunction", "runMainThreadEmAsm", "jstoi_q", "getExecutableName", "autoResumeAudioContext", "dynCall", "getWasmTableEntry", "handleException", "keepRuntimeAlive", "runtimeKeepalivePush", "runtimeKeepalivePop", "callUserCallback", "maybeExit", "asyncLoad", "mmapAlloc", "wasmTable", "wasmMemory", "getUniqueRunDependency", "noExitRuntime", "addOnPreRun", "addOnExit", "addOnPostRun", "freeTableIndexes", "functionsInTableMap", "setValue", "getValue", "PATH", "PATH_FS", "UTF8Decoder", "UTF8ArrayToString", "UTF8ToString", "stringToUTF8Array", "stringToUTF8", "lengthBytesUTF8", "intArrayFromString", "UTF16Decoder", "stringToNewUTF8", "stringToUTF8OnStack", "writeArrayToMemory", "JSEvents", "registerKeyEventCallback", "specialHTMLTargets", "maybeCStringToJsString", "findEventTarget", "findCanvasEventTarget", "getBoundingClientRect", "fillMouseEventData", "registerMouseEventCallback", "registerWheelEventCallback", "registerUiEventCallback", "registerFocusEventCallback", "fillFullscreenChangeEventData", "registerFullscreenChangeEventCallback", "JSEvents_requestFullscreen", "JSEvents_resizeCanvasForFullscreen", "registerRestoreOldStyle", "setLetterbox", "currentFullscreenStrategy", "restoreOldWindowedStyle", "doRequestFullscreen", "fillPointerlockChangeEventData", "registerPointerlockChangeEventCallback", "requestPointerLock", "fillVisibilityChangeEventData", "registerVisibilityChangeEventCallback", "registerTouchEventCallback", "fillGamepadEventData", "registerGamepadEventCallback", "registerBeforeUnloadEventCallback", "setCanvasElementSizeCallingThread", "setCanvasElementSizeMainThread", "setCanvasElementSize", "getCanvasSizeCallingThread", "getCanvasSizeMainThread", "getCanvasElementSize", "UNWIND_CACHE", "ExitStatus", "getEnvStrings", "checkWasiClock", "doReadv", "doWritev", "initRandomFill", "randomFill", "safeSetTimeout", "emSetImmediate", "emClearImmediate_deps", "emClearImmediate", "promiseMap", "uncaughtExceptionCount", "exceptionLast", "exceptionCaught", "ExceptionInfo", "Browser", "requestFullscreen", "requestFullScreen", "setCanvasSize", "getUserMedia", "getPreloadedImageData__data", "wget", "MONTH_DAYS_REGULAR", "MONTH_DAYS_LEAP", "MONTH_DAYS_REGULAR_CUMULATIVE", "MONTH_DAYS_LEAP_CUMULATIVE", "isLeapYear", "ydayFromDate", "SYSCALLS", "preloadPlugins", "FS_createPreloadedFile", "FS_modeStringToFlags", "FS_getMode", "FS_stdin_getChar_buffer", "FS_stdin_getChar", "FS_readFile", "FS", "FS_root", "FS_mounts", "FS_devices", "FS_streams", "FS_nextInode", "FS_nameTable", "FS_currentPath", "FS_initialized", "FS_ignorePermissions", "FS_filesystems", "FS_syncFSRequests", "FS_lookupPath", "FS_getPath", "FS_hashName", "FS_hashAddNode", "FS_hashRemoveNode", "FS_lookupNode", "FS_createNode", "FS_destroyNode", "FS_isRoot", "FS_isMountpoint", "FS_isFile", "FS_isDir", "FS_isLink", "FS_isChrdev", "FS_isBlkdev", "FS_isFIFO", "FS_isSocket", "FS_flagsToPermissionString", "FS_nodePermissions", "FS_mayLookup", "FS_mayCreate", "FS_mayDelete", "FS_mayOpen", "FS_checkOpExists", "FS_nextfd", "FS_getStreamChecked", "FS_getStream", "FS_createStream", "FS_closeStream", "FS_dupStream", "FS_doSetAttr", "FS_chrdev_stream_ops", "FS_major", "FS_minor", "FS_makedev", "FS_registerDevice", "FS_getDevice", "FS_getMounts", "FS_syncfs", "FS_mount", "FS_unmount", "FS_lookup", "FS_mknod", "FS_statfs", "FS_statfsStream", "FS_statfsNode", "FS_create", "FS_mkdir", "FS_mkdev", "FS_symlink", "FS_rename", "FS_rmdir", "FS_readdir", "FS_readlink", "FS_stat", "FS_fstat", "FS_lstat", "FS_doChmod", "FS_chmod", "FS_lchmod", "FS_fchmod", "FS_doChown", "FS_chown", "FS_lchown", "FS_fchown", "FS_doTruncate", "FS_truncate", "FS_ftruncate", "FS_utime", "FS_open", "FS_close", "FS_isClosed", "FS_llseek", "FS_read", "FS_write", "FS_mmap", "FS_msync", "FS_ioctl", "FS_writeFile", "FS_cwd", "FS_chdir", "FS_createDefaultDirectories", "FS_createDefaultDevices", "FS_createSpecialDirectories", "FS_createStandardStreams", "FS_staticInit", "FS_init", "FS_quit", "FS_findObject", "FS_analyzePath", "FS_createFile", "FS_forceLoadFile", "FS_absolutePath", "FS_createFolder", "FS_createLink", "FS_joinPath", "FS_mmapAlloc", "FS_standardizePath", "MEMFS", "TTY", "PIPEFS", "SOCKFS", "tempFixedLengthArray", "miniTempWebGLFloatBuffers", "miniTempWebGLIntBuffers", "heapObjectForWebGLType", "toTypedArrayIndex", "webgl_enable_ANGLE_instanced_arrays", "webgl_enable_OES_vertex_array_object", "webgl_enable_WEBGL_draw_buffers", "webgl_enable_WEBGL_multi_draw", "webgl_enable_EXT_polygon_offset_clamp", "webgl_enable_EXT_clip_control", "webgl_enable_WEBGL_polygon_mode", "GL", "emscriptenWebGLGet", "computeUnpackAlignedImageSize", "colorChannelsInGlTextureFormat", "emscriptenWebGLGetTexPixelData", "emscriptenWebGLGetUniform", "webglGetUniformLocation", "webglPrepareUniformLocationsBeforeFirstUse", "webglGetLeftBracePos", "emscriptenWebGLGetVertexAttrib", "__glGetActiveAttribOrUniform", "AL", "GLUT", "EGL", "GLEW", "IDBStore", "waitAsyncPolyfilled", "print", "printErr", "jstoi_s", "PThread", "terminateWorker", "cleanupThread", "registerTLSInit", "spawnThread", "exitOnMainThread", "proxyToMainThread", "proxiedJSCallArgs", "invokeEntryPoint", "checkMailbox", "IDBFS" ];
 
 unexportedSymbols.forEach(unexportedRuntimeSymbol);
 
 // End runtime exports
 // Begin JS library exports
-Module["_setTempRet0"] = _setTempRet0;
-
-Module["_getTempRet0"] = _getTempRet0;
-
-Module["___cxa_uncaught_exceptions"] = ___cxa_uncaught_exceptions;
-
-Module["___cxa_current_primary_exception"] = ___cxa_current_primary_exception;
-
-Module["___cxa_rethrow_primary_exception"] = ___cxa_rethrow_primary_exception;
-
-Module["___syscall_shutdown"] = ___syscall_shutdown;
-
 // End JS library exports
 // end include: postlibrary.js
 // proxiedFunctionTable specifies the list of functions that can be called
 // either synchronously or asynchronously from other threads in postMessage()d
 // or internally queued events. This way a pthread in a Worker can synchronously
 // access e.g. the DOM on the main thread.
-var proxiedFunctionTable = [ _proc_exit, exitOnMainThread, pthreadCreateProxied, ___syscall_chdir, ___syscall_chmod, ___syscall_dup3, ___syscall_fchmod, ___syscall_fchmodat2, ___syscall_fcntl64, ___syscall_fstat64, ___syscall_fstatfs64, ___syscall_ftruncate64, ___syscall_getcwd, ___syscall_getdents64, ___syscall_ioctl, ___syscall_lstat64, ___syscall_mkdirat, ___syscall_newfstatat, ___syscall_openat, ___syscall_readlinkat, ___syscall_renameat, ___syscall_rmdir, ___syscall_stat64, ___syscall_statfs64, ___syscall_symlinkat, ___syscall_truncate64, ___syscall_unlinkat, ___syscall_utimensat, __emscripten_dlsync_threads, __emscripten_get_last_devicemotion_event, __emscripten_get_last_deviceorientation_event, __emscripten_get_last_mouse_event, __setitimer_js, _eglBindAPI, _eglChooseConfig, _eglCreateContext, _eglCreateWindowSurface, _eglDestroyContext, _eglDestroySurface, _eglGetConfigAttrib, _eglGetDisplay, _eglGetError, _eglInitialize, _eglMakeCurrent, _eglQueryString, _eglSwapBuffers, _eglSwapInterval, _eglTerminate, _eglWaitClient, _eglWaitNative, _emscripten_exit_fullscreen, getCanvasSizeMainThread, setCanvasElementSizeMainThread, _emscripten_exit_pointerlock, _emscripten_force_exit, _emscripten_get_device_pixel_ratio, _emscripten_get_element_css_size, _emscripten_get_gamepad_status, _emscripten_get_num_gamepads, _emscripten_get_screen_size, _emscripten_request_fullscreen_strategy, _emscripten_request_pointerlock, _emscripten_sample_gamepad_data, _emscripten_set_beforeunload_callback_on_thread, _emscripten_set_blur_callback_on_thread, _emscripten_set_element_css_size, _emscripten_set_focus_callback_on_thread, _emscripten_set_fullscreenchange_callback_on_thread, _emscripten_set_gamepadconnected_callback_on_thread, _emscripten_set_gamepaddisconnected_callback_on_thread, _emscripten_set_keydown_callback_on_thread, _emscripten_set_keypress_callback_on_thread, _emscripten_set_keyup_callback_on_thread, _emscripten_set_mousedown_callback_on_thread, _emscripten_set_mouseenter_callback_on_thread, _emscripten_set_mouseleave_callback_on_thread, _emscripten_set_mousemove_callback_on_thread, _emscripten_set_mouseup_callback_on_thread, _emscripten_set_pointerlockchange_callback_on_thread, _emscripten_set_resize_callback_on_thread, _emscripten_set_touchcancel_callback_on_thread, _emscripten_set_touchend_callback_on_thread, _emscripten_set_touchmove_callback_on_thread, _emscripten_set_touchstart_callback_on_thread, _emscripten_set_visibilitychange_callback_on_thread, _emscripten_set_wheel_callback_on_thread, _emscripten_set_window_title, _environ_get, _environ_sizes_get, _fd_close, _fd_fdstat_get, _fd_read, _fd_seek, _fd_write, _getaddrinfo, _emscripten_html5_remove_event_listener, _emscripten_set_click_callback_on_thread, _emscripten_set_dblclick_callback_on_thread, _emscripten_set_mouseover_callback_on_thread, _emscripten_set_mouseout_callback_on_thread, _emscripten_set_scroll_callback_on_thread, _emscripten_set_focusin_callback_on_thread, _emscripten_set_focusout_callback_on_thread, _emscripten_set_deviceorientation_callback_on_thread, _emscripten_set_devicemotion_callback_on_thread, _emscripten_set_orientationchange_callback_on_thread, _emscripten_get_orientation_status, _emscripten_lock_orientation, _emscripten_unlock_orientation, _emscripten_get_fullscreen_status, _emscripten_request_fullscreen, _emscripten_enter_soft_fullscreen, _emscripten_exit_soft_fullscreen, _emscripten_set_pointerlockerror_callback_on_thread, _emscripten_get_pointerlock_status, _emscripten_vibrate, _emscripten_vibrate_pattern, _emscripten_get_visibility_status, _emscripten_set_batterychargingchange_callback_on_thread, _emscripten_set_batterylevelchange_callback_on_thread, _emscripten_get_battery_status, _sched_yield, _fd_pwrite, _fd_pread, _fd_sync, _emscripten_run_preload_plugins, _emscripten_run_preload_plugins_data, _emscripten_get_window_title, _emscripten_hide_mouse, _emscripten_set_canvas_size, _emscripten_get_canvas_size, _emscripten_create_worker, _emscripten_destroy_worker, _emscripten_call_worker, _emscripten_get_worker_queue_size, _emscripten_get_preloaded_image_data, _emscripten_get_preloaded_image_data_from_FILE, _emscripten_async_wget, _emscripten_async_wget_data, _emscripten_async_wget2, _emscripten_async_wget2_data, _emscripten_async_wget2_abort, __mmap_js, __munmap_js, ___syscall_dup, ___syscall_pipe, ___syscall_socket, ___syscall_getsockname, ___syscall_getpeername, ___syscall_connect, ___syscall_shutdown, ___syscall_accept4, ___syscall_bind, ___syscall_listen, ___syscall_recvfrom, ___syscall_sendto, ___syscall_getsockopt, ___syscall_sendmsg, ___syscall_recvmsg, ___syscall_fchdir, __msync_js, ___syscall_fdatasync, ___syscall_poll, ___syscall_fchown32, ___syscall_mknodat, ___syscall_fchownat, ___syscall_faccessat, ___syscall_fallocate, _emscripten_set_webglcontextlost_callback_on_thread, _emscripten_set_webglcontextrestored_callback_on_thread, _alcCaptureOpenDevice, _alcCaptureCloseDevice, _alcCaptureStart, _alcCaptureStop, _alcCaptureSamples, _alcOpenDevice, _alcCloseDevice, _alcCreateContext, _alcDestroyContext, _alcGetError, _alcGetCurrentContext, _alcMakeContextCurrent, _alcGetContextsDevice, _alcIsExtensionPresent, _alcGetEnumValue, _alcGetString, _alcGetIntegerv, _emscripten_alcDevicePauseSOFT, _emscripten_alcDeviceResumeSOFT, _emscripten_alcGetStringiSOFT, _emscripten_alcResetDeviceSOFT, _alGenBuffers, _alDeleteBuffers, _alGenSources, _alDeleteSources, _alSourcei, _alGetError, _alIsExtensionPresent, _alGetEnumValue, _alGetString, _alEnable, _alDisable, _alIsEnabled, _alGetDouble, _alGetDoublev, _alGetFloat, _alGetFloatv, _alGetInteger, _alGetIntegerv, _alGetBoolean, _alGetBooleanv, _alDistanceModel, _alSpeedOfSound, _alDopplerFactor, _alDopplerVelocity, _alGetListenerf, _alGetListener3f, _alGetListenerfv, _alGetListeneri, _alGetListener3i, _alGetListeneriv, _alListenerf, _alListener3f, _alListenerfv, _alListeneri, _alListener3i, _alListeneriv, _alIsBuffer, _alBufferData, _alGetBufferf, _alGetBuffer3f, _alGetBufferfv, _alGetBufferi, _alGetBuffer3i, _alGetBufferiv, _alBufferf, _alBuffer3f, _alBufferfv, _alBufferi, _alBuffer3i, _alBufferiv, _alIsSource, _alSourceQueueBuffers, _alSourceUnqueueBuffers, _alSourcePlay, _alSourcePlayv, _alSourceStop, _alSourceStopv, _alSourceRewind, _alSourceRewindv, _alSourcePause, _alSourcePausev, _alGetSourcef, _alGetSource3f, _alGetSourcefv, _alGetSourcei, _alGetSource3i, _alGetSourceiv, _alSourcef, _alSource3f, _alSourcefv, _alSource3i, _alSourceiv, _glutPostRedisplay, _glutGetModifiers, _glutInit, _glutInitWindowSize, _glutInitWindowPosition, _glutIdleFunc, _glutTimerFunc, _glutDisplayFunc, _glutKeyboardFunc, _glutKeyboardUpFunc, _glutSpecialFunc, _glutSpecialUpFunc, _glutReshapeFunc, _glutMotionFunc, _glutPassiveMotionFunc, _glutMouseFunc, _glutSetCursor, _glutCreateWindow, _glutDestroyWindow, _glutReshapeWindow, _glutPositionWindow, _glutFullScreen, _glutInitDisplayMode, _glutSwapBuffers, _glutMainLoop, _eglGetConfigs, _eglQuerySurface, _eglQueryContext, _eglQueryAPI, _eglGetCurrentContext, _eglGetCurrentSurface, _eglGetCurrentDisplay, _eglReleaseThread ];
+var proxiedFunctionTable = [ _proc_exit, exitOnMainThread, pthreadCreateProxied, ___syscall_fcntl64, ___syscall_fstat64, ___syscall_getdents64, ___syscall_ioctl, ___syscall_lstat64, ___syscall_newfstatat, ___syscall_openat, ___syscall_rmdir, ___syscall_stat64, ___syscall_unlinkat, _eglBindAPI, _eglChooseConfig, _eglCreateContext, _eglCreateWindowSurface, _eglDestroyContext, _eglDestroySurface, _eglGetConfigAttrib, _eglGetDisplay, _eglGetError, _eglInitialize, _eglMakeCurrent, _eglQueryString, _eglSwapBuffers, _eglSwapInterval, _eglTerminate, _eglWaitClient, _eglWaitNative, _emscripten_exit_fullscreen, getCanvasSizeMainThread, setCanvasElementSizeMainThread, _emscripten_exit_pointerlock, _emscripten_force_exit, _emscripten_get_device_pixel_ratio, _emscripten_get_element_css_size, _emscripten_get_gamepad_status, _emscripten_get_num_gamepads, _emscripten_get_screen_size, _emscripten_request_fullscreen_strategy, _emscripten_request_pointerlock, _emscripten_sample_gamepad_data, _emscripten_set_beforeunload_callback_on_thread, _emscripten_set_blur_callback_on_thread, _emscripten_set_element_css_size, _emscripten_set_focus_callback_on_thread, _emscripten_set_fullscreenchange_callback_on_thread, _emscripten_set_gamepadconnected_callback_on_thread, _emscripten_set_gamepaddisconnected_callback_on_thread, _emscripten_set_keydown_callback_on_thread, _emscripten_set_keypress_callback_on_thread, _emscripten_set_keyup_callback_on_thread, _emscripten_set_mousedown_callback_on_thread, _emscripten_set_mouseenter_callback_on_thread, _emscripten_set_mouseleave_callback_on_thread, _emscripten_set_mousemove_callback_on_thread, _emscripten_set_mouseup_callback_on_thread, _emscripten_set_pointerlockchange_callback_on_thread, _emscripten_set_resize_callback_on_thread, _emscripten_set_touchcancel_callback_on_thread, _emscripten_set_touchend_callback_on_thread, _emscripten_set_touchmove_callback_on_thread, _emscripten_set_touchstart_callback_on_thread, _emscripten_set_visibilitychange_callback_on_thread, _emscripten_set_wheel_callback_on_thread, _emscripten_set_window_title, _environ_get, _environ_sizes_get, _fd_close, _fd_read, _fd_seek, _fd_write ];
 
 function checkIncomingModuleAPI() {
   ignoredModuleProp("fetchSettings");
@@ -24740,10 +10122,10 @@ function checkIncomingModuleAPI() {
 }
 
 var ASM_CONSTS = {
-  266356: () => {
+  175572: () => {
     window.location.href = window.location.href.substring(0, window.location.href.lastIndexOf("/"));
   },
-  266457: () => {
+  175673: () => {
     FS.syncfs(false, function(err) {
       if (err) {
         ccall("SyncFSCompleted", null, [ "number" ], [ err ]);
@@ -24752,7 +10134,7 @@ var ASM_CONSTS = {
       }
     });
   },
-  266616: ($0, $1, $2, $3, $4) => {
+  175832: ($0, $1, $2, $3, $4) => {
     if (typeof window === "undefined" || (window.AudioContext || window.webkitAudioContext) === undefined) {
       return 0;
     }
@@ -24819,7 +10201,7 @@ var ASM_CONSTS = {
     window.miniaudio.referenceCount += 1;
     return 1;
   },
-  268606: () => {
+  177822: () => {
     if (typeof (window.miniaudio) !== "undefined") {
       window.miniaudio.referenceCount -= 1;
       if (window.miniaudio.referenceCount === 0) {
@@ -24827,8 +10209,8 @@ var ASM_CONSTS = {
       }
     }
   },
-  268770: () => (navigator.mediaDevices !== undefined && navigator.mediaDevices.getUserMedia !== undefined),
-  268874: () => {
+  177986: () => (navigator.mediaDevices !== undefined && navigator.mediaDevices.getUserMedia !== undefined),
+  178090: () => {
     try {
       var temp = new (window.AudioContext || window.webkitAudioContext);
       var sampleRate = temp.sampleRate;
@@ -24838,7 +10220,7 @@ var ASM_CONSTS = {
       return 0;
     }
   },
-  269045: ($0, $1, $2, $3, $4, $5) => {
+  178261: ($0, $1, $2, $3, $4, $5) => {
     var deviceType = $0;
     var channels = $1;
     var sampleRate = $2;
@@ -24908,8 +10290,8 @@ var ASM_CONSTS = {
     }
     return miniaudio.track_device(device);
   },
-  271828: $0 => miniaudio.get_device_by_index($0).webaudio.sampleRate,
-  271894: $0 => {
+  181044: $0 => miniaudio.get_device_by_index($0).webaudio.sampleRate,
+  181110: $0 => {
     var device = miniaudio.get_device_by_index($0);
     if (device.scriptNode !== undefined) {
       device.scriptNode.onaudioprocess = function(e) {};
@@ -24923,20 +10305,20 @@ var ASM_CONSTS = {
     device.webaudio.close();
     device.webaudio = undefined;
   },
-  272259: $0 => {
+  181475: $0 => {
     miniaudio.untrack_device_by_index($0);
   },
-  272302: $0 => {
+  181518: $0 => {
     var device = miniaudio.get_device_by_index($0);
     device.webaudio.resume();
     device.state = miniaudio.device_state.started;
   },
-  272427: $0 => {
+  181643: $0 => {
     var device = miniaudio.get_device_by_index($0);
     device.webaudio.suspend();
     device.state = miniaudio.device_state.stopped;
   },
-  272553: $0 => {
+  181769: $0 => {
     var str = UTF8ToString($0) + "\n\n" + "Abort/Retry/Ignore/AlwaysIgnore? [ariA] :";
     var reply = window.prompt(str, "i");
     if (reply === null) {
@@ -24944,7 +10326,7 @@ var ASM_CONSTS = {
     }
     return reply.length === 1 ? reply.charCodeAt(0) : -1;
   },
-  272768: () => {
+  181984: () => {
     if (typeof (AudioContext) !== "undefined") {
       return true;
     } else if (typeof (webkitAudioContext) !== "undefined") {
@@ -24952,7 +10334,7 @@ var ASM_CONSTS = {
     }
     return false;
   },
-  272915: () => {
+  182131: () => {
     if ((typeof (navigator.mediaDevices) !== "undefined") && (typeof (navigator.mediaDevices.getUserMedia) !== "undefined")) {
       return true;
     } else if (typeof (navigator.webkitGetUserMedia) !== "undefined") {
@@ -24960,7 +10342,7 @@ var ASM_CONSTS = {
     }
     return false;
   },
-  273149: $0 => {
+  182365: $0 => {
     if (typeof (Module["SDL2"]) === "undefined") {
       Module["SDL2"] = {};
     }
@@ -24984,11 +10366,11 @@ var ASM_CONSTS = {
     }
     return SDL2.audioContext === undefined ? -1 : 0;
   },
-  273701: () => {
+  182917: () => {
     var SDL2 = Module["SDL2"];
     return SDL2.audioContext.sampleRate;
   },
-  273769: ($0, $1, $2, $3) => {
+  182985: ($0, $1, $2, $3) => {
     var SDL2 = Module["SDL2"];
     var have_microphone = function(stream) {
       if (SDL2.capture.silenceTimer !== undefined) {
@@ -25030,7 +10412,7 @@ var ASM_CONSTS = {
       }, have_microphone, no_microphone);
     }
   },
-  275462: ($0, $1, $2, $3) => {
+  184678: ($0, $1, $2, $3) => {
     var SDL2 = Module["SDL2"];
     SDL2.audio.scriptProcessorNode = SDL2.audioContext["createScriptProcessor"]($1, 0, $0);
     SDL2.audio.scriptProcessorNode["onaudioprocess"] = function(e) {
@@ -25062,7 +10444,7 @@ var ASM_CONSTS = {
       SDL2.audio.silenceTimer = setInterval(silence_callback, ($1 / SDL2.audioContext.sampleRate) * 1e3);
     }
   },
-  276637: ($0, $1) => {
+  185853: ($0, $1) => {
     var SDL2 = Module["SDL2"];
     var numChannels = SDL2.capture.currentCaptureBuffer.numberOfChannels;
     for (var c = 0; c < numChannels; ++c) {
@@ -25081,7 +10463,7 @@ var ASM_CONSTS = {
       }
     }
   },
-  277242: ($0, $1) => {
+  186458: ($0, $1) => {
     var SDL2 = Module["SDL2"];
     var buf = $0 >>> 2;
     var numChannels = SDL2.audio.currentOutputBuffer["numberOfChannels"];
@@ -25095,7 +10477,7 @@ var ASM_CONSTS = {
       }
     }
   },
-  277731: $0 => {
+  186947: $0 => {
     var SDL2 = Module["SDL2"];
     if ($0) {
       if (SDL2.capture.silenceTimer !== undefined) {
@@ -25129,10 +10511,10 @@ var ASM_CONSTS = {
       SDL2.audioContext = undefined;
     }
   },
-  278737: $0 => {
+  187953: $0 => {
     window.open(UTF8ToString($0), "_blank");
   },
-  278777: ($0, $1, $2) => {
+  187993: ($0, $1, $2) => {
     var w = $0;
     var h = $1;
     var pixels = $2;
@@ -25203,7 +10585,7 @@ var ASM_CONSTS = {
     }
     SDL2.ctx.putImageData(SDL2.image, 0, 0);
   },
-  280243: ($0, $1, $2, $3, $4) => {
+  189459: ($0, $1, $2, $3, $4) => {
     var w = $0;
     var h = $1;
     var hot_x = $2;
@@ -25240,21 +10622,18 @@ var ASM_CONSTS = {
     stringToUTF8(url, urlBuf, url.length + 1);
     return urlBuf;
   },
-  281231: $0 => {
+  190447: $0 => {
     if (Module["canvas"]) {
       Module["canvas"].style["cursor"] = UTF8ToString($0);
     }
   },
-  281314: () => {
+  190530: () => {
     if (Module["canvas"]) {
       Module["canvas"].style["cursor"] = "none";
     }
   },
-  281383: () => window.innerWidth,
-  281413: () => window.innerHeight,
-  281444: ($0, $1) => {
-    alert(UTF8ToString($0) + "\n\n" + UTF8ToString($1));
-  }
+  190599: () => window.innerWidth,
+  190629: () => window.innerHeight
 };
 
 // Imports from the Wasm binary.
@@ -25264,15 +10643,11 @@ var _RSDK_Configure = Module["_RSDK_Configure"] = makeInvalidEarlyAccess("_RSDK_
 
 var _main = Module["_main"] = makeInvalidEarlyAccess("_main");
 
-var _memcmp = makeInvalidEarlyAccess("_memcmp");
-
 var _SyncFSCompleted = Module["_SyncFSCompleted"] = makeInvalidEarlyAccess("_SyncFSCompleted");
 
 var _malloc = makeInvalidEarlyAccess("_malloc");
 
 var _free = makeInvalidEarlyAccess("_free");
-
-var _calloc = makeInvalidEarlyAccess("_calloc");
 
 var _ma_malloc_emscripten = Module["_ma_malloc_emscripten"] = makeInvalidEarlyAccess("_ma_malloc_emscripten");
 
@@ -25282,10 +10657,6 @@ var _ma_device_process_pcm_frames_capture__webaudio = Module["_ma_device_process
 
 var _ma_device_process_pcm_frames_playback__webaudio = Module["_ma_device_process_pcm_frames_playback__webaudio"] = makeInvalidEarlyAccess("_ma_device_process_pcm_frames_playback__webaudio");
 
-var _realloc = makeInvalidEarlyAccess("_realloc");
-
-var _fileno = makeInvalidEarlyAccess("_fileno");
-
 var _fflush = makeInvalidEarlyAccess("_fflush");
 
 var _strerror = makeInvalidEarlyAccess("_strerror");
@@ -25294,37 +10665,15 @@ var _pthread_self = makeInvalidEarlyAccess("_pthread_self");
 
 var __emscripten_tls_init = makeInvalidEarlyAccess("__emscripten_tls_init");
 
-var _emscripten_builtin_memalign = makeInvalidEarlyAccess("_emscripten_builtin_memalign");
-
 var __emscripten_run_callback_on_thread = makeInvalidEarlyAccess("__emscripten_run_callback_on_thread");
-
-var ___dl_seterr = makeInvalidEarlyAccess("___dl_seterr");
-
-var __emscripten_dlsync_self_async = makeInvalidEarlyAccess("__emscripten_dlsync_self_async");
-
-var __emscripten_dlsync_self = makeInvalidEarlyAccess("__emscripten_dlsync_self");
-
-var __emscripten_proxy_dlsync_async = makeInvalidEarlyAccess("__emscripten_proxy_dlsync_async");
-
-var __emscripten_proxy_dlsync = makeInvalidEarlyAccess("__emscripten_proxy_dlsync");
-
-var __emscripten_find_dylib = makeInvalidEarlyAccess("__emscripten_find_dylib");
-
-var _memcpy = makeInvalidEarlyAccess("_memcpy");
 
 var __emscripten_thread_init = makeInvalidEarlyAccess("__emscripten_thread_init");
 
 var __emscripten_thread_crashed = makeInvalidEarlyAccess("__emscripten_thread_crashed");
 
-var _htonl = makeInvalidEarlyAccess("_htonl");
-
-var _htons = makeInvalidEarlyAccess("_htons");
-
 var _emscripten_stack_get_end = makeInvalidEarlyAccess("_emscripten_stack_get_end");
 
 var _emscripten_stack_get_base = makeInvalidEarlyAccess("_emscripten_stack_get_base");
-
-var _ntohs = makeInvalidEarlyAccess("_ntohs");
 
 var __emscripten_run_js_on_main_thread_done = makeInvalidEarlyAccess("__emscripten_run_js_on_main_thread_done");
 
@@ -25334,19 +10683,11 @@ var __emscripten_thread_free_data = makeInvalidEarlyAccess("__emscripten_thread_
 
 var __emscripten_thread_exit = makeInvalidEarlyAccess("__emscripten_thread_exit");
 
-var __emscripten_timeout = makeInvalidEarlyAccess("__emscripten_timeout");
-
 var __emscripten_check_mailbox = makeInvalidEarlyAccess("__emscripten_check_mailbox");
 
 var _sbrk = makeInvalidEarlyAccess("_sbrk");
 
 var _emscripten_get_sbrk_ptr = makeInvalidEarlyAccess("_emscripten_get_sbrk_ptr");
-
-var _setThrew = makeInvalidEarlyAccess("_setThrew");
-
-var __emscripten_tempret_set = makeInvalidEarlyAccess("__emscripten_tempret_set");
-
-var __emscripten_tempret_get = makeInvalidEarlyAccess("__emscripten_tempret_get");
 
 var _emscripten_stack_init = makeInvalidEarlyAccess("_emscripten_stack_init");
 
@@ -25360,21 +10701,9 @@ var __emscripten_stack_alloc = makeInvalidEarlyAccess("__emscripten_stack_alloc"
 
 var _emscripten_stack_get_current = makeInvalidEarlyAccess("_emscripten_stack_get_current");
 
-var ___cxa_decrement_exception_refcount = makeInvalidEarlyAccess("___cxa_decrement_exception_refcount");
-
-var ___cxa_increment_exception_refcount = makeInvalidEarlyAccess("___cxa_increment_exception_refcount");
-
-var ___cxa_demangle = makeInvalidEarlyAccess("___cxa_demangle");
-
-var ___cxa_can_catch = makeInvalidEarlyAccess("___cxa_can_catch");
-
-var ___cxa_get_exception_ptr = makeInvalidEarlyAccess("___cxa_get_exception_ptr");
-
-var ___stack_pointer = makeInvalidEarlyAccess("___stack_pointer");
+var ___set_stack_limits = Module["___set_stack_limits"] = makeInvalidEarlyAccess("___set_stack_limits");
 
 var __indirect_function_table = makeInvalidEarlyAccess("__indirect_function_table");
-
-var ___heap_base = makeInvalidEarlyAccess("___heap_base");
 
 var wasmTable = makeInvalidEarlyAccess("wasmTable");
 
@@ -25382,333 +10711,104 @@ function assignWasmExports(wasmExports) {
   assert(typeof wasmExports["RSDK_Initialize"] != "undefined", "missing Wasm export: RSDK_Initialize");
   assert(typeof wasmExports["RSDK_Configure"] != "undefined", "missing Wasm export: RSDK_Configure");
   assert(typeof wasmExports["main"] != "undefined", "missing Wasm export: main");
-  assert(typeof wasmExports["memcmp"] != "undefined", "missing Wasm export: memcmp");
   assert(typeof wasmExports["SyncFSCompleted"] != "undefined", "missing Wasm export: SyncFSCompleted");
   assert(typeof wasmExports["malloc"] != "undefined", "missing Wasm export: malloc");
   assert(typeof wasmExports["free"] != "undefined", "missing Wasm export: free");
-  assert(typeof wasmExports["calloc"] != "undefined", "missing Wasm export: calloc");
   assert(typeof wasmExports["ma_malloc_emscripten"] != "undefined", "missing Wasm export: ma_malloc_emscripten");
   assert(typeof wasmExports["ma_free_emscripten"] != "undefined", "missing Wasm export: ma_free_emscripten");
   assert(typeof wasmExports["ma_device_process_pcm_frames_capture__webaudio"] != "undefined", "missing Wasm export: ma_device_process_pcm_frames_capture__webaudio");
   assert(typeof wasmExports["ma_device_process_pcm_frames_playback__webaudio"] != "undefined", "missing Wasm export: ma_device_process_pcm_frames_playback__webaudio");
-  assert(typeof wasmExports["realloc"] != "undefined", "missing Wasm export: realloc");
-  assert(typeof wasmExports["fileno"] != "undefined", "missing Wasm export: fileno");
   assert(typeof wasmExports["fflush"] != "undefined", "missing Wasm export: fflush");
   assert(typeof wasmExports["strerror"] != "undefined", "missing Wasm export: strerror");
   assert(typeof wasmExports["pthread_self"] != "undefined", "missing Wasm export: pthread_self");
   assert(typeof wasmExports["_emscripten_tls_init"] != "undefined", "missing Wasm export: _emscripten_tls_init");
-  assert(typeof wasmExports["emscripten_builtin_memalign"] != "undefined", "missing Wasm export: emscripten_builtin_memalign");
   assert(typeof wasmExports["_emscripten_run_callback_on_thread"] != "undefined", "missing Wasm export: _emscripten_run_callback_on_thread");
-  assert(typeof wasmExports["__dl_seterr"] != "undefined", "missing Wasm export: __dl_seterr");
-  assert(typeof wasmExports["_emscripten_dlsync_self_async"] != "undefined", "missing Wasm export: _emscripten_dlsync_self_async");
-  assert(typeof wasmExports["_emscripten_dlsync_self"] != "undefined", "missing Wasm export: _emscripten_dlsync_self");
-  assert(typeof wasmExports["_emscripten_proxy_dlsync_async"] != "undefined", "missing Wasm export: _emscripten_proxy_dlsync_async");
-  assert(typeof wasmExports["_emscripten_proxy_dlsync"] != "undefined", "missing Wasm export: _emscripten_proxy_dlsync");
-  assert(typeof wasmExports["_emscripten_find_dylib"] != "undefined", "missing Wasm export: _emscripten_find_dylib");
-  assert(typeof wasmExports["memcpy"] != "undefined", "missing Wasm export: memcpy");
   assert(typeof wasmExports["_emscripten_thread_init"] != "undefined", "missing Wasm export: _emscripten_thread_init");
   assert(typeof wasmExports["_emscripten_thread_crashed"] != "undefined", "missing Wasm export: _emscripten_thread_crashed");
-  assert(typeof wasmExports["htonl"] != "undefined", "missing Wasm export: htonl");
-  assert(typeof wasmExports["htons"] != "undefined", "missing Wasm export: htons");
   assert(typeof wasmExports["emscripten_stack_get_end"] != "undefined", "missing Wasm export: emscripten_stack_get_end");
   assert(typeof wasmExports["emscripten_stack_get_base"] != "undefined", "missing Wasm export: emscripten_stack_get_base");
-  assert(typeof wasmExports["ntohs"] != "undefined", "missing Wasm export: ntohs");
   assert(typeof wasmExports["_emscripten_run_js_on_main_thread_done"] != "undefined", "missing Wasm export: _emscripten_run_js_on_main_thread_done");
   assert(typeof wasmExports["_emscripten_run_js_on_main_thread"] != "undefined", "missing Wasm export: _emscripten_run_js_on_main_thread");
   assert(typeof wasmExports["_emscripten_thread_free_data"] != "undefined", "missing Wasm export: _emscripten_thread_free_data");
   assert(typeof wasmExports["_emscripten_thread_exit"] != "undefined", "missing Wasm export: _emscripten_thread_exit");
-  assert(typeof wasmExports["_emscripten_timeout"] != "undefined", "missing Wasm export: _emscripten_timeout");
   assert(typeof wasmExports["_emscripten_check_mailbox"] != "undefined", "missing Wasm export: _emscripten_check_mailbox");
   assert(typeof wasmExports["sbrk"] != "undefined", "missing Wasm export: sbrk");
   assert(typeof wasmExports["emscripten_get_sbrk_ptr"] != "undefined", "missing Wasm export: emscripten_get_sbrk_ptr");
-  assert(typeof wasmExports["setThrew"] != "undefined", "missing Wasm export: setThrew");
-  assert(typeof wasmExports["_emscripten_tempret_set"] != "undefined", "missing Wasm export: _emscripten_tempret_set");
-  assert(typeof wasmExports["_emscripten_tempret_get"] != "undefined", "missing Wasm export: _emscripten_tempret_get");
   assert(typeof wasmExports["emscripten_stack_init"] != "undefined", "missing Wasm export: emscripten_stack_init");
   assert(typeof wasmExports["emscripten_stack_set_limits"] != "undefined", "missing Wasm export: emscripten_stack_set_limits");
   assert(typeof wasmExports["emscripten_stack_get_free"] != "undefined", "missing Wasm export: emscripten_stack_get_free");
   assert(typeof wasmExports["_emscripten_stack_restore"] != "undefined", "missing Wasm export: _emscripten_stack_restore");
   assert(typeof wasmExports["_emscripten_stack_alloc"] != "undefined", "missing Wasm export: _emscripten_stack_alloc");
   assert(typeof wasmExports["emscripten_stack_get_current"] != "undefined", "missing Wasm export: emscripten_stack_get_current");
-  assert(typeof wasmExports["__cxa_decrement_exception_refcount"] != "undefined", "missing Wasm export: __cxa_decrement_exception_refcount");
-  assert(typeof wasmExports["__cxa_increment_exception_refcount"] != "undefined", "missing Wasm export: __cxa_increment_exception_refcount");
-  assert(typeof wasmExports["__cxa_demangle"] != "undefined", "missing Wasm export: __cxa_demangle");
-  assert(typeof wasmExports["__cxa_can_catch"] != "undefined", "missing Wasm export: __cxa_can_catch");
-  assert(typeof wasmExports["__cxa_get_exception_ptr"] != "undefined", "missing Wasm export: __cxa_get_exception_ptr");
-  assert(typeof wasmExports["__stack_pointer"] != "undefined", "missing Wasm export: __stack_pointer");
+  assert(typeof wasmExports["__set_stack_limits"] != "undefined", "missing Wasm export: __set_stack_limits");
   assert(typeof wasmExports["__indirect_function_table"] != "undefined", "missing Wasm export: __indirect_function_table");
-  assert(typeof wasmExports["__heap_base"] != "undefined", "missing Wasm export: __heap_base");
   _RSDK_Initialize = Module["_RSDK_Initialize"] = createExportWrapper("RSDK_Initialize", 0);
   _RSDK_Configure = Module["_RSDK_Configure"] = createExportWrapper("RSDK_Configure", 2);
   _main = Module["_main"] = createExportWrapper("main", 2);
-  _memcmp = createExportWrapper("memcmp", 3);
   _SyncFSCompleted = Module["_SyncFSCompleted"] = createExportWrapper("SyncFSCompleted", 2);
   _malloc = createExportWrapper("malloc", 1);
   _free = createExportWrapper("free", 1);
-  _calloc = createExportWrapper("calloc", 2);
   _ma_malloc_emscripten = Module["_ma_malloc_emscripten"] = createExportWrapper("ma_malloc_emscripten", 2);
   _ma_free_emscripten = Module["_ma_free_emscripten"] = createExportWrapper("ma_free_emscripten", 2);
   _ma_device_process_pcm_frames_capture__webaudio = Module["_ma_device_process_pcm_frames_capture__webaudio"] = createExportWrapper("ma_device_process_pcm_frames_capture__webaudio", 3);
   _ma_device_process_pcm_frames_playback__webaudio = Module["_ma_device_process_pcm_frames_playback__webaudio"] = createExportWrapper("ma_device_process_pcm_frames_playback__webaudio", 3);
-  _realloc = createExportWrapper("realloc", 2);
-  _fileno = createExportWrapper("fileno", 1);
   _fflush = createExportWrapper("fflush", 1);
   _strerror = createExportWrapper("strerror", 1);
   _pthread_self = createExportWrapper("pthread_self", 0);
   __emscripten_tls_init = createExportWrapper("_emscripten_tls_init", 0);
-  _emscripten_builtin_memalign = createExportWrapper("emscripten_builtin_memalign", 2);
   __emscripten_run_callback_on_thread = createExportWrapper("_emscripten_run_callback_on_thread", 6);
-  ___dl_seterr = createExportWrapper("__dl_seterr", 2);
-  __emscripten_dlsync_self_async = createExportWrapper("_emscripten_dlsync_self_async", 1);
-  __emscripten_dlsync_self = createExportWrapper("_emscripten_dlsync_self", 0);
-  __emscripten_proxy_dlsync_async = createExportWrapper("_emscripten_proxy_dlsync_async", 2);
-  __emscripten_proxy_dlsync = createExportWrapper("_emscripten_proxy_dlsync", 1);
-  __emscripten_find_dylib = createExportWrapper("_emscripten_find_dylib", 4);
-  _memcpy = createExportWrapper("memcpy", 3);
   __emscripten_thread_init = createExportWrapper("_emscripten_thread_init", 6);
   __emscripten_thread_crashed = createExportWrapper("_emscripten_thread_crashed", 0);
-  _htonl = createExportWrapper("htonl", 1);
-  _htons = createExportWrapper("htons", 1);
   _emscripten_stack_get_end = wasmExports["emscripten_stack_get_end"];
   _emscripten_stack_get_base = wasmExports["emscripten_stack_get_base"];
-  _ntohs = createExportWrapper("ntohs", 1);
   __emscripten_run_js_on_main_thread_done = createExportWrapper("_emscripten_run_js_on_main_thread_done", 3);
   __emscripten_run_js_on_main_thread = createExportWrapper("_emscripten_run_js_on_main_thread", 5);
   __emscripten_thread_free_data = createExportWrapper("_emscripten_thread_free_data", 1);
   __emscripten_thread_exit = createExportWrapper("_emscripten_thread_exit", 1);
-  __emscripten_timeout = createExportWrapper("_emscripten_timeout", 2);
   __emscripten_check_mailbox = createExportWrapper("_emscripten_check_mailbox", 0);
   _sbrk = createExportWrapper("sbrk", 1);
   _emscripten_get_sbrk_ptr = wasmExports["emscripten_get_sbrk_ptr"];
-  _setThrew = createExportWrapper("setThrew", 2);
-  __emscripten_tempret_set = createExportWrapper("_emscripten_tempret_set", 1);
-  __emscripten_tempret_get = createExportWrapper("_emscripten_tempret_get", 0);
   _emscripten_stack_init = wasmExports["emscripten_stack_init"];
   _emscripten_stack_set_limits = wasmExports["emscripten_stack_set_limits"];
   _emscripten_stack_get_free = wasmExports["emscripten_stack_get_free"];
   __emscripten_stack_restore = wasmExports["_emscripten_stack_restore"];
   __emscripten_stack_alloc = wasmExports["_emscripten_stack_alloc"];
   _emscripten_stack_get_current = wasmExports["emscripten_stack_get_current"];
-  ___cxa_decrement_exception_refcount = createExportWrapper("__cxa_decrement_exception_refcount", 1);
-  ___cxa_increment_exception_refcount = createExportWrapper("__cxa_increment_exception_refcount", 1);
-  ___cxa_demangle = createExportWrapper("__cxa_demangle", 4);
-  ___cxa_can_catch = createExportWrapper("__cxa_can_catch", 3);
-  ___cxa_get_exception_ptr = createExportWrapper("__cxa_get_exception_ptr", 1);
-  ___stack_pointer = wasmExports["__stack_pointer"];
+  ___set_stack_limits = Module["___set_stack_limits"] = createExportWrapper("__set_stack_limits", 2);
   __indirect_function_table = wasmTable = wasmExports["__indirect_function_table"];
-  ___heap_base = wasmExports["__heap_base"].value;
 }
 
 var wasmImports;
 
 function assignWasmImports() {
   wasmImports = {
-    /** @export */ XChangeWindowAttributes: _XChangeWindowAttributes,
-    /** @export */ XCreateWindow: _XCreateWindow,
-    /** @export */ XInternAtom: _XInternAtom,
-    /** @export */ XMapWindow: _XMapWindow,
-    /** @export */ XOpenDisplay: _XOpenDisplay,
-    /** @export */ XPending: _XPending,
-    /** @export */ XSendEvent: _XSendEvent,
-    /** @export */ XSetWMHints: _XSetWMHints,
-    /** @export */ XStoreName: _XStoreName,
-    /** @export */ _Unwind_Backtrace: __Unwind_Backtrace,
-    /** @export */ _Unwind_DeleteException: __Unwind_DeleteException,
-    /** @export */ _Unwind_FindEnclosingFunction: __Unwind_FindEnclosingFunction,
-    /** @export */ _Unwind_GetIPInfo: __Unwind_GetIPInfo,
-    /** @export */ _Unwind_RaiseException: __Unwind_RaiseException,
-    /** @export */ __asctime_r: ___asctime_r,
     /** @export */ __assert_fail: ___assert_fail,
     /** @export */ __call_sighandler: ___call_sighandler,
-    /** @export */ __cxa_begin_catch: ___cxa_begin_catch,
-    /** @export */ __cxa_call_unexpected: ___cxa_call_unexpected,
-    /** @export */ __cxa_current_exception_type: ___cxa_current_exception_type,
-    /** @export */ __cxa_end_catch: ___cxa_end_catch,
-    /** @export */ __cxa_find_matching_catch_2: ___cxa_find_matching_catch_2,
-    /** @export */ __cxa_find_matching_catch_3: ___cxa_find_matching_catch_3,
-    /** @export */ __cxa_find_matching_catch_4: ___cxa_find_matching_catch_4,
-    /** @export */ __cxa_rethrow: ___cxa_rethrow,
     /** @export */ __cxa_throw: ___cxa_throw,
     /** @export */ __handle_stack_overflow: ___handle_stack_overflow,
     /** @export */ __pthread_create_js: ___pthread_create_js,
-    /** @export */ __resumeException: ___resumeException,
-    /** @export */ __syscall_accept4: ___syscall_accept4,
-    /** @export */ __syscall_bind: ___syscall_bind,
-    /** @export */ __syscall_chdir: ___syscall_chdir,
-    /** @export */ __syscall_chmod: ___syscall_chmod,
-    /** @export */ __syscall_connect: ___syscall_connect,
-    /** @export */ __syscall_dup: ___syscall_dup,
-    /** @export */ __syscall_dup3: ___syscall_dup3,
-    /** @export */ __syscall_faccessat: ___syscall_faccessat,
-    /** @export */ __syscall_fadvise64: ___syscall_fadvise64,
-    /** @export */ __syscall_fallocate: ___syscall_fallocate,
-    /** @export */ __syscall_fchdir: ___syscall_fchdir,
-    /** @export */ __syscall_fchmod: ___syscall_fchmod,
-    /** @export */ __syscall_fchmodat2: ___syscall_fchmodat2,
-    /** @export */ __syscall_fchown32: ___syscall_fchown32,
-    /** @export */ __syscall_fchownat: ___syscall_fchownat,
     /** @export */ __syscall_fcntl64: ___syscall_fcntl64,
-    /** @export */ __syscall_fdatasync: ___syscall_fdatasync,
     /** @export */ __syscall_fstat64: ___syscall_fstat64,
-    /** @export */ __syscall_fstatfs64: ___syscall_fstatfs64,
-    /** @export */ __syscall_ftruncate64: ___syscall_ftruncate64,
-    /** @export */ __syscall_getcwd: ___syscall_getcwd,
     /** @export */ __syscall_getdents64: ___syscall_getdents64,
-    /** @export */ __syscall_getpeername: ___syscall_getpeername,
-    /** @export */ __syscall_getsockname: ___syscall_getsockname,
-    /** @export */ __syscall_getsockopt: ___syscall_getsockopt,
     /** @export */ __syscall_ioctl: ___syscall_ioctl,
-    /** @export */ __syscall_listen: ___syscall_listen,
     /** @export */ __syscall_lstat64: ___syscall_lstat64,
-    /** @export */ __syscall_mkdirat: ___syscall_mkdirat,
-    /** @export */ __syscall_mknodat: ___syscall_mknodat,
     /** @export */ __syscall_newfstatat: ___syscall_newfstatat,
     /** @export */ __syscall_openat: ___syscall_openat,
-    /** @export */ __syscall_pipe: ___syscall_pipe,
-    /** @export */ __syscall_poll: ___syscall_poll,
-    /** @export */ __syscall_readlinkat: ___syscall_readlinkat,
-    /** @export */ __syscall_recvfrom: ___syscall_recvfrom,
-    /** @export */ __syscall_recvmsg: ___syscall_recvmsg,
-    /** @export */ __syscall_renameat: ___syscall_renameat,
     /** @export */ __syscall_rmdir: ___syscall_rmdir,
-    /** @export */ __syscall_sendmsg: ___syscall_sendmsg,
-    /** @export */ __syscall_sendto: ___syscall_sendto,
-    /** @export */ __syscall_socket: ___syscall_socket,
     /** @export */ __syscall_stat64: ___syscall_stat64,
-    /** @export */ __syscall_statfs64: ___syscall_statfs64,
-    /** @export */ __syscall_symlinkat: ___syscall_symlinkat,
-    /** @export */ __syscall_truncate64: ___syscall_truncate64,
     /** @export */ __syscall_unlinkat: ___syscall_unlinkat,
-    /** @export */ __syscall_utimensat: ___syscall_utimensat,
     /** @export */ _abort_js: __abort_js,
-    /** @export */ _dlopen_js: __dlopen_js,
-    /** @export */ _dlsym_catchup_js: __dlsym_catchup_js,
-    /** @export */ _dlsym_js: __dlsym_js,
-    /** @export */ _emscripten_dlopen_js: __emscripten_dlopen_js,
-    /** @export */ _emscripten_dlsync_threads: __emscripten_dlsync_threads,
-    /** @export */ _emscripten_fs_load_embedded_files: __emscripten_fs_load_embedded_files,
-    /** @export */ _emscripten_get_last_devicemotion_event: __emscripten_get_last_devicemotion_event,
-    /** @export */ _emscripten_get_last_deviceorientation_event: __emscripten_get_last_deviceorientation_event,
-    /** @export */ _emscripten_get_last_mouse_event: __emscripten_get_last_mouse_event,
-    /** @export */ _emscripten_get_now_is_monotonic: __emscripten_get_now_is_monotonic,
-    /** @export */ _emscripten_get_progname: __emscripten_get_progname,
     /** @export */ _emscripten_init_main_thread_js: __emscripten_init_main_thread_js,
-    /** @export */ _emscripten_log_formatted: __emscripten_log_formatted,
-    /** @export */ _emscripten_lookup_name: __emscripten_lookup_name,
     /** @export */ _emscripten_notify_mailbox_postmessage: __emscripten_notify_mailbox_postmessage,
-    /** @export */ _emscripten_push_main_loop_blocker: __emscripten_push_main_loop_blocker,
-    /** @export */ _emscripten_push_uncounted_main_loop_blocker: __emscripten_push_uncounted_main_loop_blocker,
     /** @export */ _emscripten_receive_on_main_thread_js: __emscripten_receive_on_main_thread_js,
     /** @export */ _emscripten_runtime_keepalive_clear: __emscripten_runtime_keepalive_clear,
-    /** @export */ _emscripten_system: __emscripten_system,
     /** @export */ _emscripten_thread_cleanup: __emscripten_thread_cleanup,
-    /** @export */ _emscripten_thread_exit_joinable: __emscripten_thread_exit_joinable,
     /** @export */ _emscripten_thread_mailbox_await: __emscripten_thread_mailbox_await,
     /** @export */ _emscripten_thread_set_strongref: __emscripten_thread_set_strongref,
-    /** @export */ _emscripten_throw_longjmp: __emscripten_throw_longjmp,
-    /** @export */ _glGetActiveAttribOrUniform: __glGetActiveAttribOrUniform,
-    /** @export */ _gmtime_js: __gmtime_js,
     /** @export */ _localtime_js: __localtime_js,
     /** @export */ _mktime_js: __mktime_js,
-    /** @export */ _mmap_js: __mmap_js,
-    /** @export */ _msync_js: __msync_js,
-    /** @export */ _munmap_js: __munmap_js,
-    /** @export */ _setitimer_js: __setitimer_js,
-    /** @export */ _timegm_js: __timegm_js,
     /** @export */ _tzset_js: __tzset_js,
-    /** @export */ alBuffer3f: _alBuffer3f,
-    /** @export */ alBuffer3i: _alBuffer3i,
-    /** @export */ alBufferData: _alBufferData,
-    /** @export */ alBufferf: _alBufferf,
-    /** @export */ alBufferfv: _alBufferfv,
-    /** @export */ alBufferi: _alBufferi,
-    /** @export */ alBufferiv: _alBufferiv,
-    /** @export */ alDeleteBuffers: _alDeleteBuffers,
-    /** @export */ alDeleteSources: _alDeleteSources,
-    /** @export */ alDisable: _alDisable,
-    /** @export */ alDistanceModel: _alDistanceModel,
-    /** @export */ alDopplerFactor: _alDopplerFactor,
-    /** @export */ alDopplerVelocity: _alDopplerVelocity,
-    /** @export */ alEnable: _alEnable,
-    /** @export */ alGenBuffers: _alGenBuffers,
-    /** @export */ alGenSources: _alGenSources,
-    /** @export */ alGetBoolean: _alGetBoolean,
-    /** @export */ alGetBooleanv: _alGetBooleanv,
-    /** @export */ alGetBuffer3f: _alGetBuffer3f,
-    /** @export */ alGetBuffer3i: _alGetBuffer3i,
-    /** @export */ alGetBufferf: _alGetBufferf,
-    /** @export */ alGetBufferfv: _alGetBufferfv,
-    /** @export */ alGetBufferi: _alGetBufferi,
-    /** @export */ alGetBufferiv: _alGetBufferiv,
-    /** @export */ alGetDouble: _alGetDouble,
-    /** @export */ alGetDoublev: _alGetDoublev,
-    /** @export */ alGetEnumValue: _alGetEnumValue,
-    /** @export */ alGetError: _alGetError,
-    /** @export */ alGetFloat: _alGetFloat,
-    /** @export */ alGetFloatv: _alGetFloatv,
-    /** @export */ alGetInteger: _alGetInteger,
-    /** @export */ alGetIntegerv: _alGetIntegerv,
-    /** @export */ alGetListener3f: _alGetListener3f,
-    /** @export */ alGetListener3i: _alGetListener3i,
-    /** @export */ alGetListenerf: _alGetListenerf,
-    /** @export */ alGetListenerfv: _alGetListenerfv,
-    /** @export */ alGetListeneri: _alGetListeneri,
-    /** @export */ alGetListeneriv: _alGetListeneriv,
-    /** @export */ alGetSource3f: _alGetSource3f,
-    /** @export */ alGetSource3i: _alGetSource3i,
-    /** @export */ alGetSourcef: _alGetSourcef,
-    /** @export */ alGetSourcefv: _alGetSourcefv,
-    /** @export */ alGetSourcei: _alGetSourcei,
-    /** @export */ alGetSourceiv: _alGetSourceiv,
-    /** @export */ alGetString: _alGetString,
-    /** @export */ alIsBuffer: _alIsBuffer,
-    /** @export */ alIsEnabled: _alIsEnabled,
-    /** @export */ alIsExtensionPresent: _alIsExtensionPresent,
-    /** @export */ alIsSource: _alIsSource,
-    /** @export */ alListener3f: _alListener3f,
-    /** @export */ alListener3i: _alListener3i,
-    /** @export */ alListenerf: _alListenerf,
-    /** @export */ alListenerfv: _alListenerfv,
-    /** @export */ alListeneri: _alListeneri,
-    /** @export */ alListeneriv: _alListeneriv,
-    /** @export */ alSource3f: _alSource3f,
-    /** @export */ alSource3i: _alSource3i,
-    /** @export */ alSourcePause: _alSourcePause,
-    /** @export */ alSourcePausev: _alSourcePausev,
-    /** @export */ alSourcePlay: _alSourcePlay,
-    /** @export */ alSourcePlayv: _alSourcePlayv,
-    /** @export */ alSourceQueueBuffers: _alSourceQueueBuffers,
-    /** @export */ alSourceRewind: _alSourceRewind,
-    /** @export */ alSourceRewindv: _alSourceRewindv,
-    /** @export */ alSourceStop: _alSourceStop,
-    /** @export */ alSourceStopv: _alSourceStopv,
-    /** @export */ alSourceUnqueueBuffers: _alSourceUnqueueBuffers,
-    /** @export */ alSourcef: _alSourcef,
-    /** @export */ alSourcefv: _alSourcefv,
-    /** @export */ alSourcei: _alSourcei,
-    /** @export */ alSourceiv: _alSourceiv,
-    /** @export */ alSpeedOfSound: _alSpeedOfSound,
-    /** @export */ alcCaptureCloseDevice: _alcCaptureCloseDevice,
-    /** @export */ alcCaptureOpenDevice: _alcCaptureOpenDevice,
-    /** @export */ alcCaptureSamples: _alcCaptureSamples,
-    /** @export */ alcCaptureStart: _alcCaptureStart,
-    /** @export */ alcCaptureStop: _alcCaptureStop,
-    /** @export */ alcCloseDevice: _alcCloseDevice,
-    /** @export */ alcCreateContext: _alcCreateContext,
-    /** @export */ alcDestroyContext: _alcDestroyContext,
-    /** @export */ alcGetContextsDevice: _alcGetContextsDevice,
-    /** @export */ alcGetCurrentContext: _alcGetCurrentContext,
-    /** @export */ alcGetEnumValue: _alcGetEnumValue,
-    /** @export */ alcGetError: _alcGetError,
-    /** @export */ alcGetIntegerv: _alcGetIntegerv,
-    /** @export */ alcGetString: _alcGetString,
-    /** @export */ alcIsExtensionPresent: _alcIsExtensionPresent,
-    /** @export */ alcMakeContextCurrent: _alcMakeContextCurrent,
-    /** @export */ alcOpenDevice: _alcOpenDevice,
-    /** @export */ alcProcessContext: _alcProcessContext,
-    /** @export */ alcSuspendContext: _alcSuspendContext,
-    /** @export */ alignfault: _alignfault,
-    /** @export */ clock_res_get: _clock_res_get,
+    /** @export */ alignfault,
     /** @export */ clock_time_get: _clock_time_get,
     /** @export */ eglBindAPI: _eglBindAPI,
     /** @export */ eglChooseConfig: _eglChooseConfig,
@@ -25717,107 +10817,40 @@ function assignWasmImports() {
     /** @export */ eglDestroyContext: _eglDestroyContext,
     /** @export */ eglDestroySurface: _eglDestroySurface,
     /** @export */ eglGetConfigAttrib: _eglGetConfigAttrib,
-    /** @export */ eglGetConfigs: _eglGetConfigs,
-    /** @export */ eglGetCurrentContext: _eglGetCurrentContext,
-    /** @export */ eglGetCurrentDisplay: _eglGetCurrentDisplay,
-    /** @export */ eglGetCurrentSurface: _eglGetCurrentSurface,
     /** @export */ eglGetDisplay: _eglGetDisplay,
     /** @export */ eglGetError: _eglGetError,
     /** @export */ eglInitialize: _eglInitialize,
     /** @export */ eglMakeCurrent: _eglMakeCurrent,
-    /** @export */ eglQueryAPI: _eglQueryAPI,
-    /** @export */ eglQueryContext: _eglQueryContext,
     /** @export */ eglQueryString: _eglQueryString,
-    /** @export */ eglQuerySurface: _eglQuerySurface,
-    /** @export */ eglReleaseThread: _eglReleaseThread,
     /** @export */ eglSwapBuffers: _eglSwapBuffers,
     /** @export */ eglSwapInterval: _eglSwapInterval,
     /** @export */ eglTerminate: _eglTerminate,
-    /** @export */ eglWaitClient: _eglWaitClient,
     /** @export */ eglWaitGL: _eglWaitGL,
     /** @export */ eglWaitNative: _eglWaitNative,
-    /** @export */ emscripten_alcDevicePauseSOFT: _emscripten_alcDevicePauseSOFT,
-    /** @export */ emscripten_alcDeviceResumeSOFT: _emscripten_alcDeviceResumeSOFT,
-    /** @export */ emscripten_alcGetStringiSOFT: _emscripten_alcGetStringiSOFT,
-    /** @export */ emscripten_alcResetDeviceSOFT: _emscripten_alcResetDeviceSOFT,
-    /** @export */ emscripten_asm_const_async_on_main_thread: _emscripten_asm_const_async_on_main_thread,
-    /** @export */ emscripten_asm_const_double: _emscripten_asm_const_double,
-    /** @export */ emscripten_asm_const_double_sync_on_main_thread: _emscripten_asm_const_double_sync_on_main_thread,
     /** @export */ emscripten_asm_const_int: _emscripten_asm_const_int,
     /** @export */ emscripten_asm_const_int_sync_on_main_thread: _emscripten_asm_const_int_sync_on_main_thread,
-    /** @export */ emscripten_asm_const_ptr: _emscripten_asm_const_ptr,
     /** @export */ emscripten_asm_const_ptr_sync_on_main_thread: _emscripten_asm_const_ptr_sync_on_main_thread,
-    /** @export */ emscripten_async_call: _emscripten_async_call,
-    /** @export */ emscripten_async_load_script: _emscripten_async_load_script,
-    /** @export */ emscripten_async_run_script: _emscripten_async_run_script,
-    /** @export */ emscripten_async_wget: _emscripten_async_wget,
-    /** @export */ emscripten_async_wget2: _emscripten_async_wget2,
-    /** @export */ emscripten_async_wget2_abort: _emscripten_async_wget2_abort,
-    /** @export */ emscripten_async_wget2_data: _emscripten_async_wget2_data,
-    /** @export */ emscripten_async_wget_data: _emscripten_async_wget_data,
-    /** @export */ emscripten_atomic_cancel_all_wait_asyncs: _emscripten_atomic_cancel_all_wait_asyncs,
-    /** @export */ emscripten_atomic_cancel_all_wait_asyncs_at_address: _emscripten_atomic_cancel_all_wait_asyncs_at_address,
-    /** @export */ emscripten_atomic_cancel_wait_async: _emscripten_atomic_cancel_wait_async,
-    /** @export */ emscripten_atomic_wait_async: _emscripten_atomic_wait_async,
-    /** @export */ emscripten_call_worker: _emscripten_call_worker,
-    /** @export */ emscripten_cancel_animation_frame: _emscripten_cancel_animation_frame,
     /** @export */ emscripten_cancel_main_loop: _emscripten_cancel_main_loop,
     /** @export */ emscripten_check_blocking_allowed: _emscripten_check_blocking_allowed,
-    /** @export */ emscripten_clear_immediate: _emscripten_clear_immediate,
-    /** @export */ emscripten_clear_interval: _emscripten_clear_interval,
-    /** @export */ emscripten_clear_timeout: _emscripten_clear_timeout,
-    /** @export */ emscripten_console_error: _emscripten_console_error,
-    /** @export */ emscripten_console_log: _emscripten_console_log,
-    /** @export */ emscripten_console_trace: _emscripten_console_trace,
-    /** @export */ emscripten_console_warn: _emscripten_console_warn,
-    /** @export */ emscripten_create_worker: _emscripten_create_worker,
     /** @export */ emscripten_date_now: _emscripten_date_now,
-    /** @export */ emscripten_dbg: _emscripten_dbg,
-    /** @export */ emscripten_dbg_backtrace: _emscripten_dbg_backtrace,
-    /** @export */ emscripten_dbgn: _emscripten_dbgn,
-    /** @export */ emscripten_debugger: _emscripten_debugger,
-    /** @export */ emscripten_destroy_worker: _emscripten_destroy_worker,
-    /** @export */ emscripten_enter_soft_fullscreen: _emscripten_enter_soft_fullscreen,
-    /** @export */ emscripten_err: _emscripten_err,
-    /** @export */ emscripten_errn: _emscripten_errn,
     /** @export */ emscripten_exit_fullscreen: _emscripten_exit_fullscreen,
     /** @export */ emscripten_exit_pointerlock: _emscripten_exit_pointerlock,
-    /** @export */ emscripten_exit_soft_fullscreen: _emscripten_exit_soft_fullscreen,
     /** @export */ emscripten_exit_with_live_runtime: _emscripten_exit_with_live_runtime,
-    /** @export */ emscripten_fiber_swap: _emscripten_fiber_swap,
     /** @export */ emscripten_force_exit: _emscripten_force_exit,
-    /** @export */ emscripten_get_battery_status: _emscripten_get_battery_status,
-    /** @export */ emscripten_get_callstack: _emscripten_get_callstack,
-    /** @export */ emscripten_get_canvas_element_size: _emscripten_get_canvas_element_size,
-    /** @export */ emscripten_get_canvas_size: _emscripten_get_canvas_size,
-    /** @export */ emscripten_get_compiler_setting: _emscripten_get_compiler_setting,
     /** @export */ emscripten_get_device_pixel_ratio: _emscripten_get_device_pixel_ratio,
     /** @export */ emscripten_get_element_css_size: _emscripten_get_element_css_size,
-    /** @export */ emscripten_get_fullscreen_status: _emscripten_get_fullscreen_status,
     /** @export */ emscripten_get_gamepad_status: _emscripten_get_gamepad_status,
-    /** @export */ emscripten_get_heap_max: _emscripten_get_heap_max,
-    /** @export */ emscripten_get_main_loop_timing: _emscripten_get_main_loop_timing,
     /** @export */ emscripten_get_now: _emscripten_get_now,
-    /** @export */ emscripten_get_now_res: _emscripten_get_now_res,
     /** @export */ emscripten_get_num_gamepads: _emscripten_get_num_gamepads,
-    /** @export */ emscripten_get_orientation_status: _emscripten_get_orientation_status,
-    /** @export */ emscripten_get_pointerlock_status: _emscripten_get_pointerlock_status,
-    /** @export */ emscripten_get_preloaded_image_data: _emscripten_get_preloaded_image_data,
-    /** @export */ emscripten_get_preloaded_image_data_from_FILE: _emscripten_get_preloaded_image_data_from_FILE,
     /** @export */ emscripten_get_screen_size: _emscripten_get_screen_size,
-    /** @export */ emscripten_get_visibility_status: _emscripten_get_visibility_status,
-    /** @export */ emscripten_get_window_title: _emscripten_get_window_title,
-    /** @export */ emscripten_get_worker_queue_size: _emscripten_get_worker_queue_size,
     /** @export */ emscripten_glActiveTexture: _emscripten_glActiveTexture,
     /** @export */ emscripten_glAttachShader: _emscripten_glAttachShader,
-    /** @export */ emscripten_glBegin: _emscripten_glBegin,
     /** @export */ emscripten_glBeginQueryEXT: _emscripten_glBeginQueryEXT,
     /** @export */ emscripten_glBindAttribLocation: _emscripten_glBindAttribLocation,
     /** @export */ emscripten_glBindBuffer: _emscripten_glBindBuffer,
     /** @export */ emscripten_glBindFramebuffer: _emscripten_glBindFramebuffer,
     /** @export */ emscripten_glBindRenderbuffer: _emscripten_glBindRenderbuffer,
     /** @export */ emscripten_glBindTexture: _emscripten_glBindTexture,
-    /** @export */ emscripten_glBindVertexArray: _emscripten_glBindVertexArray,
     /** @export */ emscripten_glBindVertexArrayOES: _emscripten_glBindVertexArrayOES,
     /** @export */ emscripten_glBlendColor: _emscripten_glBlendColor,
     /** @export */ emscripten_glBlendEquation: _emscripten_glBlendEquation,
@@ -25829,7 +10862,6 @@ function assignWasmImports() {
     /** @export */ emscripten_glCheckFramebufferStatus: _emscripten_glCheckFramebufferStatus,
     /** @export */ emscripten_glClear: _emscripten_glClear,
     /** @export */ emscripten_glClearColor: _emscripten_glClearColor,
-    /** @export */ emscripten_glClearDepth: _emscripten_glClearDepth,
     /** @export */ emscripten_glClearDepthf: _emscripten_glClearDepthf,
     /** @export */ emscripten_glClearStencil: _emscripten_glClearStencil,
     /** @export */ emscripten_glClipControlEXT: _emscripten_glClipControlEXT,
@@ -25849,30 +10881,18 @@ function assignWasmImports() {
     /** @export */ emscripten_glDeleteRenderbuffers: _emscripten_glDeleteRenderbuffers,
     /** @export */ emscripten_glDeleteShader: _emscripten_glDeleteShader,
     /** @export */ emscripten_glDeleteTextures: _emscripten_glDeleteTextures,
-    /** @export */ emscripten_glDeleteVertexArrays: _emscripten_glDeleteVertexArrays,
     /** @export */ emscripten_glDeleteVertexArraysOES: _emscripten_glDeleteVertexArraysOES,
     /** @export */ emscripten_glDepthFunc: _emscripten_glDepthFunc,
     /** @export */ emscripten_glDepthMask: _emscripten_glDepthMask,
-    /** @export */ emscripten_glDepthRange: _emscripten_glDepthRange,
     /** @export */ emscripten_glDepthRangef: _emscripten_glDepthRangef,
     /** @export */ emscripten_glDetachShader: _emscripten_glDetachShader,
     /** @export */ emscripten_glDisable: _emscripten_glDisable,
     /** @export */ emscripten_glDisableVertexAttribArray: _emscripten_glDisableVertexAttribArray,
     /** @export */ emscripten_glDrawArrays: _emscripten_glDrawArrays,
-    /** @export */ emscripten_glDrawArraysInstanced: _emscripten_glDrawArraysInstanced,
     /** @export */ emscripten_glDrawArraysInstancedANGLE: _emscripten_glDrawArraysInstancedANGLE,
-    /** @export */ emscripten_glDrawArraysInstancedARB: _emscripten_glDrawArraysInstancedARB,
-    /** @export */ emscripten_glDrawArraysInstancedEXT: _emscripten_glDrawArraysInstancedEXT,
-    /** @export */ emscripten_glDrawArraysInstancedNV: _emscripten_glDrawArraysInstancedNV,
-    /** @export */ emscripten_glDrawBuffers: _emscripten_glDrawBuffers,
-    /** @export */ emscripten_glDrawBuffersEXT: _emscripten_glDrawBuffersEXT,
     /** @export */ emscripten_glDrawBuffersWEBGL: _emscripten_glDrawBuffersWEBGL,
     /** @export */ emscripten_glDrawElements: _emscripten_glDrawElements,
-    /** @export */ emscripten_glDrawElementsInstanced: _emscripten_glDrawElementsInstanced,
     /** @export */ emscripten_glDrawElementsInstancedANGLE: _emscripten_glDrawElementsInstancedANGLE,
-    /** @export */ emscripten_glDrawElementsInstancedARB: _emscripten_glDrawElementsInstancedARB,
-    /** @export */ emscripten_glDrawElementsInstancedEXT: _emscripten_glDrawElementsInstancedEXT,
-    /** @export */ emscripten_glDrawElementsInstancedNV: _emscripten_glDrawElementsInstancedNV,
     /** @export */ emscripten_glEnable: _emscripten_glEnable,
     /** @export */ emscripten_glEnableVertexAttribArray: _emscripten_glEnableVertexAttribArray,
     /** @export */ emscripten_glEndQueryEXT: _emscripten_glEndQueryEXT,
@@ -25886,7 +10906,6 @@ function assignWasmImports() {
     /** @export */ emscripten_glGenQueriesEXT: _emscripten_glGenQueriesEXT,
     /** @export */ emscripten_glGenRenderbuffers: _emscripten_glGenRenderbuffers,
     /** @export */ emscripten_glGenTextures: _emscripten_glGenTextures,
-    /** @export */ emscripten_glGenVertexArrays: _emscripten_glGenVertexArrays,
     /** @export */ emscripten_glGenVertexArraysOES: _emscripten_glGenVertexArraysOES,
     /** @export */ emscripten_glGenerateMipmap: _emscripten_glGenerateMipmap,
     /** @export */ emscripten_glGetActiveAttrib: _emscripten_glGetActiveAttrib,
@@ -25929,22 +10948,9 @@ function assignWasmImports() {
     /** @export */ emscripten_glIsRenderbuffer: _emscripten_glIsRenderbuffer,
     /** @export */ emscripten_glIsShader: _emscripten_glIsShader,
     /** @export */ emscripten_glIsTexture: _emscripten_glIsTexture,
-    /** @export */ emscripten_glIsVertexArray: _emscripten_glIsVertexArray,
     /** @export */ emscripten_glIsVertexArrayOES: _emscripten_glIsVertexArrayOES,
     /** @export */ emscripten_glLineWidth: _emscripten_glLineWidth,
     /** @export */ emscripten_glLinkProgram: _emscripten_glLinkProgram,
-    /** @export */ emscripten_glLoadIdentity: _emscripten_glLoadIdentity,
-    /** @export */ emscripten_glMatrixMode: _emscripten_glMatrixMode,
-    /** @export */ emscripten_glMultiDrawArrays: _emscripten_glMultiDrawArrays,
-    /** @export */ emscripten_glMultiDrawArraysANGLE: _emscripten_glMultiDrawArraysANGLE,
-    /** @export */ emscripten_glMultiDrawArraysInstancedANGLE: _emscripten_glMultiDrawArraysInstancedANGLE,
-    /** @export */ emscripten_glMultiDrawArraysInstancedWEBGL: _emscripten_glMultiDrawArraysInstancedWEBGL,
-    /** @export */ emscripten_glMultiDrawArraysWEBGL: _emscripten_glMultiDrawArraysWEBGL,
-    /** @export */ emscripten_glMultiDrawElements: _emscripten_glMultiDrawElements,
-    /** @export */ emscripten_glMultiDrawElementsANGLE: _emscripten_glMultiDrawElementsANGLE,
-    /** @export */ emscripten_glMultiDrawElementsInstancedANGLE: _emscripten_glMultiDrawElementsInstancedANGLE,
-    /** @export */ emscripten_glMultiDrawElementsInstancedWEBGL: _emscripten_glMultiDrawElementsInstancedWEBGL,
-    /** @export */ emscripten_glMultiDrawElementsWEBGL: _emscripten_glMultiDrawElementsWEBGL,
     /** @export */ emscripten_glPixelStorei: _emscripten_glPixelStorei,
     /** @export */ emscripten_glPolygonModeWEBGL: _emscripten_glPolygonModeWEBGL,
     /** @export */ emscripten_glPolygonOffset: _emscripten_glPolygonOffset,
@@ -25998,469 +11004,83 @@ function assignWasmImports() {
     /** @export */ emscripten_glVertexAttrib3fv: _emscripten_glVertexAttrib3fv,
     /** @export */ emscripten_glVertexAttrib4f: _emscripten_glVertexAttrib4f,
     /** @export */ emscripten_glVertexAttrib4fv: _emscripten_glVertexAttrib4fv,
-    /** @export */ emscripten_glVertexAttribDivisor: _emscripten_glVertexAttribDivisor,
     /** @export */ emscripten_glVertexAttribDivisorANGLE: _emscripten_glVertexAttribDivisorANGLE,
-    /** @export */ emscripten_glVertexAttribDivisorARB: _emscripten_glVertexAttribDivisorARB,
-    /** @export */ emscripten_glVertexAttribDivisorEXT: _emscripten_glVertexAttribDivisorEXT,
-    /** @export */ emscripten_glVertexAttribDivisorNV: _emscripten_glVertexAttribDivisorNV,
     /** @export */ emscripten_glVertexAttribPointer: _emscripten_glVertexAttribPointer,
-    /** @export */ emscripten_glVertexPointer: _emscripten_glVertexPointer,
     /** @export */ emscripten_glViewport: _emscripten_glViewport,
     /** @export */ emscripten_has_asyncify: _emscripten_has_asyncify,
-    /** @export */ emscripten_has_threading_support: _emscripten_has_threading_support,
-    /** @export */ emscripten_hide_mouse: _emscripten_hide_mouse,
-    /** @export */ emscripten_html5_remove_all_event_listeners: _emscripten_html5_remove_all_event_listeners,
-    /** @export */ emscripten_html5_remove_event_listener: _emscripten_html5_remove_event_listener,
-    /** @export */ emscripten_idb_async_clear: _emscripten_idb_async_clear,
-    /** @export */ emscripten_idb_async_delete: _emscripten_idb_async_delete,
-    /** @export */ emscripten_idb_async_exists: _emscripten_idb_async_exists,
-    /** @export */ emscripten_idb_async_load: _emscripten_idb_async_load,
-    /** @export */ emscripten_idb_async_store: _emscripten_idb_async_store,
-    /** @export */ emscripten_idb_clear: _emscripten_idb_clear,
-    /** @export */ emscripten_idb_delete: _emscripten_idb_delete,
-    /** @export */ emscripten_idb_exists: _emscripten_idb_exists,
-    /** @export */ emscripten_idb_load: _emscripten_idb_load,
-    /** @export */ emscripten_idb_store: _emscripten_idb_store,
-    /** @export */ emscripten_is_webgl_context_lost: _emscripten_is_webgl_context_lost,
-    /** @export */ emscripten_lock_orientation: _emscripten_lock_orientation,
-    /** @export */ emscripten_math_acos: _emscripten_math_acos,
-    /** @export */ emscripten_math_acosh: _emscripten_math_acosh,
-    /** @export */ emscripten_math_asin: _emscripten_math_asin,
-    /** @export */ emscripten_math_asinh: _emscripten_math_asinh,
-    /** @export */ emscripten_math_atan: _emscripten_math_atan,
-    /** @export */ emscripten_math_atan2: _emscripten_math_atan2,
-    /** @export */ emscripten_math_atanh: _emscripten_math_atanh,
-    /** @export */ emscripten_math_cbrt: _emscripten_math_cbrt,
-    /** @export */ emscripten_math_cos: _emscripten_math_cos,
-    /** @export */ emscripten_math_cosh: _emscripten_math_cosh,
-    /** @export */ emscripten_math_exp: _emscripten_math_exp,
-    /** @export */ emscripten_math_expm1: _emscripten_math_expm1,
-    /** @export */ emscripten_math_fmod: _emscripten_math_fmod,
-    /** @export */ emscripten_math_hypot: _emscripten_math_hypot,
-    /** @export */ emscripten_math_log: _emscripten_math_log,
-    /** @export */ emscripten_math_log10: _emscripten_math_log10,
-    /** @export */ emscripten_math_log1p: _emscripten_math_log1p,
-    /** @export */ emscripten_math_log2: _emscripten_math_log2,
-    /** @export */ emscripten_math_pow: _emscripten_math_pow,
-    /** @export */ emscripten_math_random: _emscripten_math_random,
-    /** @export */ emscripten_math_round: _emscripten_math_round,
-    /** @export */ emscripten_math_sign: _emscripten_math_sign,
-    /** @export */ emscripten_math_sin: _emscripten_math_sin,
-    /** @export */ emscripten_math_sinh: _emscripten_math_sinh,
-    /** @export */ emscripten_math_sqrt: _emscripten_math_sqrt,
-    /** @export */ emscripten_math_tan: _emscripten_math_tan,
-    /** @export */ emscripten_math_tanh: _emscripten_math_tanh,
-    /** @export */ emscripten_notify_memory_growth: _emscripten_notify_memory_growth,
-    /** @export */ emscripten_num_logical_cores: _emscripten_num_logical_cores,
-    /** @export */ emscripten_out: _emscripten_out,
-    /** @export */ emscripten_outn: _emscripten_outn,
-    /** @export */ emscripten_pause_main_loop: _emscripten_pause_main_loop,
-    /** @export */ emscripten_pc_get_column: _emscripten_pc_get_column,
-    /** @export */ emscripten_pc_get_file: _emscripten_pc_get_file,
-    /** @export */ emscripten_pc_get_function: _emscripten_pc_get_function,
-    /** @export */ emscripten_pc_get_line: _emscripten_pc_get_line,
-    /** @export */ emscripten_performance_now: _emscripten_performance_now,
-    /** @export */ emscripten_print_double: _emscripten_print_double,
-    /** @export */ emscripten_promise_all: _emscripten_promise_all,
-    /** @export */ emscripten_promise_all_settled: _emscripten_promise_all_settled,
-    /** @export */ emscripten_promise_any: _emscripten_promise_any,
-    /** @export */ emscripten_promise_await: _emscripten_promise_await,
-    /** @export */ emscripten_promise_create: _emscripten_promise_create,
-    /** @export */ emscripten_promise_destroy: _emscripten_promise_destroy,
-    /** @export */ emscripten_promise_race: _emscripten_promise_race,
-    /** @export */ emscripten_promise_resolve: _emscripten_promise_resolve,
-    /** @export */ emscripten_promise_then: _emscripten_promise_then,
-    /** @export */ emscripten_random: _emscripten_random,
-    /** @export */ emscripten_request_animation_frame: _emscripten_request_animation_frame,
-    /** @export */ emscripten_request_animation_frame_loop: _emscripten_request_animation_frame_loop,
-    /** @export */ emscripten_request_fullscreen: _emscripten_request_fullscreen,
     /** @export */ emscripten_request_fullscreen_strategy: _emscripten_request_fullscreen_strategy,
     /** @export */ emscripten_request_pointerlock: _emscripten_request_pointerlock,
     /** @export */ emscripten_resize_heap: _emscripten_resize_heap,
-    /** @export */ emscripten_resume_main_loop: _emscripten_resume_main_loop,
-    /** @export */ emscripten_return_address: _emscripten_return_address,
-    /** @export */ emscripten_run_preload_plugins: _emscripten_run_preload_plugins,
-    /** @export */ emscripten_run_preload_plugins_data: _emscripten_run_preload_plugins_data,
-    /** @export */ emscripten_run_script: _emscripten_run_script,
-    /** @export */ emscripten_run_script_int: _emscripten_run_script_int,
-    /** @export */ emscripten_run_script_string: _emscripten_run_script_string,
-    /** @export */ emscripten_runtime_keepalive_check: _emscripten_runtime_keepalive_check,
-    /** @export */ emscripten_runtime_keepalive_pop: _emscripten_runtime_keepalive_pop,
-    /** @export */ emscripten_runtime_keepalive_push: _emscripten_runtime_keepalive_push,
     /** @export */ emscripten_sample_gamepad_data: _emscripten_sample_gamepad_data,
-    /** @export */ emscripten_scan_registers: _emscripten_scan_registers,
-    /** @export */ emscripten_set_batterychargingchange_callback_on_thread: _emscripten_set_batterychargingchange_callback_on_thread,
-    /** @export */ emscripten_set_batterylevelchange_callback_on_thread: _emscripten_set_batterylevelchange_callback_on_thread,
     /** @export */ emscripten_set_beforeunload_callback_on_thread: _emscripten_set_beforeunload_callback_on_thread,
     /** @export */ emscripten_set_blur_callback_on_thread: _emscripten_set_blur_callback_on_thread,
     /** @export */ emscripten_set_canvas_element_size: _emscripten_set_canvas_element_size,
-    /** @export */ emscripten_set_canvas_size: _emscripten_set_canvas_size,
-    /** @export */ emscripten_set_click_callback_on_thread: _emscripten_set_click_callback_on_thread,
-    /** @export */ emscripten_set_dblclick_callback_on_thread: _emscripten_set_dblclick_callback_on_thread,
-    /** @export */ emscripten_set_devicemotion_callback_on_thread: _emscripten_set_devicemotion_callback_on_thread,
-    /** @export */ emscripten_set_deviceorientation_callback_on_thread: _emscripten_set_deviceorientation_callback_on_thread,
     /** @export */ emscripten_set_element_css_size: _emscripten_set_element_css_size,
     /** @export */ emscripten_set_focus_callback_on_thread: _emscripten_set_focus_callback_on_thread,
-    /** @export */ emscripten_set_focusin_callback_on_thread: _emscripten_set_focusin_callback_on_thread,
-    /** @export */ emscripten_set_focusout_callback_on_thread: _emscripten_set_focusout_callback_on_thread,
     /** @export */ emscripten_set_fullscreenchange_callback_on_thread: _emscripten_set_fullscreenchange_callback_on_thread,
     /** @export */ emscripten_set_gamepadconnected_callback_on_thread: _emscripten_set_gamepadconnected_callback_on_thread,
     /** @export */ emscripten_set_gamepaddisconnected_callback_on_thread: _emscripten_set_gamepaddisconnected_callback_on_thread,
-    /** @export */ emscripten_set_immediate: _emscripten_set_immediate,
-    /** @export */ emscripten_set_immediate_loop: _emscripten_set_immediate_loop,
-    /** @export */ emscripten_set_interval: _emscripten_set_interval,
     /** @export */ emscripten_set_keydown_callback_on_thread: _emscripten_set_keydown_callback_on_thread,
     /** @export */ emscripten_set_keypress_callback_on_thread: _emscripten_set_keypress_callback_on_thread,
     /** @export */ emscripten_set_keyup_callback_on_thread: _emscripten_set_keyup_callback_on_thread,
     /** @export */ emscripten_set_main_loop: _emscripten_set_main_loop,
-    /** @export */ emscripten_set_main_loop_arg: _emscripten_set_main_loop_arg,
-    /** @export */ emscripten_set_main_loop_expected_blockers: _emscripten_set_main_loop_expected_blockers,
-    /** @export */ emscripten_set_main_loop_timing: _emscripten_set_main_loop_timing,
     /** @export */ emscripten_set_mousedown_callback_on_thread: _emscripten_set_mousedown_callback_on_thread,
     /** @export */ emscripten_set_mouseenter_callback_on_thread: _emscripten_set_mouseenter_callback_on_thread,
     /** @export */ emscripten_set_mouseleave_callback_on_thread: _emscripten_set_mouseleave_callback_on_thread,
     /** @export */ emscripten_set_mousemove_callback_on_thread: _emscripten_set_mousemove_callback_on_thread,
-    /** @export */ emscripten_set_mouseout_callback_on_thread: _emscripten_set_mouseout_callback_on_thread,
-    /** @export */ emscripten_set_mouseover_callback_on_thread: _emscripten_set_mouseover_callback_on_thread,
     /** @export */ emscripten_set_mouseup_callback_on_thread: _emscripten_set_mouseup_callback_on_thread,
-    /** @export */ emscripten_set_orientationchange_callback_on_thread: _emscripten_set_orientationchange_callback_on_thread,
     /** @export */ emscripten_set_pointerlockchange_callback_on_thread: _emscripten_set_pointerlockchange_callback_on_thread,
-    /** @export */ emscripten_set_pointerlockerror_callback_on_thread: _emscripten_set_pointerlockerror_callback_on_thread,
     /** @export */ emscripten_set_resize_callback_on_thread: _emscripten_set_resize_callback_on_thread,
-    /** @export */ emscripten_set_scroll_callback_on_thread: _emscripten_set_scroll_callback_on_thread,
-    /** @export */ emscripten_set_socket_close_callback: _emscripten_set_socket_close_callback,
-    /** @export */ emscripten_set_socket_connection_callback: _emscripten_set_socket_connection_callback,
-    /** @export */ emscripten_set_socket_error_callback: _emscripten_set_socket_error_callback,
-    /** @export */ emscripten_set_socket_listen_callback: _emscripten_set_socket_listen_callback,
-    /** @export */ emscripten_set_socket_message_callback: _emscripten_set_socket_message_callback,
-    /** @export */ emscripten_set_socket_open_callback: _emscripten_set_socket_open_callback,
-    /** @export */ emscripten_set_timeout: _emscripten_set_timeout,
-    /** @export */ emscripten_set_timeout_loop: _emscripten_set_timeout_loop,
     /** @export */ emscripten_set_touchcancel_callback_on_thread: _emscripten_set_touchcancel_callback_on_thread,
     /** @export */ emscripten_set_touchend_callback_on_thread: _emscripten_set_touchend_callback_on_thread,
     /** @export */ emscripten_set_touchmove_callback_on_thread: _emscripten_set_touchmove_callback_on_thread,
     /** @export */ emscripten_set_touchstart_callback_on_thread: _emscripten_set_touchstart_callback_on_thread,
     /** @export */ emscripten_set_visibilitychange_callback_on_thread: _emscripten_set_visibilitychange_callback_on_thread,
-    /** @export */ emscripten_set_webglcontextlost_callback_on_thread: _emscripten_set_webglcontextlost_callback_on_thread,
-    /** @export */ emscripten_set_webglcontextrestored_callback_on_thread: _emscripten_set_webglcontextrestored_callback_on_thread,
     /** @export */ emscripten_set_wheel_callback_on_thread: _emscripten_set_wheel_callback_on_thread,
     /** @export */ emscripten_set_window_title: _emscripten_set_window_title,
     /** @export */ emscripten_sleep: _emscripten_sleep,
-    /** @export */ emscripten_stack_snapshot: _emscripten_stack_snapshot,
-    /** @export */ emscripten_stack_unwind_buffer: _emscripten_stack_unwind_buffer,
-    /** @export */ emscripten_supports_offscreencanvas: _emscripten_supports_offscreencanvas,
-    /** @export */ emscripten_throw_number: _emscripten_throw_number,
-    /** @export */ emscripten_throw_string: _emscripten_throw_string,
-    /** @export */ emscripten_unlock_orientation: _emscripten_unlock_orientation,
-    /** @export */ emscripten_unwind_to_js_event_loop: _emscripten_unwind_to_js_event_loop,
-    /** @export */ emscripten_vibrate: _emscripten_vibrate,
-    /** @export */ emscripten_vibrate_pattern: _emscripten_vibrate_pattern,
-    /** @export */ emscripten_webgl_commit_frame: _emscripten_webgl_commit_frame,
-    /** @export */ emscripten_webgl_create_context: _emscripten_webgl_create_context,
-    /** @export */ emscripten_webgl_destroy_context: _emscripten_webgl_destroy_context,
-    /** @export */ emscripten_webgl_do_commit_frame: _emscripten_webgl_do_commit_frame,
-    /** @export */ emscripten_webgl_do_create_context: _emscripten_webgl_do_create_context,
-    /** @export */ emscripten_webgl_do_get_current_context: _emscripten_webgl_do_get_current_context,
-    /** @export */ emscripten_webgl_enable_ANGLE_instanced_arrays: _emscripten_webgl_enable_ANGLE_instanced_arrays,
-    /** @export */ emscripten_webgl_enable_EXT_clip_control: _emscripten_webgl_enable_EXT_clip_control,
-    /** @export */ emscripten_webgl_enable_EXT_polygon_offset_clamp: _emscripten_webgl_enable_EXT_polygon_offset_clamp,
-    /** @export */ emscripten_webgl_enable_OES_vertex_array_object: _emscripten_webgl_enable_OES_vertex_array_object,
-    /** @export */ emscripten_webgl_enable_WEBGL_draw_buffers: _emscripten_webgl_enable_WEBGL_draw_buffers,
-    /** @export */ emscripten_webgl_enable_WEBGL_multi_draw: _emscripten_webgl_enable_WEBGL_multi_draw,
-    /** @export */ emscripten_webgl_enable_WEBGL_polygon_mode: _emscripten_webgl_enable_WEBGL_polygon_mode,
-    /** @export */ emscripten_webgl_enable_extension: _emscripten_webgl_enable_extension,
-    /** @export */ emscripten_webgl_get_context_attributes: _emscripten_webgl_get_context_attributes,
-    /** @export */ emscripten_webgl_get_current_context: _emscripten_webgl_get_current_context,
-    /** @export */ emscripten_webgl_get_drawing_buffer_size: _emscripten_webgl_get_drawing_buffer_size,
-    /** @export */ emscripten_webgl_get_parameter_d: _emscripten_webgl_get_parameter_d,
-    /** @export */ emscripten_webgl_get_parameter_i64v: _emscripten_webgl_get_parameter_i64v,
-    /** @export */ emscripten_webgl_get_parameter_o: _emscripten_webgl_get_parameter_o,
-    /** @export */ emscripten_webgl_get_parameter_utf8: _emscripten_webgl_get_parameter_utf8,
-    /** @export */ emscripten_webgl_get_parameter_v: _emscripten_webgl_get_parameter_v,
-    /** @export */ emscripten_webgl_get_program_info_log_utf8: _emscripten_webgl_get_program_info_log_utf8,
-    /** @export */ emscripten_webgl_get_program_parameter_d: _emscripten_webgl_get_program_parameter_d,
-    /** @export */ emscripten_webgl_get_shader_info_log_utf8: _emscripten_webgl_get_shader_info_log_utf8,
-    /** @export */ emscripten_webgl_get_shader_parameter_d: _emscripten_webgl_get_shader_parameter_d,
-    /** @export */ emscripten_webgl_get_shader_source_utf8: _emscripten_webgl_get_shader_source_utf8,
-    /** @export */ emscripten_webgl_get_supported_extensions: _emscripten_webgl_get_supported_extensions,
-    /** @export */ emscripten_webgl_get_uniform_d: _emscripten_webgl_get_uniform_d,
-    /** @export */ emscripten_webgl_get_uniform_v: _emscripten_webgl_get_uniform_v,
-    /** @export */ emscripten_webgl_get_vertex_attrib_d: _emscripten_webgl_get_vertex_attrib_d,
-    /** @export */ emscripten_webgl_get_vertex_attrib_o: _emscripten_webgl_get_vertex_attrib_o,
-    /** @export */ emscripten_webgl_get_vertex_attrib_v: _emscripten_webgl_get_vertex_attrib_v,
-    /** @export */ emscripten_webgl_make_context_current: _emscripten_webgl_make_context_current,
-    /** @export */ emscripten_wget: _emscripten_wget,
-    /** @export */ emscripten_wget_data: _emscripten_wget_data,
-    /** @export */ endprotoent: _endprotoent,
     /** @export */ environ_get: _environ_get,
     /** @export */ environ_sizes_get: _environ_sizes_get,
     /** @export */ exit: _exit,
     /** @export */ fd_close: _fd_close,
-    /** @export */ fd_fdstat_get: _fd_fdstat_get,
-    /** @export */ fd_pread: _fd_pread,
-    /** @export */ fd_pwrite: _fd_pwrite,
     /** @export */ fd_read: _fd_read,
     /** @export */ fd_seek: _fd_seek,
-    /** @export */ fd_sync: _fd_sync,
     /** @export */ fd_write: _fd_write,
-    /** @export */ getaddrinfo: _getaddrinfo,
-    /** @export */ getnameinfo: _getnameinfo,
-    /** @export */ getprotobyname: _getprotobyname,
-    /** @export */ getprotobynumber: _getprotobynumber,
-    /** @export */ getprotoent: _getprotoent,
     /** @export */ glActiveTexture: _glActiveTexture,
     /** @export */ glAttachShader: _glAttachShader,
-    /** @export */ glBegin: _glBegin,
-    /** @export */ glBeginQueryEXT: _glBeginQueryEXT,
     /** @export */ glBindAttribLocation: _glBindAttribLocation,
     /** @export */ glBindBuffer: _glBindBuffer,
-    /** @export */ glBindFramebuffer: _glBindFramebuffer,
-    /** @export */ glBindRenderbuffer: _glBindRenderbuffer,
     /** @export */ glBindTexture: _glBindTexture,
-    /** @export */ glBindVertexArray: _glBindVertexArray,
-    /** @export */ glBindVertexArrayOES: _glBindVertexArrayOES,
-    /** @export */ glBlendColor: _glBlendColor,
-    /** @export */ glBlendEquation: _glBlendEquation,
-    /** @export */ glBlendEquationSeparate: _glBlendEquationSeparate,
-    /** @export */ glBlendFunc: _glBlendFunc,
-    /** @export */ glBlendFuncSeparate: _glBlendFuncSeparate,
     /** @export */ glBufferData: _glBufferData,
     /** @export */ glBufferSubData: _glBufferSubData,
-    /** @export */ glCheckFramebufferStatus: _glCheckFramebufferStatus,
     /** @export */ glClear: _glClear,
-    /** @export */ glClearColor: _glClearColor,
-    /** @export */ glClearDepth: _glClearDepth,
-    /** @export */ glClearDepthf: _glClearDepthf,
-    /** @export */ glClearStencil: _glClearStencil,
-    /** @export */ glClipControlEXT: _glClipControlEXT,
-    /** @export */ glColorMask: _glColorMask,
     /** @export */ glCompileShader: _glCompileShader,
-    /** @export */ glCompressedTexImage2D: _glCompressedTexImage2D,
-    /** @export */ glCompressedTexSubImage2D: _glCompressedTexSubImage2D,
-    /** @export */ glCopyTexImage2D: _glCopyTexImage2D,
-    /** @export */ glCopyTexSubImage2D: _glCopyTexSubImage2D,
     /** @export */ glCreateProgram: _glCreateProgram,
     /** @export */ glCreateShader: _glCreateShader,
-    /** @export */ glCullFace: _glCullFace,
-    /** @export */ glDeleteBuffers: _glDeleteBuffers,
-    /** @export */ glDeleteFramebuffers: _glDeleteFramebuffers,
-    /** @export */ glDeleteProgram: _glDeleteProgram,
-    /** @export */ glDeleteQueriesEXT: _glDeleteQueriesEXT,
-    /** @export */ glDeleteRenderbuffers: _glDeleteRenderbuffers,
     /** @export */ glDeleteShader: _glDeleteShader,
-    /** @export */ glDeleteTextures: _glDeleteTextures,
-    /** @export */ glDeleteVertexArrays: _glDeleteVertexArrays,
-    /** @export */ glDeleteVertexArraysOES: _glDeleteVertexArraysOES,
-    /** @export */ glDepthFunc: _glDepthFunc,
-    /** @export */ glDepthMask: _glDepthMask,
-    /** @export */ glDepthRange: _glDepthRange,
-    /** @export */ glDepthRangef: _glDepthRangef,
-    /** @export */ glDetachShader: _glDetachShader,
-    /** @export */ glDisable: _glDisable,
-    /** @export */ glDisableVertexAttribArray: _glDisableVertexAttribArray,
     /** @export */ glDrawArrays: _glDrawArrays,
-    /** @export */ glDrawArraysInstanced: _glDrawArraysInstanced,
-    /** @export */ glDrawArraysInstancedANGLE: _glDrawArraysInstancedANGLE,
-    /** @export */ glDrawArraysInstancedARB: _glDrawArraysInstancedARB,
-    /** @export */ glDrawArraysInstancedEXT: _glDrawArraysInstancedEXT,
-    /** @export */ glDrawArraysInstancedNV: _glDrawArraysInstancedNV,
-    /** @export */ glDrawBuffers: _glDrawBuffers,
-    /** @export */ glDrawBuffersEXT: _glDrawBuffersEXT,
-    /** @export */ glDrawBuffersWEBGL: _glDrawBuffersWEBGL,
-    /** @export */ glDrawElements: _glDrawElements,
-    /** @export */ glDrawElementsInstanced: _glDrawElementsInstanced,
-    /** @export */ glDrawElementsInstancedANGLE: _glDrawElementsInstancedANGLE,
-    /** @export */ glDrawElementsInstancedARB: _glDrawElementsInstancedARB,
-    /** @export */ glDrawElementsInstancedEXT: _glDrawElementsInstancedEXT,
-    /** @export */ glDrawElementsInstancedNV: _glDrawElementsInstancedNV,
-    /** @export */ glEnable: _glEnable,
     /** @export */ glEnableVertexAttribArray: _glEnableVertexAttribArray,
-    /** @export */ glEndQueryEXT: _glEndQueryEXT,
-    /** @export */ glFinish: _glFinish,
-    /** @export */ glFlush: _glFlush,
-    /** @export */ glFramebufferRenderbuffer: _glFramebufferRenderbuffer,
-    /** @export */ glFramebufferTexture2D: _glFramebufferTexture2D,
-    /** @export */ glFrontFace: _glFrontFace,
     /** @export */ glGenBuffers: _glGenBuffers,
-    /** @export */ glGenFramebuffers: _glGenFramebuffers,
-    /** @export */ glGenQueriesEXT: _glGenQueriesEXT,
-    /** @export */ glGenRenderbuffers: _glGenRenderbuffers,
     /** @export */ glGenTextures: _glGenTextures,
-    /** @export */ glGenVertexArrays: _glGenVertexArrays,
-    /** @export */ glGenVertexArraysOES: _glGenVertexArraysOES,
-    /** @export */ glGenerateMipmap: _glGenerateMipmap,
-    /** @export */ glGetActiveAttrib: _glGetActiveAttrib,
-    /** @export */ glGetActiveUniform: _glGetActiveUniform,
-    /** @export */ glGetAttachedShaders: _glGetAttachedShaders,
-    /** @export */ glGetAttribLocation: _glGetAttribLocation,
-    /** @export */ glGetBooleanv: _glGetBooleanv,
-    /** @export */ glGetBufferParameteriv: _glGetBufferParameteriv,
-    /** @export */ glGetError: _glGetError,
-    /** @export */ glGetFloatv: _glGetFloatv,
-    /** @export */ glGetFramebufferAttachmentParameteriv: _glGetFramebufferAttachmentParameteriv,
-    /** @export */ glGetIntegerv: _glGetIntegerv,
     /** @export */ glGetProgramInfoLog: _glGetProgramInfoLog,
     /** @export */ glGetProgramiv: _glGetProgramiv,
-    /** @export */ glGetQueryObjecti64vEXT: _glGetQueryObjecti64vEXT,
-    /** @export */ glGetQueryObjectivEXT: _glGetQueryObjectivEXT,
-    /** @export */ glGetQueryObjectui64vEXT: _glGetQueryObjectui64vEXT,
-    /** @export */ glGetQueryObjectuivEXT: _glGetQueryObjectuivEXT,
-    /** @export */ glGetQueryivEXT: _glGetQueryivEXT,
-    /** @export */ glGetRenderbufferParameteriv: _glGetRenderbufferParameteriv,
     /** @export */ glGetShaderInfoLog: _glGetShaderInfoLog,
-    /** @export */ glGetShaderPrecisionFormat: _glGetShaderPrecisionFormat,
-    /** @export */ glGetShaderSource: _glGetShaderSource,
     /** @export */ glGetShaderiv: _glGetShaderiv,
-    /** @export */ glGetString: _glGetString,
-    /** @export */ glGetTexParameterfv: _glGetTexParameterfv,
-    /** @export */ glGetTexParameteriv: _glGetTexParameteriv,
     /** @export */ glGetUniformLocation: _glGetUniformLocation,
-    /** @export */ glGetUniformfv: _glGetUniformfv,
-    /** @export */ glGetUniformiv: _glGetUniformiv,
-    /** @export */ glGetVertexAttribPointerv: _glGetVertexAttribPointerv,
-    /** @export */ glGetVertexAttribfv: _glGetVertexAttribfv,
-    /** @export */ glGetVertexAttribiv: _glGetVertexAttribiv,
-    /** @export */ glHint: _glHint,
-    /** @export */ glIsBuffer: _glIsBuffer,
-    /** @export */ glIsEnabled: _glIsEnabled,
-    /** @export */ glIsFramebuffer: _glIsFramebuffer,
-    /** @export */ glIsProgram: _glIsProgram,
-    /** @export */ glIsQueryEXT: _glIsQueryEXT,
-    /** @export */ glIsRenderbuffer: _glIsRenderbuffer,
-    /** @export */ glIsShader: _glIsShader,
-    /** @export */ glIsTexture: _glIsTexture,
-    /** @export */ glIsVertexArray: _glIsVertexArray,
-    /** @export */ glIsVertexArrayOES: _glIsVertexArrayOES,
-    /** @export */ glLineWidth: _glLineWidth,
     /** @export */ glLinkProgram: _glLinkProgram,
-    /** @export */ glLoadIdentity: _glLoadIdentity,
-    /** @export */ glMatrixMode: _glMatrixMode,
-    /** @export */ glMultiDrawArrays: _glMultiDrawArrays,
-    /** @export */ glMultiDrawArraysANGLE: _glMultiDrawArraysANGLE,
-    /** @export */ glMultiDrawArraysInstancedANGLE: _glMultiDrawArraysInstancedANGLE,
-    /** @export */ glMultiDrawArraysInstancedWEBGL: _glMultiDrawArraysInstancedWEBGL,
-    /** @export */ glMultiDrawArraysWEBGL: _glMultiDrawArraysWEBGL,
-    /** @export */ glMultiDrawElements: _glMultiDrawElements,
-    /** @export */ glMultiDrawElementsANGLE: _glMultiDrawElementsANGLE,
-    /** @export */ glMultiDrawElementsInstancedANGLE: _glMultiDrawElementsInstancedANGLE,
-    /** @export */ glMultiDrawElementsInstancedWEBGL: _glMultiDrawElementsInstancedWEBGL,
-    /** @export */ glMultiDrawElementsWEBGL: _glMultiDrawElementsWEBGL,
     /** @export */ glPixelStorei: _glPixelStorei,
-    /** @export */ glPolygonModeWEBGL: _glPolygonModeWEBGL,
-    /** @export */ glPolygonOffset: _glPolygonOffset,
-    /** @export */ glPolygonOffsetClampEXT: _glPolygonOffsetClampEXT,
-    /** @export */ glQueryCounterEXT: _glQueryCounterEXT,
-    /** @export */ glReadPixels: _glReadPixels,
-    /** @export */ glReleaseShaderCompiler: _glReleaseShaderCompiler,
-    /** @export */ glRenderbufferStorage: _glRenderbufferStorage,
-    /** @export */ glSampleCoverage: _glSampleCoverage,
-    /** @export */ glScissor: _glScissor,
-    /** @export */ glShaderBinary: _glShaderBinary,
     /** @export */ glShaderSource: _glShaderSource,
-    /** @export */ glStencilFunc: _glStencilFunc,
-    /** @export */ glStencilFuncSeparate: _glStencilFuncSeparate,
-    /** @export */ glStencilMask: _glStencilMask,
-    /** @export */ glStencilMaskSeparate: _glStencilMaskSeparate,
-    /** @export */ glStencilOp: _glStencilOp,
-    /** @export */ glStencilOpSeparate: _glStencilOpSeparate,
     /** @export */ glTexImage2D: _glTexImage2D,
-    /** @export */ glTexParameterf: _glTexParameterf,
-    /** @export */ glTexParameterfv: _glTexParameterfv,
     /** @export */ glTexParameteri: _glTexParameteri,
-    /** @export */ glTexParameteriv: _glTexParameteriv,
     /** @export */ glTexSubImage2D: _glTexSubImage2D,
     /** @export */ glUniform1f: _glUniform1f,
-    /** @export */ glUniform1fv: _glUniform1fv,
     /** @export */ glUniform1i: _glUniform1i,
-    /** @export */ glUniform1iv: _glUniform1iv,
     /** @export */ glUniform2f: _glUniform2f,
-    /** @export */ glUniform2fv: _glUniform2fv,
-    /** @export */ glUniform2i: _glUniform2i,
-    /** @export */ glUniform2iv: _glUniform2iv,
-    /** @export */ glUniform3f: _glUniform3f,
-    /** @export */ glUniform3fv: _glUniform3fv,
-    /** @export */ glUniform3i: _glUniform3i,
-    /** @export */ glUniform3iv: _glUniform3iv,
-    /** @export */ glUniform4f: _glUniform4f,
-    /** @export */ glUniform4fv: _glUniform4fv,
-    /** @export */ glUniform4i: _glUniform4i,
-    /** @export */ glUniform4iv: _glUniform4iv,
-    /** @export */ glUniformMatrix2fv: _glUniformMatrix2fv,
-    /** @export */ glUniformMatrix3fv: _glUniformMatrix3fv,
-    /** @export */ glUniformMatrix4fv: _glUniformMatrix4fv,
     /** @export */ glUseProgram: _glUseProgram,
-    /** @export */ glValidateProgram: _glValidateProgram,
-    /** @export */ glVertexAttrib1f: _glVertexAttrib1f,
-    /** @export */ glVertexAttrib1fv: _glVertexAttrib1fv,
-    /** @export */ glVertexAttrib2f: _glVertexAttrib2f,
-    /** @export */ glVertexAttrib2fv: _glVertexAttrib2fv,
-    /** @export */ glVertexAttrib3f: _glVertexAttrib3f,
-    /** @export */ glVertexAttrib3fv: _glVertexAttrib3fv,
-    /** @export */ glVertexAttrib4f: _glVertexAttrib4f,
-    /** @export */ glVertexAttrib4fv: _glVertexAttrib4fv,
-    /** @export */ glVertexAttribDivisor: _glVertexAttribDivisor,
-    /** @export */ glVertexAttribDivisorANGLE: _glVertexAttribDivisorANGLE,
-    /** @export */ glVertexAttribDivisorARB: _glVertexAttribDivisorARB,
-    /** @export */ glVertexAttribDivisorEXT: _glVertexAttribDivisorEXT,
-    /** @export */ glVertexAttribDivisorNV: _glVertexAttribDivisorNV,
     /** @export */ glVertexAttribPointer: _glVertexAttribPointer,
-    /** @export */ glVertexPointer: _glVertexPointer,
-    /** @export */ glViewport: _glViewport,
-    /** @export */ glewGetErrorString: _glewGetErrorString,
-    /** @export */ glewGetExtension: _glewGetExtension,
-    /** @export */ glewGetString: _glewGetString,
-    /** @export */ glewInit: _glewInit,
-    /** @export */ glewIsSupported: _glewIsSupported,
-    /** @export */ glutCreateWindow: _glutCreateWindow,
-    /** @export */ glutDestroyWindow: _glutDestroyWindow,
-    /** @export */ glutDisplayFunc: _glutDisplayFunc,
-    /** @export */ glutFullScreen: _glutFullScreen,
-    /** @export */ glutGet: _glutGet,
-    /** @export */ glutGetModifiers: _glutGetModifiers,
-    /** @export */ glutIdleFunc: _glutIdleFunc,
-    /** @export */ glutInit: _glutInit,
-    /** @export */ glutInitDisplayMode: _glutInitDisplayMode,
-    /** @export */ glutInitWindowPosition: _glutInitWindowPosition,
-    /** @export */ glutInitWindowSize: _glutInitWindowSize,
-    /** @export */ glutKeyboardFunc: _glutKeyboardFunc,
-    /** @export */ glutKeyboardUpFunc: _glutKeyboardUpFunc,
-    /** @export */ glutMainLoop: _glutMainLoop,
-    /** @export */ glutMotionFunc: _glutMotionFunc,
-    /** @export */ glutMouseFunc: _glutMouseFunc,
-    /** @export */ glutPassiveMotionFunc: _glutPassiveMotionFunc,
-    /** @export */ glutPositionWindow: _glutPositionWindow,
-    /** @export */ glutPostRedisplay: _glutPostRedisplay,
-    /** @export */ glutReshapeFunc: _glutReshapeFunc,
-    /** @export */ glutReshapeWindow: _glutReshapeWindow,
-    /** @export */ glutSetCursor: _glutSetCursor,
-    /** @export */ glutSpecialFunc: _glutSpecialFunc,
-    /** @export */ glutSpecialUpFunc: _glutSpecialUpFunc,
-    /** @export */ glutSwapBuffers: _glutSwapBuffers,
-    /** @export */ glutTimerFunc: _glutTimerFunc,
-    /** @export */ llvm_eh_typeid_for: _llvm_eh_typeid_for,
     /** @export */ memory: wasmMemory,
     /** @export */ proc_exit: _proc_exit,
-    /** @export */ random_get: _random_get,
-    /** @export */ sched_yield: _sched_yield,
-    /** @export */ segfault: _segfault,
-    /** @export */ setNetworkCallback: _setNetworkCallback,
-    /** @export */ setprotoent: _setprotoent,
-    /** @export */ stackAlloc: _stackAlloc,
-    /** @export */ stackRestore: _stackRestore,
-    /** @export */ stackSave: _stackSave,
-    /** @export */ strptime: _strptime,
-    /** @export */ strptime_l: _strptime_l,
-    /** @export */ uuid_clear: _uuid_clear,
-    /** @export */ uuid_compare: _uuid_compare,
-    /** @export */ uuid_copy: _uuid_copy,
-    /** @export */ uuid_generate: _uuid_generate,
-    /** @export */ uuid_is_null: _uuid_is_null,
-    /** @export */ uuid_parse: _uuid_parse,
-    /** @export */ uuid_type: _uuid_type,
-    /** @export */ uuid_unparse: _uuid_unparse,
-    /** @export */ uuid_unparse_lower: _uuid_unparse_lower,
-    /** @export */ uuid_unparse_upper: _uuid_unparse_upper,
-    /** @export */ uuid_variant: _uuid_variant
+    /** @export */ segfault
   };
 }
 
@@ -26468,22 +11088,12 @@ function assignWasmImports() {
 // === Auto-generated postamble setup entry stuff ===
 var calledRun;
 
-function callMain(args = []) {
+function callMain() {
   assert(runDependencies == 0, 'cannot call main when async dependencies remain! (listen on Module["onRuntimeInitialized"])');
   assert(typeof onPreRuns === "undefined" || onPreRuns.length == 0, "cannot call main when preRun functions remain to be called");
-  var entryFunction = resolveGlobalSymbol("main").sym;
-  // Main modules can't tell if they have main() at compile time, since it may
-  // arrive from a dynamic library.
-  if (!entryFunction) return;
-  args.unshift(thisProgram);
-  var argc = args.length;
-  var argv = stackAlloc((argc + 1) * 4);
-  var argv_ptr = argv;
-  for (var arg of args) {
-    HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((argv_ptr) >> 2), "storing")] = stringToUTF8OnStack(arg);
-    argv_ptr += 4;
-  }
-  HEAPU32[SAFE_HEAP_INDEX(HEAPU32, ((argv_ptr) >> 2), "storing")] = 0;
+  var entryFunction = _main;
+  var argc = 0;
+  var argv = 0;
   try {
     var ret = entryFunction(argc, argv);
     // if we're not running an evented main loop, it's time to exit
@@ -26505,7 +11115,7 @@ function stackCheckInit() {
   writeStackCookie();
 }
 
-function run(args = arguments_) {
+function run() {
   if (runDependencies > 0) {
     dependenciesFulfilled = run;
     return;
@@ -26533,7 +11143,7 @@ function run(args = arguments_) {
     Module["onRuntimeInitialized"]?.();
     consumedModuleProp("onRuntimeInitialized");
     var noInitialRun = Module["noInitialRun"] || false;
-    if (!noInitialRun) callMain(args);
+    if (!noInitialRun) callMain();
     postRun();
   }
   if (Module["setStatus"]) {
