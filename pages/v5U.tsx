@@ -75,10 +75,7 @@ export default function V5U() {
     }, []);
 
     // --- Engine FS ---
-    // this is stupid.
     React.useEffect(() => {
-        // @ts-ignore
-       React.useEffect(() => {
         // @ts-ignore
         window.TS_InitFS = async (p: string, f: any) => {
             try {
