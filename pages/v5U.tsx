@@ -27,7 +27,6 @@ import EngineFS from '@/lib/EngineFS'
 
 export default function V5U() {
     // --- Console State ---
-    const [showConsole, setShowConsole] = React.useState(false);
     const [logs, setLogs] = React.useState<string[]>([]);
     const [input, setInput] = React.useState('');
     const endOfLogsRef = React.useRef<HTMLDivElement>(null);
@@ -43,32 +42,17 @@ export default function V5U() {
             originalLog(...args); // Keep logging to the actual browser console
         };
 
-        // Toggle console with the Backtick (`) key
-        const handleKeyDown = (e: KeyboardEvent) => {
-            // e.code === 'Backquote' targets the physical key, ignoring Shift/layout weirdness
-            if (e.code === 'Backquote' || e.key === '`' || e.key === '~') {
-                e.preventDefault();
-                e.stopPropagation(); // Stop the engine from seeing this keypress
-                
-                setShowConsole((prev) => !prev);
-            }
-        };
-
-        // { capture: true } forces this listener to fire BEFORE the canvas intercepts it
-        window.addEventListener('keydown', handleKeyDown, { capture: true });
-
         return () => {
             console.log = originalLog;
-            window.removeEventListener('keydown', handleKeyDown, { capture: true });
         };
     }, []);
 
     // Auto-scroll to bottom of console when new logs arrive
     React.useEffect(() => {
-        if (showConsole && endOfLogsRef.current) {
+        if (endOfLogsRef.current) {
             endOfLogsRef.current.scrollIntoView({ behavior: 'smooth' });
         }
-    }, [logs, showConsole]);
+    }, [logs]);
 
     // Handle pressing Enter in the console input
     const handleCommandSubmit = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -108,53 +92,52 @@ export default function V5U() {
                     <Splash/>
                     <canvas className='engineCanvas' id='canvas' />
 
-                    {/* --- Console Overlay --- */}
-                    {showConsole && (
-                        <div 
-                            className="engine-console"
-                            style={{
-                                position: 'absolute',
-                                top: 0,
-                                left: 0,
-                                width: '100%',
-                                height: '40%',
-                                backgroundColor: 'rgba(0, 0, 0, 0.85)',
-                                color: '#00ff00',
-                                fontFamily: 'monospace',
-                                zIndex: 9999, // Ensure it sits above the canvas/splash
-                                display: 'flex',
-                                flexDirection: 'column',
-                                padding: '1rem',
-                                boxSizing: 'border-box'
-                            }}
-                        >
-                            <div style={{ flex: 1, overflowY: 'auto', marginBottom: '10px' }}>
-                                {logs.map((log, index) => (
-                                    <div key={index} style={{ wordBreak: 'break-all' }}>{log}</div>
-                                ))}
-                                <div ref={endOfLogsRef} />
-                            </div>
-                            
-                            <input
-                                type="text"
-                                value={input}
-                                onChange={(e) => setInput(e.target.value)}
-                                onKeyDown={handleCommandSubmit}
-                                style={{
-                                    width: '100%',
-                                    backgroundColor: 'transparent',
-                                    border: 'none',
-                                    borderTop: '1px solid #00ff00',
-                                    color: '#00ff00',
-                                    outline: 'none',
-                                    paddingTop: '10px',
-                                    fontFamily: 'monospace'
-                                }}
-                                placeholder="Enter command..."
-                                autoFocus
-                            />
+                    {/* --- Console Overlay (Always Visible) --- */}
+                    <div 
+                        className="engine-console"
+                        style={{
+                            position: 'absolute',
+                            top: 0,
+                            left: 0,
+                            width: '100%',
+                            height: '40%',
+                            backgroundColor: 'rgba(0, 0, 0, 0.85)',
+                            color: '#00ff00',
+                            fontFamily: 'monospace',
+                            zIndex: 9999, // Ensure it sits above the canvas/splash
+                            display: 'flex',
+                            flexDirection: 'column',
+                            padding: '1rem',
+                            boxSizing: 'border-box',
+                            pointerEvents: 'auto' // Ensures you can click and interact with the input
+                        }}
+                    >
+                        <div style={{ flex: 1, overflowY: 'auto', marginBottom: '10px' }}>
+                            {logs.map((log, index) => (
+                                <div key={index} style={{ wordBreak: 'break-all' }}>{log}</div>
+                            ))}
+                            <div ref={endOfLogsRef} />
                         </div>
-                    )}
+                        
+                        <input
+                            type="text"
+                            value={input}
+                            onChange={(e) => setInput(e.target.value)}
+                            onKeyDown={handleCommandSubmit}
+                            style={{
+                                width: '100%',
+                                backgroundColor: 'transparent',
+                                border: 'none',
+                                borderTop: '1px solid #00ff00',
+                                color: '#00ff00',
+                                outline: 'none',
+                                paddingTop: '10px',
+                                fontFamily: 'monospace'
+                            }}
+                            placeholder="Enter command..."
+                            autoFocus
+                        />
+                    </div>
                 </ThemeProvider>
 
                 <Script src='coi-serviceworker.js' />
