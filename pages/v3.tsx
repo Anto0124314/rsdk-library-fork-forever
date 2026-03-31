@@ -68,7 +68,19 @@ export default function V3() {
         <div className='enginePage'>
             <ThemeProvider attribute='class' defaultTheme='dark' enableSystem>
                 <Splash />
-                <canvas className='engineCanvas' id='canvas' />
+                <canvas
+                    className='engineCanvas'
+                    id='canvas'
+                    onContextMenu={(e) => e.preventDefault()}
+                    ref={(el) => {
+                        if (el) {
+                            el.addEventListener('webglcontextlost', (e) => {
+                                alert('WebGL context lost. You will need to reload the page.');
+                                e.preventDefault();
+                            });
+                        }
+                    }}
+                />
             </ThemeProvider>
             <Script src='./coi-serviceworker.js' strategy='beforeInteractive' />
             <Script src='./lib/RSDKv3.js' />
