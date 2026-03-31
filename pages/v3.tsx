@@ -40,6 +40,8 @@ function loadFavicon(href: string) {
 // ---------------------
 
 export default function V3() {
+    const [moduleReady, setModuleReady] = React.useState(false);
+
     React.useEffect(() => {
         // ---- Favicon ----
         loadFavicon('./icons/CD.ico');
@@ -66,8 +68,17 @@ export default function V3() {
                 />
             </ThemeProvider>
             <Script src='./coi-serviceworker.js' strategy='beforeInteractive' />
-            <Script src='./lib/RSDKv3.js' strategy='lazyOnload' />
-            <Script src='./modules/RSDKv3.js' strategy='lazyOnload' />
+            <Script
+                src='./lib/RSDKv3.js'
+                strategy='afterInteractive'
+                onLoad={() => setModuleReady(true)}
+            />
+            {moduleReady && (
+                <Script
+                    src='./modules/RSDKv3.js'
+                    strategy='afterInteractive'
+                />
+            )}
         </div>
     )
 }
