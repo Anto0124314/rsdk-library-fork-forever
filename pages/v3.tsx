@@ -26,8 +26,8 @@ import EngineFS from '@/lib/EngineFS'
 // ---------------------
 
 export default function V3() {
+    // this is stupid.
     React.useEffect(() => {
-        // ---- Engine FS init ----
         window.TS_InitFS = async (p: string, f: any) => {
             try {
                 await EngineFS.Init(p);
@@ -35,16 +35,6 @@ export default function V3() {
             } catch (error) {
             }
         };
-
-        // ---- Load favicon from icons/CD.ico ----
-        let link: HTMLLinkElement | null = document.querySelector("link[rel~='icon']");
-        if (!link) {
-            link = document.createElement('link');
-            link.rel = 'icon';
-            document.head.appendChild(link);
-        }
-        link.type = 'image/x-icon';
-        link.href = './icons/CD.ico';
     }, []);
 
     return (
@@ -53,7 +43,6 @@ export default function V3() {
                 {/* eslint-disable-next-line @next/next/no-sync-scripts */}
                 <script src="./coi-serviceworker.js" />
                 <meta name='viewport' content='initial-scale=1, viewport-fit=cover' />
-                <link rel='icon' type='image/x-icon' href='./icons/CD.ico' />
             </Head>
             <div className='enginePage'>
                 <ThemeProvider attribute='class' defaultTheme='dark' enableSystem>
