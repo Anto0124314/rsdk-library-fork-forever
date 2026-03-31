@@ -24,12 +24,18 @@ var Module = {
             }
         };
     })(),
-    canvas: (() => {
-        // Don't grab canvas here — it may not exist yet.
-        // Emscripten will find it by ID at runtime.
-        return null;
+    canvas: (function () {
+        // Try to get canvas now, if it exists
+        var canvas = document.getElementById('canvas');
+        if (canvas) {
+            canvas.addEventListener("webglcontextlost", function (e) {
+                alert('WebGL context lost. You will need to reload the page.');
+                e.preventDefault();
+            }, false);
+        }
+        return canvas;
     })(),
-    setStatus: (text) => {
+    setStatus: function (text) {
         if (!Module.setStatus.last) Module.setStatus.last = { time: Date.now(), text: '' };
         if (text === Module.setStatus.last.text) return;
         var m = text.match(/([^(]+)\((\d+(\.\d+)?)\/(\d+)\)/);
@@ -51,10 +57,10 @@ var Module = {
     }
 };
 Module.setStatus('Downloading...');
-window.onerror = () => {
+window.onerror = function () {
     Module.setStatus('Exception thrown, see JavaScript console');
 
-    Module.setStatus = (text) => {
+    Module.setStatus = function (text) {
         if (text) console.error('[post-exception status] ' + text);
     };
 };
