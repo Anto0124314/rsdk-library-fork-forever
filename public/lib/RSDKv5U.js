@@ -119,14 +119,53 @@ window.onerror = (msg, url, line) => {
 };
 
 function RSDK_Init() {
-    FS.chdir('/RSDKv5U');
+    try {
+        FS.chdir('/RSDKv5U');
 
-    const storedSettings = localStorage.getItem('settings');
-    if (storedSettings) {
-        const settings = JSON.parse(storedSettings);
-        _RSDK_Configure(settings.enablePlus, 0);
+        // Check what files exist
+        try {
+            var files = FS.readdir('/RSDKv5U');
+            console.log('Files in /RSDKv5U:', JSON.stringify(files));
+            if (window.__engineConsoleAppend) window.__engineConsoleAppend('Files: ' + JSON.stringify(files));
+        } catch(e) {
+            console.error('/RSDKv5U directory error:', e);
+            if (window.__engineConsoleAppend) window.__engineConsoleAppend('[ERROR] /RSDKv5U dir: ' + e.message);
+        }
+
+        // Check Data.rsdk specifically
+        try {
+            var stat = FS.stat('/RSDKv5U/Data.rsdk');
+            console.log('Data.rsdk size:', stat.size);
+            if (window.__engineConsoleAppend) window.__engineConsoleAppend('Data.rsdk size: ' + stat.size);
+        } catch(e) {
+            console.error('Data.rsdk NOT FOUND');
+            if (window.__engineConsoleAppend) window.__engineConsoleAppend('[ERROR] Data.rsdk NOT FOUND');
+        }
+
+        const storedSettings = localStorage.getItem('settings');
+        if (storedSettings) {
+            const settings = JSON.parse(storedSettings);
+            console.log('Settings:', JSON.stringify(settings));
+            if (window.__engineConsoleAppend) window.__engineConsoleAppend('Settings: ' + JSON.stringify(settings));
+
+            console.log('Calling _RSDK_Configure...');
+            _RSDK_Configure(settings.enablePlus, 0);
+            console.log('_RSDK_Configure returned OK');
+        } else {
+            console.log('No settings in localStorage');
+            if (window.__engineConsoleAppend) window.__engineConsoleAppend('No settings found');
+        }
+
+        console.log('About to call _RSDK_Initialize...');
+        if (window.__engineConsoleAppend) window.__engineConsoleAppend('Calling _RSDK_Initialize...');
+        _RSDK_Initialize();
+        console.log('_RSDK_Initialize returned OK');
+    } catch(e) {
+        console.error('RSDK_Init crashed:', e.message);
+        console.error('Stack:', e.stack);
+        if (window.__engineConsoleAppend) {
+            window.__engineConsoleAppend('[FATAL] RSDK_Init: ' + e.message);
+            window.__engineConsoleAppend('[STACK] ' + e.stack);
+        }
     }
-
-    if (window.__engineConsoleAppend) window.__engineConsoleAppend('RSDK_Initialize starting...');
-    _RSDK_Initialize();
 }
