@@ -5,25 +5,13 @@ import * as React from 'react'
 import '@/app/globals.css'
 import '@/app/engine.css'
 
-// --------------------
-// UI Component Imports
-// --------------------
-
 import Head from 'next/head'
 import Script from 'next/script'
 
 import { ThemeProvider } from '@/app/controls/theme-provider'
 import { Splash } from '@/app/controls/splash'
 
-// ---------------
-// Library Imports
-// ---------------
-
 import EngineFS from '@/lib/EngineFS'
-
-// ---------------------
-// Component Definitions
-// ---------------------
 
 export default function V5U() {
     const [consoleVisible, setConsoleVisible] = React.useState(false);
@@ -31,11 +19,9 @@ export default function V5U() {
     const consoleEndRef = React.useRef<HTMLDivElement>(null);
 
     React.useEffect(() => {
-        // Expose the console line appender globally so Module.print can use it
         window.__engineConsoleAppend = (text: string) => {
             setConsoleLines(prev => {
                 const next = [...prev, text];
-                // Keep a rolling buffer of 500 lines to avoid memory bloat
                 if (next.length > 500) next.splice(0, next.length - 500);
                 return next;
             });
@@ -46,18 +32,17 @@ export default function V5U() {
                 await EngineFS.Init(p);
                 f();
             } catch (error) {
+                console.error('EngineFS init failed:', error);
             }
         };
     }, []);
 
-    // Auto-scroll to bottom when new lines arrive
     React.useEffect(() => {
         if (consoleEndRef.current && consoleVisible) {
             consoleEndRef.current.scrollIntoView({ behavior: 'auto' });
         }
     }, [consoleLines, consoleVisible]);
 
-    // Toggle with backtick key
     React.useEffect(() => {
         const handleKey = (e: KeyboardEvent) => {
             if (e.key === '`' || e.key === '~') {
@@ -69,6 +54,22 @@ export default function V5U() {
         return () => window.removeEventListener('keydown', handleKey);
     }, []);
 
+    const getLineClass = (line: string): string => {
+        if (line.includes('[ERROR]') || line.includes('ERROR') || line.includes('Exception') || line.includes('[FATAL]'))
+            return 'engine-console-line--error';
+        if (line.includes('WARNING') || line.includes('WARN'))
+            return 'engine-console-line--warning';
+        if (line.includes('MSZSetup:'))
+            return 'engine-console-line--info';
+        if (line.includes('->'))
+            return 'engine-console-line--success';
+        if (line.includes('TRANSITIONING'))
+            return 'engine-console-line--highlight';
+        if (line.includes('[STATUS]'))
+            return 'engine-console-line--status';
+        return '';
+    };
+
     return (
         <>
             <Head>
@@ -79,109 +80,38 @@ export default function V5U() {
                     <Splash />
                     <canvas className='engineCanvas' id='canvas' />
 
-                    {/* In-page console overlay */}
                     {consoleVisible && (
-                        <div
-                            style={{
-                                position: 'fixed',
-                                bottom: 0,
-                                left: 0,
-                                width: '100%',
-                                height: '40%',
-                                backgroundColor: 'rgba(0, 0, 0, 0.90)',
-                                borderTop: '2px solid #333',
-                                zIndex: 9999,
-                                display: 'flex',
-                                flexDirection: 'column',
-                                pointerEvents: 'auto',
-                            }}
-                        >
-                            {/* Header bar */}
-                            <div
-                                style={{
-                                    display: 'flex',
-                                    justifyContent: 'space-between',
-                                    alignItems: 'center',
-                                    padding: '4px 10px',
-                                    backgroundColor: 'rgba(30, 30, 30, 0.95)',
-                                    borderBottom: '1px solid #444',
-                                    flexShrink: 0,
-                                }}
-                            >
-                                <span style={{
-                                    color: '#0f0',
-                                    fontFamily: 'monospace',
-                                    fontSize: '12px',
-                                    fontWeight: 'bold',
-                                }}>
-                                    ENGINE CONSOLE
-                                </span>
-                                <div style={{ display: 'flex', gap: '8px' }}>
+                        <div className='engine-console'>
+                            <div className='engine-console-resize' />
+                            <div className='engine-console-header'>
+                                <span className='engine-console-title'>Engine Console</span>
+                                <div className='engine-console-buttons'>
                                     <button
+                                        className='engine-console-btn'
                                         onClick={() => setConsoleLines([])}
-                                        style={{
-                                            background: 'none',
-                                            border: '1px solid #555',
-                                            color: '#aaa',
-                                            fontFamily: 'monospace',
-                                            fontSize: '11px',
-                                            padding: '2px 8px',
-                                            cursor: 'pointer',
-                                            borderRadius: '3px',
-                                        }}
                                     >
-                                        CLEAR
+                                        Clear
                                     </button>
                                     <button
+                                        className='engine-console-btn'
                                         onClick={() => setConsoleVisible(false)}
-                                        style={{
-                                            background: 'none',
-                                            border: '1px solid #555',
-                                            color: '#aaa',
-                                            fontFamily: 'monospace',
-                                            fontSize: '11px',
-                                            padding: '2px 8px',
-                                            cursor: 'pointer',
-                                            borderRadius: '3px',
-                                        }}
                                     >
-                                        CLOSE
+                                        Close
                                     </button>
                                 </div>
                             </div>
-
-                            {/* Log output area */}
-                            <div
-                                style={{
-                                    flex: 1,
-                                    overflowY: 'auto',
-                                    padding: '6px 10px',
-                                    fontFamily: '"Cascadia Code", "Fira Code", "Consolas", monospace',
-                                    fontSize: '12px',
-                                    lineHeight: '1.5',
-                                    color: '#d4d4d4',
-                                    whiteSpace: 'pre-wrap',
-                                    wordBreak: 'break-all',
-                                }}
-                            >
-                                {consoleLines.map((line, i) => {
-                                    // Color-code lines based on content
-                                    let color = '#d4d4d4';
-                                    if (line.includes('WARNING') || line.includes('WARN')) color = '#e5c07b';
-                                    else if (line.includes('ERROR') || line.includes('Exception')) color = '#e06c75';
-                                    else if (line.includes('MSZSetup:')) color = '#61afef';
-                                    else if (line.includes('->')) color = '#98c379';
-                                    else if (line.includes('TRANSITIONING')) color = '#c678dd';
-
-                                    return (
-                                        <div key={i} style={{ color }}>
-                                            <span style={{ color: '#555', marginRight: '8px', userSelect: 'none' }}>
-                                                {String(i).padStart(4, '0')}
-                                            </span>
-                                            {line}
-                                        </div>
-                                    );
-                                })}
+                            <div className='engine-console-output'>
+                                {consoleLines.map((line, i) => (
+                                    <div
+                                        key={i}
+                                        className={`engine-console-line ${getLineClass(line)}`}
+                                    >
+                                        <span className='engine-console-line-number'>
+                                            {String(i).padStart(4, '0')}
+                                        </span>
+                                        {line}
+                                    </div>
+                                ))}
                                 <div ref={consoleEndRef} />
                             </div>
                         </div>
