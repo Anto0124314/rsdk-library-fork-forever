@@ -15,7 +15,7 @@ export class FaviconLoader {
         'Sonic the Hedgehog': 'icons/s1.ico',
         'Sonic the Hedgehog 2': 'icons/s2.ico',
         'Sonic the Hedgehog 3': 'icons/s3k.ico',
-        'Sonic 2 Absolute': 'icons/s2a.ico'
+        'Sonic 2 Absolute': 'icons/s2a.ico',
         'Sonic Forever': 'icons/s1f.ico'
     };
 
