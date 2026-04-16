@@ -34,7 +34,7 @@ const HomePage: React.FC = () => {
                 filesClicked={() => setCurrentPath('rsdkv3')}
             />
 
-            <LaunchEngineGroup title='RSDKv4' icon='./assets/RSDKv4.png'
+            <LaunchEngineGroup title="Team Forever's RSDKv4" icon='./assets/RSDKv4.png'
                 launchClicked={() => {
                     const siteUrl = window.location.origin + window.location.pathname
                     window.location.href = `${siteUrl}v4`
